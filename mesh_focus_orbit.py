@@ -9,7 +9,7 @@ rotating the view.
 bl_info = {
     "name": "Mesh Focus Orbit",
     "author": "OpenAI",
-    "version": (1, 3, 0),
+    "version": (1, 4, 0),
     "blender": (5, 2, 0),
     "location": "3D View",
     "description": "Temporarily orbit around the visible mesh surface at the viewport center",
@@ -21,6 +21,7 @@ import bmesh
 import gpu
 import time
 
+from bpy.app.handlers import persistent
 from bpy.props import BoolProperty, EnumProperty, FloatProperty
 from bpy_extras import view3d_utils
 from gpu_extras.batch import batch_for_shader
@@ -46,6 +47,20 @@ ACTIVATION_ITEMS = (
     ("RIGHT_SHIFT", "Right Shift", "Double-tap Right Shift to toggle temporary orbit"),
     ("LEFT_ALT", "Left Alt", "Double-tap Left Alt to toggle temporary orbit"),
     ("RIGHT_ALT", "Right Alt", "Double-tap Right Alt to toggle temporary orbit"),
+)
+
+
+FOCUS_LOSS_ITEMS = (
+    (
+        "KEEP",
+        "Keep Mode",
+        "Keep Mesh Focus Orbit active when the Blender window loses focus",
+    ),
+    (
+        "EXIT",
+        "Exit Mode",
+        "Exit Mesh Focus Orbit when the Blender window loses focus",
+    ),
 )
 
 
@@ -374,6 +389,12 @@ def _finish_all_states():
     _last_tap_times.clear()
 
 
+@persistent
+def _on_load_pre(_dummy):
+    """Clear viewport-bound state before Blender replaces the current file."""
+    _finish_all_states()
+
+
 def _operator_key(operator):
     """Get a stable key without storing Python attributes on bpy.types.Operator."""
     try:
@@ -464,8 +485,11 @@ class VIEW3D_OT_mesh_focus_orbit(bpy.types.Operator):
             return {"CANCELLED"}
 
         if event.type == "WINDOW_DEACTIVATE":
-            _finish_operator(self)
-            return {"CANCELLED"}
+            prefs = _addon_preferences()
+            if prefs and prefs.focus_loss_behavior == "EXIT":
+                _finish_operator(self)
+                return {"CANCELLED"}
+            return {"PASS_THROUGH"}
 
         # Passing all events through is what lets Blender's native Navigation
         # Gizmo and MMB orbit continue to handle the gesture.
@@ -537,6 +561,12 @@ class MESH_FOCUS_ORBIT_AddonPreferences(bpy.types.AddonPreferences):
         default="RIGHT_SHIFT",
         update=_preferences_changed,
     )
+    focus_loss_behavior: EnumProperty(
+        name="Focus Loss Behavior",
+        description="Choose what happens when the Blender window loses focus",
+        items=FOCUS_LOSS_ITEMS,
+        default="KEEP",
+    )
     double_tap_window: FloatProperty(
         name="Double-tap Window",
         description="Maximum time in seconds between the two taps",
@@ -560,6 +590,7 @@ class MESH_FOCUS_ORBIT_AddonPreferences(bpy.types.AddonPreferences):
         layout = self.layout
         layout.prop(self, "enabled")
         layout.prop(self, "activation_key")
+        layout.prop(self, "focus_loss_behavior")
         layout.prop(self, "debug_display")
         layout.prop(self, "show_indicator")
         layout.prop(self, "double_tap_window")
@@ -581,6 +612,8 @@ def register():
     for cls in CLASSES:
         bpy.utils.register_class(cls)
     _is_registered = True
+    if _on_load_pre not in bpy.app.handlers.load_pre:
+        bpy.app.handlers.load_pre.append(_on_load_pre)
     _rebuild_keymaps()
 
 
@@ -589,6 +622,8 @@ def unregister():
     if not _is_registered:
         return
     _finish_all_states()
+    if _on_load_pre in bpy.app.handlers.load_pre:
+        bpy.app.handlers.load_pre.remove(_on_load_pre)
     _remove_keymaps()
     _is_registered = False
     for cls in reversed(CLASSES):

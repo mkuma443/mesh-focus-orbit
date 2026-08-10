@@ -23,8 +23,11 @@ Blender 5.2 用の単体アドオンです。
 
 - `Enable`: アドオンの有効/無効
 - `Activation Key`: ダブルタップに使う左右のCtrl / Shift / Altから選択（既定は `Right Shift`）
+- `Focus Loss Behavior`: Blenderウィンドウがフォーカスを失ったときの動作。`Keep Mode`（維持、既定）または `Exit Mode`（解除）から選択
 - `Double-tap Window`: 2回の押下を1回のトグルと判定する時間（秒）
 - `Show Mode Indicator`: 一時モード中に3D Viewヘッダーへ `MESH FOCUS ORBIT ON` を表示（既定ON）
 - `Debug Display`: 一時Orbit中心を青いポイントで表示（既定OFF）
 
 Edit Mode ではライブの編集メッシュをRay Castします。選択状態、3D Cursor、Pivot Point、Object Transform、常設の Orbit Around Selection は変更しません。
+
+新しい `.blend` ファイルを開くと、Viewportやメッシュへの参照を安全に破棄するため一時モードを解除します。
