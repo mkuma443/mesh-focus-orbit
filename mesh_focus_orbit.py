@@ -9,20 +9,24 @@ rotating the view.
 bl_info = {
     "name": "Mesh Focus Orbit",
     "author": "OpenAI",
-    "version": (1, 5, 3),
+    "version": (1, 9, 0),
     "blender": (5, 2, 0),
     "location": "3D View",
-    "description": "Temporary mesh-centered orbit and cursor-local Face Set expansion",
+    "description": "Temporary mesh-centered orbit and one-click Smart Face Set Fill",
     "category": "3D View",
 }
 
 import bpy
 import bmesh
 import gpu
+import heapq
+import math
 import time
+from array import array
+from collections import deque
 
 from bpy.app.handlers import persistent
-from bpy.props import BoolProperty, EnumProperty, FloatProperty
+from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty
 from bpy_extras import view3d_utils
 from gpu_extras.batch import batch_for_shader
 from mathutils import Vector
@@ -30,16 +34,30 @@ from mathutils.geometry import intersect_ray_tri, tessellate_polygon
 
 
 OPERATOR_ID = "view3d.mesh_focus_orbit"
-LOCAL_FACE_SET_GROW_OPERATOR_ID = "view3d.mesh_focus_local_face_set_grow"
-LOCAL_FACE_SET_GROW_KEY = "G"
+LOCAL_FACE_SET_GROW_OPERATOR_ID = "view3d.mesh_focus_local_face_set_grow_v2"
+LOCAL_FACE_SET_GROW_KEY = "E"
 
 _addon_keymaps = []
 _active_states = {}
 _modal_operator_areas = {}
 _last_tap_times = {}
+_local_face_set_adjacency_cache = {}
 _is_registered = False
 
 DEFAULT_DOUBLE_TAP_WINDOW = 0.28
+
+SMART_FACE_SET_FILL_NORMAL_SMOOTH_RADIUS_FACTOR = 8.0
+SMART_FACE_SET_FILL_NORMAL_VARIATION_WEIGHT = 0.25
+SMART_FACE_SET_FILL_NORMAL_ANGLE_LIMIT = math.radians(75.0)
+SMART_FACE_SET_FILL_NORMAL_RAW_ANGLE_LIMIT = math.radians(85.0)
+SMART_FACE_SET_FILL_RAW_EDGE_WEIGHT = 0.65
+SMART_FACE_SET_FILL_RAW_EDGE_ANGLE_LIMIT = math.radians(30.0)
+SMART_FACE_SET_FILL_CONCAVITY_PENALTY = 2.5
+SMART_FACE_SET_FILL_ACCEPTANCE_THRESHOLD = 0.60
+SMART_FACE_SET_FILL_MAX_FACES = 100000
+SMART_FACE_SET_FILL_MAX_GEODESIC_SCALE = 350.0
+SMART_FACE_SET_FILL_MAX_GEODESIC_FACTOR = 0.45
+SMART_FACE_SET_FILL_NORMAL_SAMPLE_LIMIT = 8
 
 
 ACTIVATION_ITEMS = (
@@ -389,12 +407,14 @@ def _finish_all_states():
         _active_states.pop(key, None)
     _modal_operator_areas.clear()
     _last_tap_times.clear()
+    _local_face_set_adjacency_cache.clear()
 
 
 @persistent
 def _on_load_pre(_dummy):
     """Clear viewport-bound state before Blender replaces the current file."""
     _finish_all_states()
+    _local_face_set_adjacency_cache.clear()
 
 
 def _operator_key(operator):
@@ -505,16 +525,417 @@ class VIEW3D_OT_mesh_focus_orbit(bpy.types.Operator):
             pass
 
 
+def _raycast_sculpt_face_set(context, coord):
+    """Return the active mesh, seed face, Face Set ID and cursor position."""
+    obj = context.active_object
+    if obj is None or obj.type != "MESH":
+        return None
+
+    face_set_attr = obj.data.attributes.get(".sculpt_face_set")
+    if face_set_attr is None or face_set_attr.domain != "FACE":
+        return None
+
+    try:
+        coord = Vector(coord)
+        region = context.region
+        rv3d = context.space_data.region_3d
+        origin = view3d_utils.region_2d_to_origin_3d(region, rv3d, coord)
+        direction = view3d_utils.region_2d_to_vector_3d(region, rv3d, coord)
+        if direction.length_squared == 0.0:
+            return None
+        direction.normalize()
+
+        inverse = obj.matrix_world.inverted_safe()
+        local_origin = inverse @ origin
+        local_direction = inverse.to_3x3() @ direction
+        if local_direction.length_squared == 0.0:
+            return None
+        local_direction.normalize()
+
+        hit, location, _normal, face_index = obj.ray_cast(
+            local_origin,
+            local_direction,
+        )
+        if not hit or face_index < 0 or face_index >= len(face_set_attr.data):
+            return None
+
+        return (
+            obj,
+            int(face_index),
+            int(face_set_attr.data[face_index].value),
+            obj.matrix_world @ location,
+            coord,
+        )
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _build_local_face_set_adjacency(mesh):
+    """Build compact edge-to-face incidence data for one mesh topology."""
+    face_count = len(mesh.polygons)
+    edge_count = len(mesh.edges)
+    loop_count = len(mesh.loops)
+
+    loop_edges = array("i", [0]) * loop_count
+    loop_vertices = array("i", [0]) * loop_count
+    face_loop_starts = array("i", [0]) * face_count
+    face_loop_totals = array("i", [0]) * face_count
+
+    if loop_count:
+        mesh.loops.foreach_get("edge_index", loop_edges)
+        mesh.loops.foreach_get("vertex_index", loop_vertices)
+    if face_count:
+        mesh.polygons.foreach_get("loop_start", face_loop_starts)
+        mesh.polygons.foreach_get("loop_total", face_loop_totals)
+
+    edge_face_a = array("i", [-1]) * edge_count
+    edge_face_b = array("i", [-1]) * edge_count
+    non_manifold_faces = {}
+
+    for face_index in range(face_count):
+        start = face_loop_starts[face_index]
+        end = start + face_loop_totals[face_index]
+        for loop_index in range(start, end):
+            edge_index = loop_edges[loop_index]
+            if edge_index < 0 or edge_index >= edge_count:
+                continue
+            if edge_face_a[edge_index] < 0:
+                edge_face_a[edge_index] = face_index
+            elif edge_face_b[edge_index] < 0:
+                edge_face_b[edge_index] = face_index
+            else:
+                non_manifold_faces.setdefault(
+                    edge_index,
+                    [edge_face_a[edge_index], edge_face_b[edge_index]],
+                ).append(face_index)
+
+    return {
+        "loop_edges": loop_edges,
+        "loop_vertices": loop_vertices,
+        "face_loop_starts": face_loop_starts,
+        "face_loop_totals": face_loop_totals,
+        "edge_face_a": edge_face_a,
+        "edge_face_b": edge_face_b,
+        "non_manifold_faces": non_manifold_faces,
+    }
+
+
+def _get_cached_local_face_set_adjacency(mesh):
+    """Reuse topology data while the mesh topology remains unchanged."""
+    key = (
+        mesh.as_pointer(),
+        len(mesh.vertices),
+        len(mesh.edges),
+        len(mesh.polygons),
+        len(mesh.loops),
+    )
+    cached = _local_face_set_adjacency_cache.get(key)
+    if cached is None:
+        cached = _build_local_face_set_adjacency(mesh)
+        _local_face_set_adjacency_cache.clear()
+        _local_face_set_adjacency_cache[key] = cached
+    return cached
+
+
+def _local_face_geometry(state, face_index):
+    cached = state["geometry_cache"].get(face_index)
+    if cached is not None:
+        return cached
+
+    polygon = state["mesh"].polygons[face_index]
+    center = polygon.center.copy()
+    normal = polygon.normal.copy()
+    if normal.length_squared:
+        normal.normalize()
+    else:
+        normal = Vector((0.0, 0.0, 1.0))
+
+    geometry = {
+        "center": center,
+        "normal": normal,
+        "area": max(float(polygon.area), 1.0e-12),
+        "scale": max(math.sqrt(float(polygon.area)), 1.0e-8),
+    }
+    state["geometry_cache"][face_index] = geometry
+    return geometry
+
+
+def _local_face_neighbors(state, face_index):
+    """Yield (neighbor face, shared edge) pairs for edge-connected faces."""
+    adjacency = state["adjacency"]
+    loop_edges = adjacency["loop_edges"]
+    starts = adjacency["face_loop_starts"]
+    totals = adjacency["face_loop_totals"]
+    edge_face_a = adjacency["edge_face_a"]
+    edge_face_b = adjacency["edge_face_b"]
+    non_manifold_faces = adjacency["non_manifold_faces"]
+
+    start = starts[face_index]
+    end = start + totals[face_index]
+    yielded = set()
+
+    for loop_index in range(start, end):
+        edge_index = loop_edges[loop_index]
+        if edge_index < 0 or edge_index >= len(edge_face_a):
+            continue
+
+        neighbors = []
+        first = edge_face_a[edge_index]
+        second = edge_face_b[edge_index]
+        if first == face_index:
+            neighbors.append(second)
+        elif second == face_index:
+            neighbors.append(first)
+
+        for neighbor in non_manifold_faces.get(edge_index, ()):
+            neighbors.append(neighbor)
+
+        for neighbor in neighbors:
+            if neighbor >= 0 and neighbor != face_index and neighbor not in yielded:
+                yielded.add(neighbor)
+                yield neighbor, edge_index
+
+
+def _local_face_edge_direction(state, face_index, edge_index):
+    """Return the current face's oriented direction along a shared edge."""
+    adjacency = state["adjacency"]
+    starts = adjacency["face_loop_starts"]
+    totals = adjacency["face_loop_totals"]
+    loop_edges = adjacency["loop_edges"]
+    loop_vertices = adjacency["loop_vertices"]
+    start = starts[face_index]
+    total = totals[face_index]
+
+    if total <= 0:
+        return None
+
+    mesh = state["mesh"]
+    for offset in range(total):
+        loop_index = start + offset
+        if loop_edges[loop_index] != edge_index:
+            continue
+        next_loop_index = start + ((offset + 1) % total)
+        vertex_a = loop_vertices[loop_index]
+        vertex_b = loop_vertices[next_loop_index]
+        try:
+            direction = mesh.vertices[vertex_b].co - mesh.vertices[vertex_a].co
+        except (IndexError, ReferenceError, RuntimeError):
+            return None
+        if direction.length_squared == 0.0:
+            return None
+        direction.normalize()
+        return direction
+    return None
+
+
+def _local_face_smoothed_normal(state, face_index):
+    """Fast area-weighted, spatially limited smoothing around one face.
+
+    A one-ring edge neighborhood is intentional here.  On an AI-generated
+    high-density mesh, recursively collecting many rings for every traversed
+    face becomes the dominant cost and smooths across the very valleys that
+    are supposed to stop the fill.  The radius still rejects neighbors from a
+    wildly different local scale, while the area weighting suppresses tiny
+    triangle-normal noise.
+    """
+    cached = state["smoothed_normals"].get(face_index)
+    if cached is not None:
+        return cached
+
+    center_geometry = _local_face_geometry(state, face_index)
+    center = center_geometry["center"]
+    base_normal = center_geometry["normal"]
+    radius = max(
+        state["normal_smoothing_radius"],
+        center_geometry["scale"] * 3.0,
+    )
+    radius_squared = radius * radius
+    raw_angle_limit = math.cos(SMART_FACE_SET_FILL_NORMAL_RAW_ANGLE_LIMIT)
+
+    weighted_normal = base_normal * center_geometry["area"]
+    sample_count = 1
+    for neighbor, _edge_index in _local_face_neighbors(state, face_index):
+        if sample_count >= SMART_FACE_SET_FILL_NORMAL_SAMPLE_LIMIT:
+            break
+        geometry = _local_face_geometry(state, neighbor)
+        offset = geometry["center"] - center
+        if offset.length_squared > radius_squared:
+            continue
+        if base_normal.dot(geometry["normal"]) < raw_angle_limit:
+            continue
+        distance = math.sqrt(max(offset.length_squared, 0.0))
+        falloff = 1.0 / (1.0 + distance / max(radius, 1.0e-8))
+        weighted_normal += geometry["normal"] * max(
+            geometry["area"] * falloff,
+            1.0e-12,
+        )
+        sample_count += 1
+
+    if weighted_normal.length_squared == 0.0:
+        weighted_normal = base_normal.copy()
+    else:
+        weighted_normal.normalize()
+
+    state["smoothed_normals"][face_index] = weighted_normal
+    return weighted_normal
+
+
+def _local_face_transition_cost(state, face_index, neighbor, edge_index):
+    """Return a local shape transition cost for bottleneck region growing."""
+    cache_key = (face_index, neighbor, edge_index)
+    cached = state["transition_cache"].get(cache_key)
+    if cached is not None:
+        return cached
+
+    current_geometry = _local_face_geometry(state, face_index)
+    neighbor_geometry = _local_face_geometry(state, neighbor)
+    current_normal = _local_face_smoothed_normal(state, face_index)
+    neighbor_normal = _local_face_smoothed_normal(state, neighbor)
+    dot_normal = max(-1.0, min(1.0, current_normal.dot(neighbor_normal)))
+    normal_angle = math.acos(dot_normal)
+    normal_cost = min(
+        normal_angle / SMART_FACE_SET_FILL_NORMAL_ANGLE_LIMIT,
+        2.0,
+    ) * SMART_FACE_SET_FILL_NORMAL_VARIATION_WEIGHT
+
+    raw_dot = max(
+        -1.0,
+        min(1.0, current_geometry["normal"].dot(neighbor_geometry["normal"])),
+    )
+    raw_angle = math.acos(raw_dot)
+    raw_edge_cost = min(
+        raw_angle / SMART_FACE_SET_FILL_RAW_EDGE_ANGLE_LIMIT,
+        2.0,
+    ) * SMART_FACE_SET_FILL_RAW_EDGE_WEIGHT
+
+    concavity = 0.0
+    edge_direction = _local_face_edge_direction(state, face_index, edge_index)
+    if edge_direction is not None:
+        # Use raw normals for the sign so a smoothed normal cannot erase the
+        # narrow concave valley that should separate adjacent hair bundles.
+        turn = current_geometry["normal"].cross(
+            neighbor_geometry["normal"]
+        ).dot(edge_direction)
+        concavity = max(0.0, min(1.0, (-turn - 0.15) / 0.65))
+
+    cost = normal_cost + raw_edge_cost + (
+        concavity * SMART_FACE_SET_FILL_CONCAVITY_PENALTY
+    )
+    state["transition_cache"][cache_key] = cost
+    return cost
+
+
+def _smart_face_set_fill(context, coord):
+    """Find and apply one geometry-aware Face Set region."""
+    hit = _raycast_sculpt_face_set(context, coord)
+    if hit is None:
+        return None
+
+    obj, seed_face, seed_face_set, _seed_location, _screen_position = hit
+    mesh = obj.data
+    face_set_attr = mesh.attributes.get(".sculpt_face_set")
+    if face_set_attr is None or face_set_attr.domain != "FACE":
+        return None
+
+    state = {
+        "object": obj,
+        "mesh": mesh,
+        "adjacency": _get_cached_local_face_set_adjacency(mesh),
+        "geometry_cache": {},
+        "smoothed_normals": {},
+        "transition_cache": {},
+    }
+
+    seed_geometry = _local_face_geometry(state, seed_face)
+    seed_scale = seed_geometry["scale"]
+    state["normal_smoothing_radius"] = max(
+        seed_scale * SMART_FACE_SET_FILL_NORMAL_SMOOTH_RADIUS_FACTOR,
+        1.0e-8,
+    )
+    object_diagonal = max(Vector(obj.dimensions).length, 1.0e-8)
+    state["max_geodesic_distance"] = max(
+        object_diagonal * 0.03,
+        min(
+            seed_scale * SMART_FACE_SET_FILL_MAX_GEODESIC_SCALE,
+            object_diagonal * SMART_FACE_SET_FILL_MAX_GEODESIC_FACTOR,
+        ),
+    )
+
+    best_cost = {seed_face: 0.0}
+    best_distance = {seed_face: 0.0}
+    heap = [(0.0, 0.0, seed_face)]
+    candidates = set()
+
+    while heap and len(candidates) < SMART_FACE_SET_FILL_MAX_FACES:
+        path_cost, path_distance, face_index = heapq.heappop(heap)
+        known_cost = best_cost.get(face_index, float("inf"))
+        known_distance = best_distance.get(face_index, float("inf"))
+        if path_cost > known_cost + 1.0e-9:
+            continue
+        if (
+            abs(path_cost - known_cost) <= 1.0e-9
+            and path_distance > known_distance + 1.0e-9
+        ):
+            continue
+
+        candidates.add(face_index)
+        current_geometry = _local_face_geometry(state, face_index)
+
+        for neighbor, edge_index in _local_face_neighbors(state, face_index):
+            neighbor_geometry = _local_face_geometry(state, neighbor)
+            step_distance = (
+                neighbor_geometry["center"] - current_geometry["center"]
+            ).length
+            next_distance = path_distance + step_distance
+            if next_distance > state["max_geodesic_distance"]:
+                continue
+
+            transition_cost = _local_face_transition_cost(
+                state,
+                face_index,
+                neighbor,
+                edge_index,
+            )
+            next_cost = max(path_cost, transition_cost)
+            if next_cost > SMART_FACE_SET_FILL_ACCEPTANCE_THRESHOLD:
+                continue
+
+            previous_cost = best_cost.get(neighbor, float("inf"))
+            previous_distance = best_distance.get(neighbor, float("inf"))
+            if (
+                next_cost < previous_cost - 1.0e-9
+                or (
+                    abs(next_cost - previous_cost) <= 1.0e-9
+                    and next_distance < previous_distance
+                )
+            ):
+                best_cost[neighbor] = next_cost
+                best_distance[neighbor] = next_distance
+                heapq.heappush(heap, (next_cost, next_distance, neighbor))
+
+    changed_faces = 0
+    for face_index in candidates:
+        if face_set_attr.data[face_index].value != seed_face_set:
+            face_set_attr.data[face_index].value = seed_face_set
+            changed_faces += 1
+
+    if changed_faces:
+        mesh.update()
+    return len(candidates), changed_faces
+
+
 class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
-    """Start Blender's cursor-local Face Set expansion using topology falloff."""
+    """Apply the seed Face Set to one geometry-aware connected region."""
 
     bl_idname = LOCAL_FACE_SET_GROW_OPERATOR_ID
-    bl_label = "Mesh Focus: Local Face Set Grow"
+    bl_label = "Mesh Focus: Smart Face Set Fill"
     bl_description = (
-        "Expand the Face Set under the cursor locally along topology; "
-        "drag to choose the expansion distance"
+        "Fill the connected smooth region under the cursor with the seed Face Set"
     )
-    bl_options = {"REGISTER"}
+    bl_options = {"REGISTER", "UNDO"}
+
+    mouse_region_x: IntProperty(options={"SKIP_SAVE"})
+    mouse_region_y: IntProperty(options={"SKIP_SAVE"})
 
     @classmethod
     def poll(cls, context):
@@ -529,47 +950,48 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
             and context.active_object.type == "MESH"
         )
 
-    @staticmethod
-    def _invoke_native(context):
-        # Blender's native expand operator performs the expensive topology
-        # traversal in its optimized sculpt backend.  Preserve existing Face
-        # Sets so only the local expansion result is added, and avoid changing
-        # the user's Transform Pivot Point as a side effect.
-        return bpy.ops.sculpt.expand(
-            "INVOKE_DEFAULT",
-            target="FACE_SETS",
-            falloff_type="TOPOLOGY",
-            use_mask_preserve=True,
-            use_modify_active=True,
-            use_reposition_pivot=False,
-            use_auto_mask=False,
-        )
-
-    def invoke(self, context, _event):
+    def invoke(self, context, event):
         if not self.poll(context):
             return {"PASS_THROUGH"}
-        try:
-            return self._invoke_native(context)
-        except (AttributeError, RuntimeError, TypeError, ValueError) as error:
-            self.report({"WARNING"}, f"Local Face Set Grow unavailable: {error}")
+
+        mouse_x = getattr(event, "mouse_region_x", None)
+        mouse_y = getattr(event, "mouse_region_y", None)
+        if mouse_x is None or mouse_y is None:
             return {"CANCELLED"}
+
+        self.mouse_region_x = int(mouse_x)
+        self.mouse_region_y = int(mouse_y)
+        return self.execute(context)
 
     def execute(self, context):
         if not self.poll(context):
             return {"CANCELLED"}
+
         try:
-            return bpy.ops.sculpt.expand(
-                "EXEC_DEFAULT",
-                target="FACE_SETS",
-                falloff_type="TOPOLOGY",
-                use_mask_preserve=True,
-                use_modify_active=True,
-                use_reposition_pivot=False,
-                use_auto_mask=False,
+            result = _smart_face_set_fill(
+                context,
+                Vector((self.mouse_region_x, self.mouse_region_y)),
             )
-        except (AttributeError, RuntimeError, TypeError, ValueError) as error:
-            self.report({"WARNING"}, f"Local Face Set Grow unavailable: {error}")
+        except (
+            AttributeError,
+            ReferenceError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+            MemoryError,
+        ):
+            result = None
+
+        if result is None:
             return {"CANCELLED"}
+
+        candidate_count, changed_faces = result
+        self.report(
+            {"INFO"},
+            f"Smart Face Set Fill: {changed_faces} faces changed "
+            f"({candidate_count} candidates)",
+        )
+        return {"FINISHED"}
 
 
 def _remove_keymaps():
@@ -606,25 +1028,12 @@ def _rebuild_keymaps():
         keymap_item.any = True
         _addon_keymaps.append((keymap, keymap_item))
 
-        sculpt_keymap = keyconfig.keymaps.new(
-            name="Sculpt",
-            space_type="EMPTY",
-            region_type="WINDOW",
-        )
-        local_grow_item = sculpt_keymap.keymap_items.new(
-            "sculpt.expand",
+        local_grow_item = keymap.keymap_items.new(
+            LOCAL_FACE_SET_GROW_OPERATOR_ID,
             LOCAL_FACE_SET_GROW_KEY,
             "PRESS",
-            shift=True,
-            alt=True,
         )
-        local_grow_item.properties.target = "FACE_SETS"
-        local_grow_item.properties.falloff_type = "TOPOLOGY"
-        local_grow_item.properties.use_mask_preserve = True
-        local_grow_item.properties.use_modify_active = True
-        local_grow_item.properties.use_reposition_pivot = False
-        local_grow_item.properties.use_auto_mask = False
-        _addon_keymaps.append((sculpt_keymap, local_grow_item))
+        _addon_keymaps.append((keymap, local_grow_item))
     except (AttributeError, RuntimeError, TypeError, ValueError):
         _remove_keymaps()
 
@@ -715,6 +1124,7 @@ def unregister():
     if _on_load_pre in bpy.app.handlers.load_pre:
         bpy.app.handlers.load_pre.remove(_on_load_pre)
     _remove_keymaps()
+    _local_face_set_adjacency_cache.clear()
     _is_registered = False
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)
