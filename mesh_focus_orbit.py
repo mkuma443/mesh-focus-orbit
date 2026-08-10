@@ -9,10 +9,10 @@ rotating the view.
 bl_info = {
     "name": "Mesh Focus Orbit",
     "author": "OpenAI",
-    "version": (1, 4, 0),
+    "version": (1, 5, 0),
     "blender": (5, 2, 0),
     "location": "3D View",
-    "description": "Temporarily orbit around the visible mesh surface at the viewport center",
+    "description": "Temporary mesh-centered orbit and cursor-local Face Set expansion",
     "category": "3D View",
 }
 
@@ -30,6 +30,7 @@ from mathutils.geometry import intersect_ray_tri, tessellate_polygon
 
 
 OPERATOR_ID = "view3d.mesh_focus_orbit"
+LOCAL_FACE_SET_GROW_OPERATOR_ID = "view3d.mesh_focus_local_face_set_grow"
 
 _addon_keymaps = []
 _active_states = {}
@@ -503,6 +504,79 @@ class VIEW3D_OT_mesh_focus_orbit(bpy.types.Operator):
             pass
 
 
+class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
+    """Start Blender's cursor-local Face Set expansion using topology falloff."""
+
+    bl_idname = LOCAL_FACE_SET_GROW_OPERATOR_ID
+    bl_label = "Mesh Focus: Local Face Set Grow"
+    bl_description = (
+        "Expand the Face Set under the cursor locally along topology; "
+        "drag to choose the expansion distance"
+    )
+    bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, context):
+        return (
+            context.area is not None
+            and context.area.type == "VIEW_3D"
+            and context.region is not None
+            and context.region.type == "WINDOW"
+            and context.space_data is not None
+            and context.mode == "SCULPT"
+            and context.active_object is not None
+            and context.active_object.type == "MESH"
+        )
+
+    @staticmethod
+    def _invoke_native(context):
+        # Blender's native expand operator performs the expensive topology
+        # traversal in its optimized sculpt backend.  Preserve existing Face
+        # Sets so only the local expansion result is added, and avoid changing
+        # the user's Transform Pivot Point as a side effect.
+        return bpy.ops.sculpt.expand(
+            "INVOKE_DEFAULT",
+            target="FACE_SETS",
+            falloff_type="TOPOLOGY",
+            use_mask_preserve=True,
+            use_reposition_pivot=False,
+            use_auto_mask=False,
+        )
+
+    def invoke(self, context, _event):
+        if not self.poll(context):
+            return {"PASS_THROUGH"}
+        try:
+            return self._invoke_native(context)
+        except (AttributeError, RuntimeError, TypeError, ValueError) as error:
+            self.report({"WARNING"}, f"Local Face Set Grow unavailable: {error}")
+            return {"CANCELLED"}
+
+    def execute(self, context):
+        if not self.poll(context):
+            return {"CANCELLED"}
+        try:
+            return bpy.ops.sculpt.expand(
+                "EXEC_DEFAULT",
+                target="FACE_SETS",
+                falloff_type="TOPOLOGY",
+                use_mask_preserve=True,
+                use_reposition_pivot=False,
+                use_auto_mask=False,
+            )
+        except (AttributeError, RuntimeError, TypeError, ValueError) as error:
+            self.report({"WARNING"}, f"Local Face Set Grow unavailable: {error}")
+            return {"CANCELLED"}
+
+
+def _draw_sculpt_menu(self, _context):
+    self.layout.separator()
+    self.layout.operator(
+        LOCAL_FACE_SET_GROW_OPERATOR_ID,
+        text="Local Face Set Grow (Cursor)",
+    )
+
+
 def _remove_keymaps():
     for keymap, keymap_item in _addon_keymaps:
         try:
@@ -601,6 +675,7 @@ class MESH_FOCUS_ORBIT_AddonPreferences(bpy.types.AddonPreferences):
 
 CLASSES = (
     VIEW3D_OT_mesh_focus_orbit,
+    VIEW3D_OT_mesh_focus_local_face_set_grow,
     MESH_FOCUS_ORBIT_AddonPreferences,
 )
 
@@ -614,6 +689,8 @@ def register():
     _is_registered = True
     if _on_load_pre not in bpy.app.handlers.load_pre:
         bpy.app.handlers.load_pre.append(_on_load_pre)
+    if hasattr(bpy.types, "VIEW3D_MT_sculpt"):
+        bpy.types.VIEW3D_MT_sculpt.append(_draw_sculpt_menu)
     _rebuild_keymaps()
 
 
@@ -624,6 +701,11 @@ def unregister():
     _finish_all_states()
     if _on_load_pre in bpy.app.handlers.load_pre:
         bpy.app.handlers.load_pre.remove(_on_load_pre)
+    if hasattr(bpy.types, "VIEW3D_MT_sculpt"):
+        try:
+            bpy.types.VIEW3D_MT_sculpt.remove(_draw_sculpt_menu)
+        except (AttributeError, RuntimeError, ValueError):
+            pass
     _remove_keymaps()
     _is_registered = False
     for cls in reversed(CLASSES):
