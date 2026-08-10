@@ -19,7 +19,7 @@ Blender 5.2 用の単体アドオンです。
 
 画面中央に可視メッシュがない場合は何も変更しません。
 
-Sculpt Mode でカーソル位置のFace Setを局所的に広げたい場合は、F3から `Mesh Focus: Local Face Set Grow` を実行するか、Sculptメニューの `Local Face Set Grow (Cursor)` を使います。Blender標準のトポロジー拡張を呼び出すため、カーソル下の面を起点にドラッグ距離で拡張範囲を決められます。既存Face Setを保持し、Transform Pivot Pointは変更しません。離れた場所にある同じFace Set番号を一括拡張する操作ではありません。
+Sculpt Mode でカーソル位置のFace Setを局所的に広げたい場合は、Sculptヘッダーの `Local Face Set Grow` ボタン、F3の `Mesh Focus: Local Face Set Grow`、またはSculptメニューの `Local Face Set Grow (Cursor)` を使います。Blender標準のトポロジー拡張を呼び出すため、カーソル下の面を起点にドラッグ距離で拡張範囲を決められます。既存Face Setを保持し、Transform Pivot Pointは変更しません。離れた場所にある同じFace Set番号を一括拡張する操作ではありません。
 
 設定は `Edit > Preferences > Add-ons > Mesh Focus Orbit` にあります。
 

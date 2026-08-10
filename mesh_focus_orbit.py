@@ -577,6 +577,16 @@ def _draw_sculpt_menu(self, _context):
     )
 
 
+def _draw_sculpt_header(self, context):
+    if context.mode != "SCULPT":
+        return
+    self.layout.separator()
+    self.layout.operator(
+        LOCAL_FACE_SET_GROW_OPERATOR_ID,
+        text="Local Face Set Grow",
+    )
+
+
 def _remove_keymaps():
     for keymap, keymap_item in _addon_keymaps:
         try:
@@ -691,6 +701,8 @@ def register():
         bpy.app.handlers.load_pre.append(_on_load_pre)
     if hasattr(bpy.types, "VIEW3D_MT_sculpt"):
         bpy.types.VIEW3D_MT_sculpt.append(_draw_sculpt_menu)
+    if hasattr(bpy.types, "VIEW3D_HT_header"):
+        bpy.types.VIEW3D_HT_header.append(_draw_sculpt_header)
     _rebuild_keymaps()
 
 
@@ -704,6 +716,11 @@ def unregister():
     if hasattr(bpy.types, "VIEW3D_MT_sculpt"):
         try:
             bpy.types.VIEW3D_MT_sculpt.remove(_draw_sculpt_menu)
+        except (AttributeError, RuntimeError, ValueError):
+            pass
+    if hasattr(bpy.types, "VIEW3D_HT_header"):
+        try:
+            bpy.types.VIEW3D_HT_header.remove(_draw_sculpt_header)
         except (AttributeError, RuntimeError, ValueError):
             pass
     _remove_keymaps()
