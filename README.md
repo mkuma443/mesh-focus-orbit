@@ -19,9 +19,9 @@ Blender 5.2 用の単体アドオンです。
 
 画面中央に可視メッシュがない場合は何も変更しません。
 
-Sculpt Mode でカーソル位置のFace Setを局所的に広げたい場合は、対象面にカーソルを置いたまま、3D View上で `Shift+Alt+G` を押します。F3から `Mesh Focus: Local Face Set Grow` を実行することもできます。Blender標準のトポロジー拡張を呼び出すため、カーソル下の面を起点にドラッグ距離で拡張範囲を決められます。既存Face Setを保持し、Transform Pivot Pointは変更しません。離れた場所にある同じFace Set番号を一括拡張する操作ではありません。UIメニューからの起動はカーソル位置がメニュー上になるため対応していません。
+Sculpt Mode でカーソル位置のFace Setを髪束単位で一発適用したい場合は、対象面にカーソルを置いたまま、3D View上で `E` を押します。カーソル直下のFaceをseedにし、Edgeを共有するFaceだけを辿りながら、面積重み付きの近傍平滑化法線、Raw dihedral、凹面ペナルティを使ったbottleneck型の領域成長を行います。強い谷を越えにくくし、滑らかに続く髪束を優先して、seedと同じ既存のFace Set IDを候補Faceへ直接適用します。プレビュー、Mask、`sculpt.expand`、Timerは使用しません。結果が気に入らない場合は通常の `Ctrl+Z` で1回の操作全体を戻してください。F3メニューからの起動はカーソル位置を正しく取得できないため対応していません。
 
-`Shift+Alt+G` は Blender の `Preferences > Keymap` で `Mesh Focus: Local Face Set Grow` を検索して変更できます。
+`E` は Blender の `Preferences > Keymap` で `Mesh Focus: Local Face Set Grow` を検索して変更できます。
 
 設定は `Edit > Preferences > Add-ons > Mesh Focus Orbit` にあります。
 
