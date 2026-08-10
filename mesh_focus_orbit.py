@@ -9,7 +9,7 @@ rotating the view.
 bl_info = {
     "name": "Mesh Focus Orbit",
     "author": "OpenAI",
-    "version": (1, 5, 0),
+    "version": (1, 5, 1),
     "blender": (5, 2, 0),
     "location": "3D View",
     "description": "Temporary mesh-centered orbit and cursor-local Face Set expansion",
@@ -31,6 +31,7 @@ from mathutils.geometry import intersect_ray_tri, tessellate_polygon
 
 OPERATOR_ID = "view3d.mesh_focus_orbit"
 LOCAL_FACE_SET_GROW_OPERATOR_ID = "view3d.mesh_focus_local_face_set_grow"
+LOCAL_FACE_SET_GROW_KEY = "G"
 
 _addon_keymaps = []
 _active_states = {}
@@ -569,24 +570,6 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
             return {"CANCELLED"}
 
 
-def _draw_sculpt_menu(self, _context):
-    self.layout.separator()
-    self.layout.operator(
-        LOCAL_FACE_SET_GROW_OPERATOR_ID,
-        text="Local Face Set Grow (Cursor)",
-    )
-
-
-def _draw_sculpt_header(self, context):
-    if context.mode != "SCULPT":
-        return
-    self.layout.separator()
-    self.layout.operator(
-        LOCAL_FACE_SET_GROW_OPERATOR_ID,
-        text="Local Face Set Grow",
-    )
-
-
 def _remove_keymaps():
     for keymap, keymap_item in _addon_keymaps:
         try:
@@ -620,6 +603,20 @@ def _rebuild_keymaps():
         # modifier state so Ctrl+... navigation does not disable activation.
         keymap_item.any = True
         _addon_keymaps.append((keymap, keymap_item))
+
+        sculpt_keymap = keyconfig.keymaps.new(
+            name="Sculpt",
+            space_type="EMPTY",
+            region_type="WINDOW",
+        )
+        local_grow_item = sculpt_keymap.keymap_items.new(
+            LOCAL_FACE_SET_GROW_OPERATOR_ID,
+            LOCAL_FACE_SET_GROW_KEY,
+            "PRESS",
+            shift=True,
+            alt=True,
+        )
+        _addon_keymaps.append((sculpt_keymap, local_grow_item))
     except (AttributeError, RuntimeError, TypeError, ValueError):
         _remove_keymaps()
 
@@ -699,10 +696,6 @@ def register():
     _is_registered = True
     if _on_load_pre not in bpy.app.handlers.load_pre:
         bpy.app.handlers.load_pre.append(_on_load_pre)
-    if hasattr(bpy.types, "VIEW3D_MT_sculpt"):
-        bpy.types.VIEW3D_MT_sculpt.append(_draw_sculpt_menu)
-    if hasattr(bpy.types, "VIEW3D_HT_header"):
-        bpy.types.VIEW3D_HT_header.append(_draw_sculpt_header)
     _rebuild_keymaps()
 
 
@@ -713,16 +706,6 @@ def unregister():
     _finish_all_states()
     if _on_load_pre in bpy.app.handlers.load_pre:
         bpy.app.handlers.load_pre.remove(_on_load_pre)
-    if hasattr(bpy.types, "VIEW3D_MT_sculpt"):
-        try:
-            bpy.types.VIEW3D_MT_sculpt.remove(_draw_sculpt_menu)
-        except (AttributeError, RuntimeError, ValueError):
-            pass
-    if hasattr(bpy.types, "VIEW3D_HT_header"):
-        try:
-            bpy.types.VIEW3D_HT_header.remove(_draw_sculpt_header)
-        except (AttributeError, RuntimeError, ValueError):
-            pass
     _remove_keymaps()
     _is_registered = False
     for cls in reversed(CLASSES):
