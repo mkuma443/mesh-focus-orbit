@@ -1,11 +1,11 @@
-# Temporary Orbit Around View Center
+# Mesh Focus Orbit
 
 Blender 5.2 用の単体アドオンです。
 
 ## インストール
 
 1. Blender の `Edit > Preferences > Add-ons > Install...` を開く
-2. `temporary_orbit_around_view_center.py` を選択する
+2. `mesh_focus_orbit.py` を選択する
 3. アドオンを有効化する
 
 ## 使い方
@@ -19,12 +19,12 @@ Blender 5.2 用の単体アドオンです。
 
 画面中央に可視メッシュがない場合は何も変更しません。
 
-設定は `Edit > Preferences > Add-ons > Temporary Orbit Around View Center` にあります。
+設定は `Edit > Preferences > Add-ons > Mesh Focus Orbit` にあります。
 
 - `Enable`: アドオンの有効/無効
 - `Activation Key`: ダブルタップに使う左右のCtrl / Shift / Altから選択（既定は `Right Shift`）
 - `Double-tap Window`: 2回の押下を1回のトグルと判定する時間（秒）
-- `Show Mode Indicator`: 一時モード中に3D Viewヘッダーへ `TEMPORARY ORBIT ON` を表示（既定ON）
+- `Show Mode Indicator`: 一時モード中に3D Viewヘッダーへ `MESH FOCUS ORBIT ON` を表示（既定ON）
 - `Debug Display`: 一時Orbit中心を青いポイントで表示（既定OFF）
 
 Edit Mode ではライブの編集メッシュをRay Castします。選択状態、3D Cursor、Pivot Point、Object Transform、常設の Orbit Around Selection は変更しません。

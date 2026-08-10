@@ -1,4 +1,4 @@
-"""Temporary Orbit Around View Center.
+"""Mesh Focus Orbit.
 
 Double-tap the configured key in a 3D Viewport to make the first visible mesh
 surface under the viewport center the temporary orbit target.  The built-in
@@ -7,9 +7,9 @@ rotating the view.
 """
 
 bl_info = {
-    "name": "Temporary Orbit Around View Center",
+    "name": "Mesh Focus Orbit",
     "author": "OpenAI",
-    "version": (1, 2, 0),
+    "version": (1, 3, 0),
     "blender": (5, 2, 0),
     "location": "3D View",
     "description": "Temporarily orbit around the visible mesh surface at the viewport center",
@@ -28,7 +28,7 @@ from mathutils import Vector
 from mathutils.geometry import intersect_ray_tri, tessellate_polygon
 
 
-OPERATOR_ID = "view3d.temporary_orbit_around_view_center"
+OPERATOR_ID = "view3d.mesh_focus_orbit"
 
 _addon_keymaps = []
 _active_states = {}
@@ -317,7 +317,7 @@ def _activate_state(state):
     prefs = _addon_preferences()
     try:
         state.area.header_text_set(
-            "TEMPORARY ORBIT ON" if not prefs or prefs.show_indicator else None
+            "MESH FOCUS ORBIT ON" if not prefs or prefs.show_indicator else None
         )
     except (AttributeError, ReferenceError, RuntimeError, TypeError):
         pass
@@ -391,11 +391,11 @@ def _finish_operator(operator):
     _finish_state(state)
 
 
-class VIEW3D_OT_temporary_orbit_around_view_center(bpy.types.Operator):
+class VIEW3D_OT_mesh_focus_orbit(bpy.types.Operator):
     """Double-tap the configured key to toggle the viewport-center orbit target."""
 
     bl_idname = OPERATOR_ID
-    bl_label = "Temporary Orbit Around View Center"
+    bl_label = "Mesh Focus Orbit"
     bl_options = {"INTERNAL"}
 
     @classmethod
@@ -521,7 +521,7 @@ def _preferences_changed(_self, _context):
         _rebuild_keymaps()
 
 
-class TEMPORARY_ORBIT_AddonPreferences(bpy.types.AddonPreferences):
+class MESH_FOCUS_ORBIT_AddonPreferences(bpy.types.AddonPreferences):
     bl_idname = __package__ or __name__
 
     enabled: BoolProperty(
@@ -552,7 +552,7 @@ class TEMPORARY_ORBIT_AddonPreferences(bpy.types.AddonPreferences):
     )
     show_indicator: BoolProperty(
         name="Show Mode Indicator",
-        description="Show TEMPORARY ORBIT ON in the 3D Viewport",
+        description="Show MESH FOCUS ORBIT ON in the 3D Viewport",
         default=True,
     )
 
@@ -569,13 +569,15 @@ class TEMPORARY_ORBIT_AddonPreferences(bpy.types.AddonPreferences):
 
 
 CLASSES = (
-    VIEW3D_OT_temporary_orbit_around_view_center,
-    TEMPORARY_ORBIT_AddonPreferences,
+    VIEW3D_OT_mesh_focus_orbit,
+    MESH_FOCUS_ORBIT_AddonPreferences,
 )
 
 
 def register():
     global _is_registered
+    if _is_registered:
+        return
     for cls in CLASSES:
         bpy.utils.register_class(cls)
     _is_registered = True
@@ -584,6 +586,8 @@ def register():
 
 def unregister():
     global _is_registered
+    if not _is_registered:
+        return
     _finish_all_states()
     _remove_keymaps()
     _is_registered = False
