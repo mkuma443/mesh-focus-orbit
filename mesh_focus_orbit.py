@@ -9,7 +9,7 @@ rotating the view.
 bl_info = {
     "name": "Mesh Focus Orbit",
     "author": "OpenAI",
-    "version": (1, 5, 2),
+    "version": (1, 5, 3),
     "blender": (5, 2, 0),
     "location": "3D View",
     "description": "Temporary mesh-centered orbit and cursor-local Face Set expansion",
@@ -540,6 +540,7 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
             target="FACE_SETS",
             falloff_type="TOPOLOGY",
             use_mask_preserve=True,
+            use_modify_active=True,
             use_reposition_pivot=False,
             use_auto_mask=False,
         )
@@ -562,6 +563,7 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
                 target="FACE_SETS",
                 falloff_type="TOPOLOGY",
                 use_mask_preserve=True,
+                use_modify_active=True,
                 use_reposition_pivot=False,
                 use_auto_mask=False,
             )
@@ -619,6 +621,7 @@ def _rebuild_keymaps():
         local_grow_item.properties.target = "FACE_SETS"
         local_grow_item.properties.falloff_type = "TOPOLOGY"
         local_grow_item.properties.use_mask_preserve = True
+        local_grow_item.properties.use_modify_active = True
         local_grow_item.properties.use_reposition_pivot = False
         local_grow_item.properties.use_auto_mask = False
         _addon_keymaps.append((sculpt_keymap, local_grow_item))
