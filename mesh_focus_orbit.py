@@ -9,7 +9,7 @@ rotating the view.
 bl_info = {
     "name": "Mesh Focus Orbit",
     "author": "OpenAI",
-    "version": (2, 1, 4),
+    "version": (2, 1, 6),
     "blender": (5, 2, 0),
     "location": "3D View",
     "description": "Temporary mesh-centered orbit and one-click Smart Face Set Fill",
@@ -21,6 +21,7 @@ import bmesh
 import gpu
 import heapq
 import math
+import statistics
 import time
 from array import array
 from collections import deque
@@ -31,6 +32,7 @@ from bpy_extras import view3d_utils
 from gpu_extras.batch import batch_for_shader
 from mathutils import Vector
 from mathutils.geometry import intersect_ray_tri, tessellate_polygon
+from mathutils.bvhtree import BVHTree
 
 
 OPERATOR_ID = "view3d.mesh_focus_orbit"
@@ -47,6 +49,7 @@ _is_registered = False
 _polyquilt_qsnap_class = None
 _polyquilt_qsnap_original_snap_objects = None
 _polyquilt_qsnap_filter_installed = False
+_retopo_isolation_serial = 0
 
 DEFAULT_DOUBLE_TAP_WINDOW = 0.28
 
@@ -64,6 +67,21 @@ _FACE_SET_REFERENCE_TAG = "mesh_focus_orbit.reference_hidden_by_proxy"
 _FACE_SET_REFERENCE_PREVIOUS_HIDE = "mesh_focus_orbit.reference_previous_hide"
 _FACE_SET_REFERENCE_PROXY_COUNT = "mesh_focus_orbit.proxy_count"
 
+# Face Set MFO may also isolate the active Edit Mesh.  These markers are
+# temporary recovery metadata only; they are removed when the mode finishes.
+_RETOPO_ISOLATION_TAG = "mesh_focus_orbit.retopo_isolation"
+_RETOPO_ISOLATION_SESSION = "mesh_focus_orbit.retopo_isolation_session"
+_RETOPO_ISOLATION_MARKER_LAYER = "mesh_focus_orbit.retopo_marker_layer"
+_RETOPO_ISOLATION_HIDE_LAYER = "mesh_focus_orbit.retopo_hide_layer"
+_RETOPO_ISOLATION_SELECT_LAYER = "mesh_focus_orbit.retopo_select_layer"
+_RETOPO_ISOLATION_TARGET_LAYER = "mesh_focus_orbit.retopo_target_layer"
+_RETOPO_ISOLATION_VERT_MARKER_LAYER = "mesh_focus_orbit.retopo_vert_marker_layer"
+_RETOPO_ISOLATION_VERT_HIDE_LAYER = "mesh_focus_orbit.retopo_vert_hide_layer"
+_RETOPO_ISOLATION_VERT_SELECT_LAYER = "mesh_focus_orbit.retopo_vert_select_layer"
+_RETOPO_ISOLATION_EDGE_MARKER_LAYER = "mesh_focus_orbit.retopo_edge_marker_layer"
+_RETOPO_ISOLATION_EDGE_HIDE_LAYER = "mesh_focus_orbit.retopo_edge_hide_layer"
+_RETOPO_ISOLATION_EDGE_SELECT_LAYER = "mesh_focus_orbit.retopo_edge_select_layer"
+
 
 SMART_FACE_SET_FILL_NORMAL_SMOOTH_RADIUS_FACTOR = 8.0
 SMART_FACE_SET_FILL_NORMAL_VARIATION_WEIGHT = 0.25
@@ -77,6 +95,17 @@ SMART_FACE_SET_FILL_MAX_FACES = 100000
 SMART_FACE_SET_FILL_MAX_GEODESIC_SCALE = 350.0
 SMART_FACE_SET_FILL_MAX_GEODESIC_FACTOR = 0.45
 SMART_FACE_SET_FILL_NORMAL_SAMPLE_LIMIT = 8
+
+
+# Initial automatic Retopo island classification thresholds.  The current
+# head setup measured a useful separation at 5 mm: the matching island had a
+# near ratio of about 0.90 and the distractor about 0.12.  Keep these as
+# constants so they can be tuned without changing the interaction design.
+RETOPO_ISOLATION_DISTANCE_TOLERANCE = 0.005
+RETOPO_ISOLATION_MAX_MEDIAN_DISTANCE = 0.010
+RETOPO_ISOLATION_MIN_NEAR_RATIO = 0.65
+RETOPO_ISOLATION_MIN_CONFIDENCE_GAP = 0.15
+RETOPO_ISOLATION_SAMPLE_LIMIT = 200
 
 
 ACTIVATION_ITEMS = (
@@ -168,6 +197,7 @@ class _FaceSetOrbitState(_TempOrbitState):
         "face_set_id",
         "proxy_object",
         "reference_was_hidden",
+        "retopo_isolation",
     )
 
     def __init__(
@@ -192,7 +222,917 @@ class _FaceSetOrbitState(_TempOrbitState):
             except (AttributeError, RuntimeError, TypeError):
                 self.reference_was_hidden = False
         self.proxy_object = None
+        self.retopo_isolation = None
         self.indicator_text = "FACE SET MFO ON"
+
+
+def _retopo_edit_object(context, reference_object):
+    """Return the active Edit Mesh that can be isolated alongside FSMFO."""
+    try:
+        obj = context.edit_object
+    except (AttributeError, ReferenceError, RuntimeError, TypeError):
+        obj = None
+    if obj is None:
+        try:
+            obj = context.active_object
+        except (AttributeError, ReferenceError, RuntimeError, TypeError):
+            obj = None
+    if (
+        obj is None
+        or obj.type != "MESH"
+        or obj.mode != "EDIT"
+        or obj == reference_object
+    ):
+        return None
+    return obj
+
+
+def _retopo_face_is_valid(face):
+    try:
+        return bool(face.is_valid)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError):
+        return False
+
+
+def _retopo_connected_components(bm):
+    """Return all BMFace edge-connected components in the Edit Mesh."""
+    bm.faces.ensure_lookup_table()
+    visited = set()
+    components = []
+    for face in bm.faces:
+        if not _retopo_face_is_valid(face) or face in visited:
+            continue
+        component = {face}
+        visited.add(face)
+        queue = deque([face])
+        while queue:
+            current = queue.popleft()
+            for edge in current.edges:
+                for linked_face in edge.link_faces:
+                    if (
+                        _retopo_face_is_valid(linked_face)
+                        and linked_face not in visited
+                    ):
+                        visited.add(linked_face)
+                        component.add(linked_face)
+                        queue.append(linked_face)
+        components.append(component)
+    return components
+
+
+def _retopo_even_sample(items, limit=RETOPO_ISOLATION_SAMPLE_LIMIT):
+    if len(items) <= limit:
+        return list(items)
+    return [
+        items[round(index * (len(items) - 1) / (limit - 1))]
+        for index in range(limit)
+    ]
+
+
+def _retopo_percentile(values, fraction):
+    if not values:
+        return None
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return float(ordered[0])
+    position = (len(ordered) - 1) * fraction
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return float(ordered[lower])
+    weight = position - lower
+    return float(
+        ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+    )
+
+
+def _retopo_proxy_bvh(proxy):
+    if proxy is None or proxy.type != "MESH":
+        return None
+    try:
+        vertices = [
+            tuple(proxy.matrix_world @ vertex.co)
+            for vertex in proxy.data.vertices
+        ]
+        polygons = [tuple(polygon.vertices) for polygon in proxy.data.polygons]
+        if not vertices or not polygons:
+            return None
+        return BVHTree.FromPolygons(
+            vertices,
+            polygons,
+            all_triangles=False,
+        )
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _retopo_island_metrics(retopo_object, component, proxy_bvh):
+    vertices = []
+    seen_vertices = set()
+    for face in component:
+        for vertex in face.verts:
+            if vertex not in seen_vertices:
+                seen_vertices.add(vertex)
+                vertices.append(vertex)
+    samples = _retopo_even_sample(vertices)
+    distances = []
+    for vertex in samples:
+        try:
+            nearest = proxy_bvh.find_nearest(
+                retopo_object.matrix_world @ vertex.co
+            )
+        except (ReferenceError, RuntimeError, TypeError, ValueError):
+            nearest = None
+        if nearest is not None and nearest[3] is not None:
+            distances.append(float(nearest[3]))
+
+    near_ratio = None
+    median_distance = None
+    p90_distance = None
+    if distances:
+        near_ratio = sum(
+            distance <= RETOPO_ISOLATION_DISTANCE_TOLERANCE
+            for distance in distances
+        ) / len(distances)
+        median_distance = statistics.median(distances)
+        p90_distance = _retopo_percentile(distances, 0.90)
+    return {
+        "component": component,
+        "face_count": len(component),
+        "vertex_count": len(vertices),
+        "sample_count": len(samples),
+        "near_ratio": near_ratio,
+        "median_distance": median_distance,
+        "p90_distance": p90_distance,
+    }
+
+
+def _retopo_candidate_is_acceptable(metrics):
+    return (
+        metrics is not None
+        and metrics["near_ratio"] is not None
+        and metrics["median_distance"] is not None
+        and metrics["near_ratio"] >= RETOPO_ISOLATION_MIN_NEAR_RATIO
+        and metrics["median_distance"] <= RETOPO_ISOLATION_MAX_MEDIAN_DISTANCE
+    )
+
+
+def _retopo_select_island(context, reference_object, proxy):
+    """Select the best Retopo island using Proxy proximity, not selection."""
+    retopo_object = _retopo_edit_object(context, reference_object)
+    if retopo_object is None:
+        return None
+
+    try:
+        bm = bmesh.from_edit_mesh(retopo_object.data)
+        components = _retopo_connected_components(bm)
+        proxy_bvh = _retopo_proxy_bvh(proxy)
+        if not components or proxy_bvh is None:
+            return None
+
+        metrics = [
+            _retopo_island_metrics(retopo_object, component, proxy_bvh)
+            for component in components
+        ]
+        ranked = sorted(
+            metrics,
+            key=lambda item: (
+                item["near_ratio"] if item["near_ratio"] is not None else -1.0,
+                -(
+                    item["median_distance"]
+                    if item["median_distance"] is not None
+                    else float("inf")
+                ),
+            ),
+            reverse=True,
+        )
+        if not ranked or not _retopo_candidate_is_acceptable(ranked[0]):
+            best = None
+        else:
+            best = ranked[0]
+
+        auto_confident = False
+        if best is not None:
+            if len(ranked) == 1:
+                auto_confident = True
+            else:
+                next_best = ranked[1]
+                ratio_gap = best["near_ratio"] - next_best["near_ratio"]
+                auto_confident = ratio_gap >= RETOPO_ISOLATION_MIN_CONFIDENCE_GAP
+
+        if auto_confident:
+            chosen = best
+        else:
+            # Selection is only a fallback when proximity confidence is not
+            # sufficient.  It is never allowed to override a clear automatic
+            # result.
+            selected_faces = [face for face in bm.faces if face.select]
+            active = bm.select_history.active
+            selected_seed = None
+            if (
+                isinstance(active, bmesh.types.BMFace)
+                and _retopo_face_is_valid(active)
+                and active.select
+            ):
+                selected_seed = active
+            elif selected_faces:
+                selected_seed = selected_faces[0]
+
+            selected_component = None
+            if selected_seed is not None:
+                selected_index = int(selected_seed.index)
+                selected_component = next(
+                    (
+                        item
+                        for item in metrics
+                        if any(
+                            int(face.index) == selected_index
+                            for face in item["component"]
+                        )
+                    ),
+                    None,
+                )
+            # An explicit Edit Mode selection is the only fallback that may
+            # bypass the proximity score.  Automatic detection remains the
+            # first choice; selection is consulted only after its confidence
+            # test has failed.
+            chosen = selected_component
+
+        if chosen is None:
+            return None
+        return {
+            "object": retopo_object,
+            "component": list(chosen["component"]),
+            # This is only a hand-off between two immediate BMesh reads during
+            # activation.  It is not used for restoration after topology
+            # changes; direct face refs and the temporary marker layer are
+            # used for that purpose.
+            "component_indices": [
+                int(face.index)
+                for face in chosen["component"]
+                if _retopo_face_is_valid(face)
+            ],
+            "metrics": metrics,
+        }
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _retopo_next_session_id():
+    global _retopo_isolation_serial
+    _retopo_isolation_serial = (_retopo_isolation_serial + 1) & 0x7FFFFFFF
+    if _retopo_isolation_serial == 0:
+        _retopo_isolation_serial = 1
+    # The time component avoids collisions after an add-on reload while old
+    # recovery markers are still present in the current .blend.
+    return ((int(time.time() * 1000000) & 0x7FFFFFFF) ^ _retopo_isolation_serial) or 1
+
+
+def _retopo_layer_names(session_id):
+    prefix = f"__MFO_RETOPO_{session_id:08x}"
+    return {
+        "marker": f"{prefix}_MARKER",
+        "hide": f"{prefix}_HIDE",
+        "select": f"{prefix}_SELECT",
+        "target": f"{prefix}_TARGET",
+        "vert_marker": f"{prefix}_VERT_MARKER",
+        "vert_hide": f"{prefix}_VERT_HIDE",
+        "vert_select": f"{prefix}_VERT_SELECT",
+        "edge_marker": f"{prefix}_EDGE_MARKER",
+        "edge_hide": f"{prefix}_EDGE_HIDE",
+        "edge_select": f"{prefix}_EDGE_SELECT",
+    }
+
+
+def _retopo_set_object_markers(obj, session_id, layer_names):
+    obj[_RETOPO_ISOLATION_TAG] = True
+    obj[_RETOPO_ISOLATION_SESSION] = int(session_id)
+    obj[_RETOPO_ISOLATION_MARKER_LAYER] = layer_names["marker"]
+    obj[_RETOPO_ISOLATION_HIDE_LAYER] = layer_names["hide"]
+    obj[_RETOPO_ISOLATION_SELECT_LAYER] = layer_names["select"]
+    obj[_RETOPO_ISOLATION_TARGET_LAYER] = layer_names["target"]
+    obj[_RETOPO_ISOLATION_VERT_MARKER_LAYER] = layer_names["vert_marker"]
+    obj[_RETOPO_ISOLATION_VERT_HIDE_LAYER] = layer_names["vert_hide"]
+    obj[_RETOPO_ISOLATION_VERT_SELECT_LAYER] = layer_names["vert_select"]
+    obj[_RETOPO_ISOLATION_EDGE_MARKER_LAYER] = layer_names["edge_marker"]
+    obj[_RETOPO_ISOLATION_EDGE_HIDE_LAYER] = layer_names["edge_hide"]
+    obj[_RETOPO_ISOLATION_EDGE_SELECT_LAYER] = layer_names["edge_select"]
+
+
+def _retopo_clear_object_markers(obj):
+    if obj is None:
+        return
+    for key in (
+        _RETOPO_ISOLATION_TAG,
+        _RETOPO_ISOLATION_SESSION,
+        _RETOPO_ISOLATION_MARKER_LAYER,
+        _RETOPO_ISOLATION_HIDE_LAYER,
+        _RETOPO_ISOLATION_SELECT_LAYER,
+        _RETOPO_ISOLATION_TARGET_LAYER,
+        _RETOPO_ISOLATION_VERT_MARKER_LAYER,
+        _RETOPO_ISOLATION_VERT_HIDE_LAYER,
+        _RETOPO_ISOLATION_VERT_SELECT_LAYER,
+        _RETOPO_ISOLATION_EDGE_MARKER_LAYER,
+        _RETOPO_ISOLATION_EDGE_HIDE_LAYER,
+        _RETOPO_ISOLATION_EDGE_SELECT_LAYER,
+    ):
+        try:
+            if key in obj:
+                del obj[key]
+        except (AttributeError, KeyError, ReferenceError, RuntimeError, TypeError):
+            pass
+
+
+def _retopo_begin_isolation(context, reference_object, proxy):
+    """Create a reversible Retopo island isolation state, if confident."""
+    chosen = _retopo_select_island(context, reference_object, proxy)
+    if chosen is None:
+        return None
+
+    retopo_object = chosen["object"]
+    component = chosen["component"]
+    try:
+        bm = bmesh.from_edit_mesh(retopo_object.data)
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+        component_indices = chosen.get("component_indices", ())
+        if component_indices:
+            component_index_set = {
+                int(index)
+                for index in component_indices
+                if 0 <= index < len(bm.faces)
+            }
+            component = [
+                bm.faces[index]
+                for index in component_indices
+                if 0 <= index < len(bm.faces)
+                and _retopo_face_is_valid(bm.faces[index])
+            ]
+        else:
+            component = [
+                face
+                for face in component
+                if _retopo_face_is_valid(face)
+            ]
+            component_index_set = {
+                int(face.index)
+                for face in component
+                if _retopo_face_is_valid(face)
+            }
+        if not component:
+            return None
+        session_id = _retopo_next_session_id()
+        layer_names = _retopo_layer_names(session_id)
+        marker_layer = bm.faces.layers.int.new(layer_names["marker"])
+        hide_layer = bm.faces.layers.int.new(layer_names["hide"])
+        select_layer = bm.faces.layers.int.new(layer_names["select"])
+        target_layer = bm.faces.layers.int.new(layer_names["target"])
+        vert_marker_layer = bm.verts.layers.int.new(layer_names["vert_marker"])
+        vert_hide_layer = bm.verts.layers.int.new(layer_names["vert_hide"])
+        vert_select_layer = bm.verts.layers.int.new(layer_names["vert_select"])
+        edge_marker_layer = bm.edges.layers.int.new(layer_names["edge_marker"])
+        edge_hide_layer = bm.edges.layers.int.new(layer_names["edge_hide"])
+        edge_select_layer = bm.edges.layers.int.new(layer_names["edge_select"])
+
+        target_vertex_indices = {
+            int(vertex.index)
+            for face in bm.faces
+            if int(face.index) in component_index_set
+            for vertex in face.verts
+        }
+        target_edge_indices = {
+            int(edge.index)
+            for face in bm.faces
+            if int(face.index) in component_index_set
+            for edge in face.edges
+        }
+
+        active = bm.select_history.active
+        active_face = (
+            active
+            if isinstance(active, bmesh.types.BMFace)
+            and _retopo_face_is_valid(active)
+            else None
+        )
+        original_records = []
+        initial_faces = []
+        for face in bm.faces:
+            if not _retopo_face_is_valid(face):
+                continue
+            initial_faces.append(face)
+            original_records.append(
+                (face, bool(face.hide), bool(face.select))
+            )
+            face[marker_layer] = session_id
+            face[hide_layer] = int(face.hide)
+            face[select_layer] = int(face.select)
+            face[target_layer] = int(face.index in component_index_set)
+
+        original_vert_records = []
+        initial_verts = []
+        for vertex in bm.verts:
+            initial_verts.append(vertex)
+            original_vert_records.append(
+                (vertex, bool(vertex.hide), bool(vertex.select))
+            )
+            vertex[vert_marker_layer] = session_id
+            vertex[vert_hide_layer] = int(vertex.hide)
+            vertex[vert_select_layer] = int(vertex.select)
+
+        original_edge_records = []
+        initial_edges = []
+        for edge in bm.edges:
+            initial_edges.append(edge)
+            original_edge_records.append(
+                (edge, bool(edge.hide), bool(edge.select))
+            )
+            edge[edge_marker_layer] = session_id
+            edge[edge_hide_layer] = int(edge.hide)
+            edge[edge_select_layer] = int(edge.select)
+
+        for face in initial_faces:
+            if face.index not in component_index_set:
+                face.hide = True
+                face.select = False
+
+        for vertex in initial_verts:
+            if int(vertex.index) not in target_vertex_indices:
+                vertex.hide = True
+                vertex.select = False
+
+        for edge in initial_edges:
+            if int(edge.index) not in target_edge_indices:
+                edge.hide = True
+                edge.select = False
+
+        bmesh.update_edit_mesh(
+            retopo_object.data,
+            loop_triangles=False,
+            destructive=False,
+        )
+        _retopo_set_object_markers(retopo_object, session_id, layer_names)
+        return {
+            "object": retopo_object,
+            "object_name": retopo_object.name,
+            "mesh": retopo_object.data,
+            "session_id": session_id,
+            "layer_names": layer_names,
+            "initial_faces": initial_faces,
+            "original_records": original_records,
+            "component_faces": list(component),
+            "initial_verts": initial_verts,
+            "original_vert_records": original_vert_records,
+            "initial_edges": initial_edges,
+            "original_edge_records": original_edge_records,
+            "active_face": active_face,
+            "topology_stamp": (
+                len(bm.verts),
+                len(bm.edges),
+                len(bm.faces),
+            ),
+        }
+    except (
+        AttributeError,
+        ReferenceError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ):
+        try:
+            if "bm" in locals():
+                for layer in (
+                    locals().get("marker_layer"),
+                    locals().get("hide_layer"),
+                    locals().get("select_layer"),
+                    locals().get("target_layer"),
+                ):
+                    if layer is not None:
+                        bm.faces.layers.int.remove(layer)
+                for layer in (
+                    locals().get("vert_marker_layer"),
+                    locals().get("vert_hide_layer"),
+                    locals().get("vert_select_layer"),
+                ):
+                    if layer is not None:
+                        bm.verts.layers.int.remove(layer)
+                for layer in (
+                    locals().get("edge_marker_layer"),
+                    locals().get("edge_hide_layer"),
+                    locals().get("edge_select_layer"),
+                ):
+                    if layer is not None:
+                        bm.edges.layers.int.remove(layer)
+                bmesh.update_edit_mesh(
+                    retopo_object.data,
+                    loop_triangles=False,
+                    destructive=False,
+                )
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            pass
+        _retopo_clear_object_markers(retopo_object)
+        return None
+
+
+def _retopo_layer_handles(bm, info):
+    names = info.get("layer_names", {})
+    try:
+        return (
+            bm.faces.layers.int.get(names.get("marker", "")),
+            bm.faces.layers.int.get(names.get("hide", "")),
+            bm.faces.layers.int.get(names.get("select", "")),
+            bm.faces.layers.int.get(names.get("target", "")),
+        )
+    except (AttributeError, ReferenceError, RuntimeError, TypeError):
+        return None, None, None, None
+
+
+def _retopo_element_layer_handles(bm, info, domain):
+    names = info.get("layer_names", {})
+    try:
+        elements = getattr(bm, domain)
+        layers = elements.layers.int
+        return (
+            layers.get(names.get(f"{domain[:-1]}_marker", "")),
+            layers.get(names.get(f"{domain[:-1]}_hide", "")),
+            layers.get(names.get(f"{domain[:-1]}_select", "")),
+        )
+    except (AttributeError, ReferenceError, RuntimeError, TypeError):
+        return None, None, None
+
+
+def _retopo_sync_isolation(state, force=False):
+    """Reveal new faces connected to the detected island during editing."""
+    if not isinstance(state, _FaceSetOrbitState):
+        return
+    info = state.retopo_isolation
+    if not info:
+        return
+
+    retopo_object = info.get("object")
+    try:
+        if retopo_object is None or retopo_object.mode != "EDIT":
+            return
+        bm = bmesh.from_edit_mesh(retopo_object.data)
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+        live_initial_faces = [
+            face
+            for face in info.get("initial_faces", ())
+            if _retopo_face_is_valid(face)
+        ]
+        marker_layer, hide_layer, select_layer, target_layer = (
+            _retopo_layer_handles(bm, info)
+        )
+        vert_marker_layer, _vert_hide_layer, _vert_select_layer = (
+            _retopo_element_layer_handles(bm, info, "verts")
+        )
+        edge_marker_layer, _edge_hide_layer, _edge_select_layer = (
+            _retopo_element_layer_handles(bm, info, "edges")
+        )
+        if marker_layer is None:
+            return
+
+        # If Undo rebuilt the BMesh, keep the recovery layer intact.  It is
+        # still the only available way to restore the original hide states.
+        # Rebind its marked faces for subsequent normal cleanup.
+        if not live_initial_faces:
+            rebound_faces = [
+                face
+                for face in bm.faces
+                if int(face[marker_layer]) == int(info["session_id"])
+            ]
+            if rebound_faces:
+                info["initial_faces"] = rebound_faces
+                info["component_faces"] = [
+                    face
+                    for face in rebound_faces
+                    if target_layer is not None and int(face[target_layer])
+                ]
+            if vert_marker_layer is not None:
+                info["initial_verts"] = [
+                    vertex
+                    for vertex in bm.verts
+                    if int(vertex[vert_marker_layer])
+                    == int(info["session_id"])
+                ]
+            if edge_marker_layer is not None:
+                info["initial_edges"] = [
+                    edge
+                    for edge in bm.edges
+                    if int(edge[edge_marker_layer])
+                    == int(info["session_id"])
+                ]
+            info["topology_stamp"] = (
+                len(bm.verts),
+                len(bm.edges),
+                len(bm.faces),
+            )
+            return
+
+        stamp = (len(bm.verts), len(bm.edges), len(bm.faces))
+        if not force and stamp == info.get("topology_stamp"):
+            return
+
+        initial_faces = info.get("initial_faces", ())
+        component_faces = info.get("component_faces", ())
+        initial_indices = {
+            int(face.index)
+            for face in initial_faces
+            if _retopo_face_is_valid(face)
+        }
+        component_indices = {
+            int(face.index)
+            for face in component_faces
+            if _retopo_face_is_valid(face)
+        }
+        new_faces = [
+            face
+            for face in bm.faces
+            if int(face.index) not in initial_indices
+        ]
+        new_indices = {int(face.index) for face in new_faces}
+        reachable_new_indices = set()
+        queue = deque()
+
+        for face in new_faces:
+            copied_target = (
+                target_layer is not None
+                and int(face[target_layer]) == 1
+            )
+            touches_component = any(
+                any(
+                    int(linked_face.index) in component_indices
+                    for linked_face in edge.link_faces
+                )
+                for edge in face.edges
+            )
+            if copied_target or touches_component:
+                reachable_new_indices.add(int(face.index))
+                queue.append(face)
+
+        while queue:
+            current = queue.popleft()
+            for edge in current.edges:
+                for linked_face in edge.link_faces:
+                    linked_index = int(linked_face.index)
+                    if (
+                        linked_index in reachable_new_indices
+                        or linked_index not in new_indices
+                    ):
+                        continue
+                    reachable_new_indices.add(linked_index)
+                    queue.append(linked_face)
+
+        changed = False
+        session_id = int(info["session_id"])
+        for face in new_faces:
+            if int(face[marker_layer]) == session_id:
+                face[marker_layer] = 0
+                if hide_layer is not None:
+                    face[hide_layer] = 0
+                if select_layer is not None:
+                    face[select_layer] = 0
+                if target_layer is not None:
+                    face[target_layer] = 0
+            if int(face.index) in reachable_new_indices and face.hide:
+                face.hide = False
+                changed = True
+
+        info["topology_stamp"] = stamp
+        if changed:
+            bmesh.update_edit_mesh(
+                retopo_object.data,
+                loop_triangles=False,
+                destructive=False,
+            )
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        pass
+
+
+def _retopo_restore_info(info):
+    """Restore one active or orphaned Retopo isolation without mode changes."""
+    if not info:
+        return False
+    retopo_object = info.get("object")
+    if retopo_object is None:
+        retopo_object = bpy.data.objects.get(info.get("object_name", ""))
+    if retopo_object is None or retopo_object.type != "MESH":
+        return False
+
+    bm = None
+    owns_bmesh = False
+    try:
+        if retopo_object.mode == "EDIT":
+            bm = bmesh.from_edit_mesh(retopo_object.data)
+        else:
+            bm = bmesh.new()
+            bm.from_mesh(retopo_object.data)
+            owns_bmesh = True
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+        marker_layer, hide_layer, select_layer, _target_layer = (
+            _retopo_layer_handles(bm, info)
+        )
+        vert_marker_layer, vert_hide_layer, vert_select_layer = (
+            _retopo_element_layer_handles(bm, info, "verts")
+        )
+        edge_marker_layer, edge_hide_layer, edge_select_layer = (
+            _retopo_element_layer_handles(bm, info, "edges")
+        )
+        restored_direct = False
+
+        for face, original_hide, original_select in info.get(
+            "original_records", ()
+        ):
+            if not _retopo_face_is_valid(face):
+                continue
+            face.hide = bool(original_hide)
+            face.select = bool(original_select)
+            restored_direct = True
+
+        for vertex, original_hide, original_select in info.get(
+            "original_vert_records", ()
+        ):
+            if not _retopo_face_is_valid(vertex):
+                continue
+            vertex.hide = bool(original_hide)
+            vertex.select = bool(original_select)
+            restored_direct = True
+
+        for edge, original_hide, original_select in info.get(
+            "original_edge_records", ()
+        ):
+            if not _retopo_face_is_valid(edge):
+                continue
+            edge.hide = bool(original_hide)
+            edge.select = bool(original_select)
+            restored_direct = True
+
+        # The layer fallback covers an Undo-rebuilt BMesh or a lost modal
+        # Python state.  New faces are cleared by _retopo_sync_isolation during
+        # normal operation, so they are not restored as old faces here.
+        if marker_layer is not None and hide_layer is not None:
+            session_id = int(info["session_id"])
+            for face in bm.faces:
+                if int(face[marker_layer]) != session_id:
+                    continue
+                face.hide = bool(face[hide_layer])
+                if select_layer is not None:
+                    face.select = bool(face[select_layer])
+
+        if vert_marker_layer is not None and vert_hide_layer is not None:
+            session_id = int(info["session_id"])
+            for vertex in bm.verts:
+                if int(vertex[vert_marker_layer]) != session_id:
+                    continue
+                vertex.hide = bool(vertex[vert_hide_layer])
+                if vert_select_layer is not None:
+                    vertex.select = bool(vertex[vert_select_layer])
+
+        if edge_marker_layer is not None and edge_hide_layer is not None:
+            session_id = int(info["session_id"])
+            for edge in bm.edges:
+                if int(edge[edge_marker_layer]) != session_id:
+                    continue
+                edge.hide = bool(edge[edge_hide_layer])
+                if edge_select_layer is not None:
+                    edge.select = bool(edge[edge_select_layer])
+
+        active_face = info.get("active_face")
+        if _retopo_face_is_valid(active_face) and active_face.select:
+            try:
+                bm.select_history.add(active_face)
+            except (AttributeError, ReferenceError, RuntimeError, TypeError):
+                pass
+
+        for layer in (
+            marker_layer,
+            hide_layer,
+            select_layer,
+            _target_layer,
+        ):
+            if layer is not None:
+                try:
+                    bm.faces.layers.int.remove(layer)
+                except (AttributeError, ReferenceError, RuntimeError, TypeError):
+                    pass
+
+        for layer in (
+            vert_marker_layer,
+            vert_hide_layer,
+            vert_select_layer,
+        ):
+            if layer is not None:
+                try:
+                    bm.verts.layers.int.remove(layer)
+                except (AttributeError, ReferenceError, RuntimeError, TypeError):
+                    pass
+
+        for layer in (
+            edge_marker_layer,
+            edge_hide_layer,
+            edge_select_layer,
+        ):
+            if layer is not None:
+                try:
+                    bm.edges.layers.int.remove(layer)
+                except (AttributeError, ReferenceError, RuntimeError, TypeError):
+                    pass
+
+        if owns_bmesh:
+            bm.to_mesh(retopo_object.data)
+            retopo_object.data.update()
+        else:
+            bmesh.update_edit_mesh(
+                retopo_object.data,
+                loop_triangles=False,
+                destructive=False,
+            )
+        _retopo_clear_object_markers(retopo_object)
+        return (
+            restored_direct
+            or marker_layer is not None
+            or vert_marker_layer is not None
+            or edge_marker_layer is not None
+        )
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return False
+    finally:
+        if owns_bmesh and bm is not None:
+            try:
+                bm.free()
+            except (ReferenceError, RuntimeError, AttributeError):
+                pass
+
+
+def _retopo_restore_isolation(state):
+    if not isinstance(state, _FaceSetOrbitState):
+        return
+    info = state.retopo_isolation
+    if not info:
+        return
+    # Final topology scan clears copied recovery markers from new faces before
+    # the layer fallback runs.
+    _retopo_sync_isolation(state, force=True)
+    _retopo_restore_info(info)
+    state.retopo_isolation = None
+
+
+def _cleanup_orphan_retopo_isolations():
+    """Restore tagged Retopo hide state when FSMFO Python state is gone."""
+    active_object_names = {
+        state.retopo_isolation.get("object_name")
+        for state in _active_states.values()
+        if isinstance(state, _FaceSetOrbitState)
+        and state.active
+        and state.retopo_isolation
+    }
+    restored_names = []
+    for obj in list(bpy.data.objects):
+        try:
+            if not obj.get(_RETOPO_ISOLATION_TAG, False):
+                continue
+            if obj.name in active_object_names:
+                continue
+            info = {
+                "object": obj,
+                "object_name": obj.name,
+                "session_id": int(obj.get(_RETOPO_ISOLATION_SESSION, 0)),
+                "layer_names": {
+                    "marker": str(obj.get(_RETOPO_ISOLATION_MARKER_LAYER, "")),
+                    "hide": str(obj.get(_RETOPO_ISOLATION_HIDE_LAYER, "")),
+                    "select": str(obj.get(_RETOPO_ISOLATION_SELECT_LAYER, "")),
+                    "target": str(obj.get(_RETOPO_ISOLATION_TARGET_LAYER, "")),
+                    "vert_marker": str(
+                        obj.get(_RETOPO_ISOLATION_VERT_MARKER_LAYER, "")
+                    ),
+                    "vert_hide": str(
+                        obj.get(_RETOPO_ISOLATION_VERT_HIDE_LAYER, "")
+                    ),
+                    "vert_select": str(
+                        obj.get(_RETOPO_ISOLATION_VERT_SELECT_LAYER, "")
+                    ),
+                    "edge_marker": str(
+                        obj.get(_RETOPO_ISOLATION_EDGE_MARKER_LAYER, "")
+                    ),
+                    "edge_hide": str(
+                        obj.get(_RETOPO_ISOLATION_EDGE_HIDE_LAYER, "")
+                    ),
+                    "edge_select": str(
+                        obj.get(_RETOPO_ISOLATION_EDGE_SELECT_LAYER, "")
+                    ),
+                },
+                "original_records": [],
+                "active_face": None,
+            }
+            if _retopo_restore_info(info):
+                restored_names.append(obj.name)
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            pass
+    return restored_names
 
 
 def _world_ray_from_view_center(context):
@@ -898,6 +1838,7 @@ def _finish_state(state):
     """End the modal watcher and restore the saved viewport transform."""
     if not state or not state.active:
         return
+    _retopo_restore_isolation(state)
     _remove_face_set_proxy(state)
     _restore_original_view(state)
     state.active = False
@@ -943,6 +1884,8 @@ def _cleanup_orphan_face_set_proxies():
     visibility marker owned by those proxies.  It never changes mesh data,
     selection, active object, or mode.
     """
+    _cleanup_orphan_retopo_isolations()
+
     active_proxy_pointers = set()
     for state in list(_active_states.values()):
         if not isinstance(state, _FaceSetOrbitState) or not state.active:
@@ -1056,17 +1999,17 @@ def _resync_active_face_set_states_after_undo():
 
         if _is_live_face_set_proxy(state.proxy_object):
             _set_object_hidden(reference, True)
-            continue
-
-        # The normal orphan cleanup above has already removed any stale tagged
-        # proxy and restored the saved Reference visibility.  Rebuild only the
-        # proxy belonging to this still-active FSMFO state.
-        state.proxy_object = None
-        _build_face_set_proxy(state)
+        else:
+            # The normal orphan cleanup above has already removed any stale
+            # tagged proxy and restored the saved Reference visibility.  Rebuild
+            # only the proxy belonging to this still-active FSMFO state.
+            state.proxy_object = None
+            _build_face_set_proxy(state)
 
     _install_polyquilt_qsnap_filter()
     for state in active_face_set_states:
         if state.active:
+            _retopo_sync_isolation(state, force=True)
             _refresh_polyquilt_qsnap(state=state)
             _tag_redraw(state.area)
 
@@ -1258,6 +2201,12 @@ class VIEW3D_OT_mesh_focus_orbit(bpy.types.Operator):
             if face_set_mode and not _build_face_set_proxy(state):
                 state.active = False
                 return {"PASS_THROUGH"}
+            if face_set_mode:
+                state.retopo_isolation = _retopo_begin_isolation(
+                    context,
+                    state.reference_object,
+                    state.proxy_object,
+                )
             _active_states[area_key] = state
             _modal_operator_areas[operator_key] = area_key
             if face_set_mode:
@@ -1266,6 +2215,7 @@ class VIEW3D_OT_mesh_focus_orbit(bpy.types.Operator):
         except (ReferenceError, RuntimeError, AttributeError, TypeError, ValueError):
             _active_states.pop(area_key, None)
             _modal_operator_areas.pop(operator_key, None)
+            _retopo_restore_isolation(state)
             _remove_face_set_proxy(state)
             state.active = False
             _release_polyquilt_qsnap_filter(state=state)
@@ -1286,6 +2236,9 @@ class VIEW3D_OT_mesh_focus_orbit(bpy.types.Operator):
                 _finish_operator(self)
                 return {"CANCELLED"}
             return {"PASS_THROUGH"}
+
+        if isinstance(state, _FaceSetOrbitState):
+            _retopo_sync_isolation(state)
 
         # Passing all events through is what lets Blender's native Navigation
         # Gizmo and MMB orbit continue to handle the gesture.
