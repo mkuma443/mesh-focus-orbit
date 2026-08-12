@@ -9,7 +9,7 @@ rotating the view.
 bl_info = {
     "name": "Mesh Focus Orbit",
     "author": "OpenAI",
-    "version": (2, 1, 6),
+    "version": (2, 1, 8),
     "blender": (5, 2, 0),
     "location": "3D View",
     "description": "Temporary mesh-centered orbit and one-click Smart Face Set Fill",
@@ -94,17 +94,38 @@ SMART_FACE_SET_FILL_ACCEPTANCE_THRESHOLD = 0.60
 SMART_FACE_SET_FILL_MAX_FACES = 100000
 SMART_FACE_SET_FILL_MAX_GEODESIC_SCALE = 350.0
 SMART_FACE_SET_FILL_MAX_GEODESIC_FACTOR = 0.45
+SMART_FACE_SET_FILL_MIN_GEODESIC_FACTOR = 0.03
 SMART_FACE_SET_FILL_NORMAL_SAMPLE_LIMIT = 8
 
+# Strict Smart Face Set Fill parameters. The normal E shortcut keeps the
+# values above; Shift+E uses these tighter local limits to stop at valleys
+# that normal mode is allowed to cross.
+SMART_FACE_SET_FILL_STRICT_NORMAL_SMOOTH_RADIUS_FACTOR = 4.0
+SMART_FACE_SET_FILL_STRICT_NORMAL_VARIATION_WEIGHT = 0.35
+SMART_FACE_SET_FILL_STRICT_NORMAL_ANGLE_LIMIT = math.radians(55.0)
+SMART_FACE_SET_FILL_STRICT_NORMAL_RAW_ANGLE_LIMIT = math.radians(70.0)
+SMART_FACE_SET_FILL_STRICT_RAW_EDGE_WEIGHT = 0.90
+SMART_FACE_SET_FILL_STRICT_RAW_EDGE_ANGLE_LIMIT = math.radians(20.0)
+SMART_FACE_SET_FILL_STRICT_CONCAVITY_PENALTY = 4.0
+SMART_FACE_SET_FILL_STRICT_ACCEPTANCE_THRESHOLD = 0.40
+SMART_FACE_SET_FILL_STRICT_MAX_GEODESIC_SCALE = 160.0
+SMART_FACE_SET_FILL_STRICT_MAX_GEODESIC_FACTOR = 0.12
+SMART_FACE_SET_FILL_STRICT_MIN_GEODESIC_FACTOR = 0.01
 
-# Initial automatic Retopo island classification thresholds.  The current
-# head setup measured a useful separation at 5 mm: the matching island had a
-# near ratio of about 0.90 and the distractor about 0.12.  Keep these as
-# constants so they can be tuned without changing the interaction design.
+
+# Automatic Retopo island classification thresholds and score parameters.
+# Distance scales are deliberately explicit so they can later be adapted to
+# the model scale without changing the interaction design.
 RETOPO_ISOLATION_DISTANCE_TOLERANCE = 0.005
 RETOPO_ISOLATION_MAX_MEDIAN_DISTANCE = 0.010
 RETOPO_ISOLATION_MIN_NEAR_RATIO = 0.65
 RETOPO_ISOLATION_MIN_CONFIDENCE_GAP = 0.15
+RETOPO_ISOLATION_MIN_SCORE = 0.50
+RETOPO_ISOLATION_MEDIAN_DECAY_DISTANCE = 0.002
+RETOPO_ISOLATION_P90_DECAY_DISTANCE = 0.005
+RETOPO_ISOLATION_NEAR_RATIO_WEIGHT = 0.60
+RETOPO_ISOLATION_MEDIAN_QUALITY_WEIGHT = 0.30
+RETOPO_ISOLATION_P90_QUALITY_WEIGHT = 0.10
 RETOPO_ISOLATION_SAMPLE_LIMIT = 200
 
 
@@ -349,6 +370,9 @@ def _retopo_island_metrics(retopo_object, component, proxy_bvh):
     near_ratio = None
     median_distance = None
     p90_distance = None
+    median_quality = None
+    p90_quality = None
+    score = None
     if distances:
         near_ratio = sum(
             distance <= RETOPO_ISOLATION_DISTANCE_TOLERANCE
@@ -356,6 +380,19 @@ def _retopo_island_metrics(retopo_object, component, proxy_bvh):
         ) / len(distances)
         median_distance = statistics.median(distances)
         p90_distance = _retopo_percentile(distances, 0.90)
+        median_quality = math.exp(
+            -max(0.0, median_distance)
+            / RETOPO_ISOLATION_MEDIAN_DECAY_DISTANCE
+        )
+        p90_quality = math.exp(
+            -max(0.0, p90_distance)
+            / RETOPO_ISOLATION_P90_DECAY_DISTANCE
+        )
+        score = (
+            RETOPO_ISOLATION_NEAR_RATIO_WEIGHT * near_ratio
+            + RETOPO_ISOLATION_MEDIAN_QUALITY_WEIGHT * median_quality
+            + RETOPO_ISOLATION_P90_QUALITY_WEIGHT * p90_quality
+        )
     return {
         "component": component,
         "face_count": len(component),
@@ -364,6 +401,9 @@ def _retopo_island_metrics(retopo_object, component, proxy_bvh):
         "near_ratio": near_ratio,
         "median_distance": median_distance,
         "p90_distance": p90_distance,
+        "median_quality": median_quality,
+        "p90_quality": p90_quality,
+        "score": score,
     }
 
 
@@ -372,9 +412,45 @@ def _retopo_candidate_is_acceptable(metrics):
         metrics is not None
         and metrics["near_ratio"] is not None
         and metrics["median_distance"] is not None
+        and metrics["score"] is not None
         and metrics["near_ratio"] >= RETOPO_ISOLATION_MIN_NEAR_RATIO
         and metrics["median_distance"] <= RETOPO_ISOLATION_MAX_MEDIAN_DISTANCE
+        and metrics["score"] >= RETOPO_ISOLATION_MIN_SCORE
     )
+
+
+def _retopo_selected_element(bm):
+    """Return the preferred selected Face, Edge, or Vertex for fallback."""
+    active = bm.select_history.active
+    selected_faces = [face for face in bm.faces if face.select]
+    if isinstance(active, bmesh.types.BMFace) and _retopo_face_is_valid(active):
+        if active.select:
+            return active
+    if selected_faces:
+        return selected_faces[0]
+
+    selected_edges = [edge for edge in bm.edges if edge.select and edge.is_valid]
+    if isinstance(active, bmesh.types.BMEdge) and active.is_valid and active.select:
+        return active
+    if selected_edges:
+        return selected_edges[0]
+
+    selected_verts = [vertex for vertex in bm.verts if vertex.select and vertex.is_valid]
+    if isinstance(active, bmesh.types.BMVert) and active.is_valid and active.select:
+        return active
+    if selected_verts:
+        return selected_verts[0]
+    return None
+
+
+def _retopo_component_matches_element(component, element):
+    if isinstance(element, bmesh.types.BMFace):
+        return any(face is element for face in component)
+    if isinstance(element, bmesh.types.BMEdge):
+        return any(element in face.edges for face in component)
+    if isinstance(element, bmesh.types.BMVert):
+        return any(element in face.verts for face in component)
+    return False
 
 
 def _retopo_select_island(context, reference_object, proxy):
@@ -397,6 +473,7 @@ def _retopo_select_island(context, reference_object, proxy):
         ranked = sorted(
             metrics,
             key=lambda item: (
+                item["score"] if item["score"] is not None else -1.0,
                 item["near_ratio"] if item["near_ratio"] is not None else -1.0,
                 -(
                     item["median_distance"]
@@ -417,8 +494,12 @@ def _retopo_select_island(context, reference_object, proxy):
                 auto_confident = True
             else:
                 next_best = ranked[1]
-                ratio_gap = best["near_ratio"] - next_best["near_ratio"]
-                auto_confident = ratio_gap >= RETOPO_ISOLATION_MIN_CONFIDENCE_GAP
+                score_gap = best["score"] - (
+                    next_best["score"]
+                    if next_best["score"] is not None
+                    else -1.0
+                )
+                auto_confident = score_gap >= RETOPO_ISOLATION_MIN_CONFIDENCE_GAP
 
         if auto_confident:
             chosen = best
@@ -426,32 +507,21 @@ def _retopo_select_island(context, reference_object, proxy):
             # Selection is only a fallback when proximity confidence is not
             # sufficient.  It is never allowed to override a clear automatic
             # result.
-            selected_faces = [face for face in bm.faces if face.select]
-            active = bm.select_history.active
-            selected_seed = None
-            if (
-                isinstance(active, bmesh.types.BMFace)
-                and _retopo_face_is_valid(active)
-                and active.select
-            ):
-                selected_seed = active
-            elif selected_faces:
-                selected_seed = selected_faces[0]
-
+            selected_seed = _retopo_selected_element(bm)
             selected_component = None
             if selected_seed is not None:
-                selected_index = int(selected_seed.index)
-                selected_component = next(
-                    (
-                        item
-                        for item in metrics
-                        if any(
-                            int(face.index) == selected_index
-                            for face in item["component"]
-                        )
-                    ),
-                    None,
-                )
+                matching_components = [
+                    item
+                    for item in metrics
+                    if _retopo_component_matches_element(
+                        item["component"], selected_seed
+                    )
+                ]
+                # A vertex can touch multiple edge-connected components at a
+                # point.  Do not isolate an arbitrary one in that ambiguous
+                # case.
+                if len(matching_components) == 1:
+                    selected_component = matching_components[0]
             # An explicit Edit Mode selection is the only fallback that may
             # bypass the proximity score.  Automatic detection remains the
             # first choice; selection is consulted only after its confidence
@@ -2477,12 +2547,12 @@ def _local_face_smoothed_normal(state, face_index):
         center_geometry["scale"] * 3.0,
     )
     radius_squared = radius * radius
-    raw_angle_limit = math.cos(SMART_FACE_SET_FILL_NORMAL_RAW_ANGLE_LIMIT)
+    raw_angle_limit = math.cos(state["normal_raw_angle_limit"])
 
     weighted_normal = base_normal * center_geometry["area"]
     sample_count = 1
     for neighbor, _edge_index in _local_face_neighbors(state, face_index):
-        if sample_count >= SMART_FACE_SET_FILL_NORMAL_SAMPLE_LIMIT:
+        if sample_count >= state["normal_sample_limit"]:
             break
         geometry = _local_face_geometry(state, neighbor)
         offset = geometry["center"] - center
@@ -2521,9 +2591,9 @@ def _local_face_transition_cost(state, face_index, neighbor, edge_index):
     dot_normal = max(-1.0, min(1.0, current_normal.dot(neighbor_normal)))
     normal_angle = math.acos(dot_normal)
     normal_cost = min(
-        normal_angle / SMART_FACE_SET_FILL_NORMAL_ANGLE_LIMIT,
+        normal_angle / state["normal_angle_limit"],
         2.0,
-    ) * SMART_FACE_SET_FILL_NORMAL_VARIATION_WEIGHT
+    ) * state["normal_variation_weight"]
 
     raw_dot = max(
         -1.0,
@@ -2531,9 +2601,9 @@ def _local_face_transition_cost(state, face_index, neighbor, edge_index):
     )
     raw_angle = math.acos(raw_dot)
     raw_edge_cost = min(
-        raw_angle / SMART_FACE_SET_FILL_RAW_EDGE_ANGLE_LIMIT,
+        raw_angle / state["raw_edge_angle_limit"],
         2.0,
-    ) * SMART_FACE_SET_FILL_RAW_EDGE_WEIGHT
+    ) * state["raw_edge_weight"]
 
     concavity = 0.0
     edge_direction = _local_face_edge_direction(state, face_index, edge_index)
@@ -2546,13 +2616,13 @@ def _local_face_transition_cost(state, face_index, neighbor, edge_index):
         concavity = max(0.0, min(1.0, (-turn - 0.15) / 0.65))
 
     cost = normal_cost + raw_edge_cost + (
-        concavity * SMART_FACE_SET_FILL_CONCAVITY_PENALTY
+        concavity * state["concavity_penalty"]
     )
     state["transition_cache"][cache_key] = cost
     return cost
 
 
-def _smart_face_set_fill(context, coord):
+def _smart_face_set_fill(context, coord, strict_mode=False):
     """Find and apply one geometry-aware Face Set region."""
     hit = _raycast_sculpt_face_set(context, coord)
     if hit is None:
@@ -2564,6 +2634,39 @@ def _smart_face_set_fill(context, coord):
     if face_set_attr is None or face_set_attr.domain != "FACE":
         return None
 
+    if strict_mode:
+        parameters = {
+            "normal_smoothing_radius_factor": SMART_FACE_SET_FILL_STRICT_NORMAL_SMOOTH_RADIUS_FACTOR,
+            "normal_variation_weight": SMART_FACE_SET_FILL_STRICT_NORMAL_VARIATION_WEIGHT,
+            "normal_angle_limit": SMART_FACE_SET_FILL_STRICT_NORMAL_ANGLE_LIMIT,
+            "normal_raw_angle_limit": SMART_FACE_SET_FILL_STRICT_NORMAL_RAW_ANGLE_LIMIT,
+            "normal_sample_limit": SMART_FACE_SET_FILL_NORMAL_SAMPLE_LIMIT,
+            "raw_edge_weight": SMART_FACE_SET_FILL_STRICT_RAW_EDGE_WEIGHT,
+            "raw_edge_angle_limit": SMART_FACE_SET_FILL_STRICT_RAW_EDGE_ANGLE_LIMIT,
+            "concavity_penalty": SMART_FACE_SET_FILL_STRICT_CONCAVITY_PENALTY,
+            "acceptance_threshold": SMART_FACE_SET_FILL_STRICT_ACCEPTANCE_THRESHOLD,
+            "max_faces": SMART_FACE_SET_FILL_MAX_FACES,
+            "max_geodesic_scale": SMART_FACE_SET_FILL_STRICT_MAX_GEODESIC_SCALE,
+            "max_geodesic_factor": SMART_FACE_SET_FILL_STRICT_MAX_GEODESIC_FACTOR,
+            "min_geodesic_factor": SMART_FACE_SET_FILL_STRICT_MIN_GEODESIC_FACTOR,
+        }
+    else:
+        parameters = {
+            "normal_smoothing_radius_factor": SMART_FACE_SET_FILL_NORMAL_SMOOTH_RADIUS_FACTOR,
+            "normal_variation_weight": SMART_FACE_SET_FILL_NORMAL_VARIATION_WEIGHT,
+            "normal_angle_limit": SMART_FACE_SET_FILL_NORMAL_ANGLE_LIMIT,
+            "normal_raw_angle_limit": SMART_FACE_SET_FILL_NORMAL_RAW_ANGLE_LIMIT,
+            "normal_sample_limit": SMART_FACE_SET_FILL_NORMAL_SAMPLE_LIMIT,
+            "raw_edge_weight": SMART_FACE_SET_FILL_RAW_EDGE_WEIGHT,
+            "raw_edge_angle_limit": SMART_FACE_SET_FILL_RAW_EDGE_ANGLE_LIMIT,
+            "concavity_penalty": SMART_FACE_SET_FILL_CONCAVITY_PENALTY,
+            "acceptance_threshold": SMART_FACE_SET_FILL_ACCEPTANCE_THRESHOLD,
+            "max_faces": SMART_FACE_SET_FILL_MAX_FACES,
+            "max_geodesic_scale": SMART_FACE_SET_FILL_MAX_GEODESIC_SCALE,
+            "max_geodesic_factor": SMART_FACE_SET_FILL_MAX_GEODESIC_FACTOR,
+            "min_geodesic_factor": SMART_FACE_SET_FILL_MIN_GEODESIC_FACTOR,
+        }
+
     state = {
         "object": obj,
         "mesh": mesh,
@@ -2571,20 +2674,22 @@ def _smart_face_set_fill(context, coord):
         "geometry_cache": {},
         "smoothed_normals": {},
         "transition_cache": {},
+        "strict_mode": bool(strict_mode),
+        **parameters,
     }
 
     seed_geometry = _local_face_geometry(state, seed_face)
     seed_scale = seed_geometry["scale"]
     state["normal_smoothing_radius"] = max(
-        seed_scale * SMART_FACE_SET_FILL_NORMAL_SMOOTH_RADIUS_FACTOR,
+        seed_scale * state["normal_smoothing_radius_factor"],
         1.0e-8,
     )
     object_diagonal = max(Vector(obj.dimensions).length, 1.0e-8)
     state["max_geodesic_distance"] = max(
-        object_diagonal * 0.03,
+        object_diagonal * state["min_geodesic_factor"],
         min(
-            seed_scale * SMART_FACE_SET_FILL_MAX_GEODESIC_SCALE,
-            object_diagonal * SMART_FACE_SET_FILL_MAX_GEODESIC_FACTOR,
+            seed_scale * state["max_geodesic_scale"],
+            object_diagonal * state["max_geodesic_factor"],
         ),
     )
 
@@ -2593,7 +2698,7 @@ def _smart_face_set_fill(context, coord):
     heap = [(0.0, 0.0, seed_face)]
     candidates = set()
 
-    while heap and len(candidates) < SMART_FACE_SET_FILL_MAX_FACES:
+    while heap and len(candidates) < state["max_faces"]:
         path_cost, path_distance, face_index = heapq.heappop(heap)
         known_cost = best_cost.get(face_index, float("inf"))
         known_distance = best_distance.get(face_index, float("inf"))
@@ -2624,7 +2729,7 @@ def _smart_face_set_fill(context, coord):
                 edge_index,
             )
             next_cost = max(path_cost, transition_cost)
-            if next_cost > SMART_FACE_SET_FILL_ACCEPTANCE_THRESHOLD:
+            if next_cost > state["acceptance_threshold"]:
                 continue
 
             previous_cost = best_cost.get(neighbor, float("inf"))
@@ -2663,6 +2768,7 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
 
     mouse_region_x: IntProperty(options={"SKIP_SAVE"})
     mouse_region_y: IntProperty(options={"SKIP_SAVE"})
+    strict_mode: BoolProperty(options={"SKIP_SAVE"}, default=False)
 
     @classmethod
     def poll(cls, context):
@@ -2688,6 +2794,9 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
 
         self.mouse_region_x = int(mouse_x)
         self.mouse_region_y = int(mouse_y)
+        self.strict_mode = bool(
+            self.strict_mode or getattr(event, "shift", False)
+        )
         return self.execute(context)
 
     def execute(self, context):
@@ -2698,6 +2807,7 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
             result = _smart_face_set_fill(
                 context,
                 Vector((self.mouse_region_x, self.mouse_region_y)),
+                strict_mode=bool(self.strict_mode),
             )
         except (
             AttributeError,
@@ -2784,6 +2894,15 @@ def _rebuild_keymaps():
             "PRESS",
         )
         _addon_keymaps.append((keymap, local_grow_item))
+
+        strict_grow_item = keymap.keymap_items.new(
+            LOCAL_FACE_SET_GROW_OPERATOR_ID,
+            LOCAL_FACE_SET_GROW_KEY,
+            "PRESS",
+            shift=True,
+        )
+        strict_grow_item.properties.strict_mode = True
+        _addon_keymaps.append((keymap, strict_grow_item))
     except (AttributeError, RuntimeError, TypeError, ValueError):
         _remove_keymaps()
 
