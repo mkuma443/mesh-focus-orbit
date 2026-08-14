@@ -9,7 +9,7 @@ rotating the view.
 bl_info = {
     "name": "Mesh Focus Orbit",
     "author": "OpenAI",
-    "version": (2, 1, 13),
+    "version": (2, 1, 18),
     "blender": (5, 2, 0),
     "location": "3D View",
     "description": "Temporary mesh-centered orbit and one-click Smart Face Set Fill",
@@ -1673,6 +1673,53 @@ def _draw_debug_point(state):
         pass
 
 
+def _rounded_rect_points(x_min, y_min, x_max, y_max, radius, segments=6):
+    radius = max(0.0, min(radius, (x_max - x_min) * 0.5, (y_max - y_min) * 0.5))
+    corners = (
+        (x_min + radius, y_min + radius, math.pi, math.pi * 1.5),
+        (x_max - radius, y_min + radius, math.pi * 1.5, math.pi * 2.0),
+        (x_max - radius, y_max - radius, 0.0, math.pi * 0.5),
+        (x_min + radius, y_max - radius, math.pi * 0.5, math.pi),
+    )
+    points = []
+    for center_x, center_y, start_angle, end_angle in corners:
+        for index in range(segments + 1):
+            factor = index / segments
+            angle = start_angle + (end_angle - start_angle) * factor
+            points.append(
+                (
+                    center_x + math.cos(angle) * radius,
+                    center_y + math.sin(angle) * radius,
+                )
+            )
+    return points
+
+
+def _draw_rounded_indicator_box(x_min, y_min, x_max, y_max):
+    points = _rounded_rect_points(x_min, y_min, x_max, y_max, 10.0)
+    center = ((x_min + x_max) * 0.5, (y_min + y_max) * 0.5)
+    fill_vertices = []
+    for index, point in enumerate(points):
+        fill_vertices.extend(
+            (center, point, points[(index + 1) % len(points)])
+        )
+
+    shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+    fill_batch = batch_for_shader(shader, "TRIS", {"pos": fill_vertices})
+    shader.bind()
+    shader.uniform_float("color", (0.015, 0.045, 0.035, 0.78))
+    fill_batch.draw(shader)
+
+    outline_batch = batch_for_shader(
+        shader,
+        "LINE_STRIP",
+        {"pos": points + [points[0]]},
+    )
+    shader.bind()
+    shader.uniform_float("color", (0.35, 1.0, 0.75, 0.9))
+    outline_batch.draw(shader)
+
+
 def _draw_indicator_text(state):
     """Draw the MFO indicator without using the shared area header text."""
     if not state or not state.active:
@@ -1691,20 +1738,45 @@ def _draw_indicator_text(state):
             return
 
         font_id = 0
-        # Keep the baseline below the top edge of the Window region.  On
-        # high-DPI displays a baseline only a few pixels from the edge can be
-        # clipped by the Viewport header/overlay compositor.
-        y = max(24, context_region.height - 80)
+        # This is the top edge of the indicator box.  RetopoFlow can add a
+        # second tool row inside the top of the viewport, so keep the box just
+        # below that area while staying close to Blender's own overlay text.
+        box_top = max(24, context_region.height - 90)
         gpu.state.blend_set("ALPHA")
         try:
             blf.size(font_id, 18)
             blf.color(font_id, 0.35, 1.0, 0.75, 1.0)
-            text_width, _text_height = blf.dimensions(
+            text_width, text_height = blf.dimensions(
                 font_id,
                 state.indicator_text,
             )
-            x = max(8, (context_region.width - text_width) * 0.5)
-            blf.position(font_id, x, y, 0)
+            padding_x = 18.0
+            padding_top = 10.0
+            padding_bottom = 9.0
+            box_width = text_width + padding_x * 2.0
+            box_height = text_height + padding_top + padding_bottom
+            box_left = max(8.0, (context_region.width - box_width) * 0.5)
+            box_right = min(
+                context_region.width - 8.0,
+                box_left + box_width,
+            )
+            box_bottom = box_top - box_height
+
+            try:
+                _draw_rounded_indicator_box(
+                    box_left,
+                    box_bottom,
+                    box_right,
+                    box_top,
+                )
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                # The panel is optional; keep the text visible if GPU drawing
+                # is unavailable in a particular viewport context.
+                pass
+
+            text_x = box_left + padding_x
+            text_y = box_bottom + padding_bottom
+            blf.position(font_id, text_x, text_y, 0)
             blf.draw(font_id, state.indicator_text)
         finally:
             gpu.state.blend_set("NONE")
