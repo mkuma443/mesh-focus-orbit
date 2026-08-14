@@ -9,7 +9,7 @@ rotating the view.
 bl_info = {
     "name": "Mesh Focus Orbit",
     "author": "OpenAI",
-    "version": (2, 1, 8),
+    "version": (2, 1, 13),
     "blender": (5, 2, 0),
     "location": "3D View",
     "description": "Temporary mesh-centered orbit and one-click Smart Face Set Fill",
@@ -18,6 +18,7 @@ bl_info = {
 
 import bpy
 import bmesh
+import blf
 import gpu
 import heapq
 import math
@@ -185,6 +186,7 @@ class _TempOrbitState:
         "is_perspective",
         "activation_key",
         "draw_handler",
+        "indicator_draw_handler",
         "active",
         "indicator_text",
     )
@@ -206,6 +208,7 @@ class _TempOrbitState:
         self.is_perspective = self.rv3d.view_perspective in {"PERSP", "CAMERA"}
         self.activation_key = activation_key
         self.draw_handler = None
+        self.indicator_draw_handler = None
         self.active = True
         self.indicator_text = "MESH FOCUS ORBIT ON"
 
@@ -756,11 +759,6 @@ def _retopo_begin_isolation(context, reference_object, proxy):
             "initial_edges": initial_edges,
             "original_edge_records": original_edge_records,
             "active_face": active_face,
-            "topology_stamp": (
-                len(bm.verts),
-                len(bm.edges),
-                len(bm.faces),
-            ),
         }
     except (
         AttributeError,
@@ -831,156 +829,6 @@ def _retopo_element_layer_handles(bm, info, domain):
         return None, None, None
 
 
-def _retopo_sync_isolation(state, force=False):
-    """Reveal new faces connected to the detected island during editing."""
-    if not isinstance(state, _FaceSetOrbitState):
-        return
-    info = state.retopo_isolation
-    if not info:
-        return
-
-    retopo_object = info.get("object")
-    try:
-        if retopo_object is None or retopo_object.mode != "EDIT":
-            return
-        bm = bmesh.from_edit_mesh(retopo_object.data)
-        bm.verts.ensure_lookup_table()
-        bm.edges.ensure_lookup_table()
-        bm.faces.ensure_lookup_table()
-        live_initial_faces = [
-            face
-            for face in info.get("initial_faces", ())
-            if _retopo_face_is_valid(face)
-        ]
-        marker_layer, hide_layer, select_layer, target_layer = (
-            _retopo_layer_handles(bm, info)
-        )
-        vert_marker_layer, _vert_hide_layer, _vert_select_layer = (
-            _retopo_element_layer_handles(bm, info, "verts")
-        )
-        edge_marker_layer, _edge_hide_layer, _edge_select_layer = (
-            _retopo_element_layer_handles(bm, info, "edges")
-        )
-        if marker_layer is None:
-            return
-
-        # If Undo rebuilt the BMesh, keep the recovery layer intact.  It is
-        # still the only available way to restore the original hide states.
-        # Rebind its marked faces for subsequent normal cleanup.
-        if not live_initial_faces:
-            rebound_faces = [
-                face
-                for face in bm.faces
-                if int(face[marker_layer]) == int(info["session_id"])
-            ]
-            if rebound_faces:
-                info["initial_faces"] = rebound_faces
-                info["component_faces"] = [
-                    face
-                    for face in rebound_faces
-                    if target_layer is not None and int(face[target_layer])
-                ]
-            if vert_marker_layer is not None:
-                info["initial_verts"] = [
-                    vertex
-                    for vertex in bm.verts
-                    if int(vertex[vert_marker_layer])
-                    == int(info["session_id"])
-                ]
-            if edge_marker_layer is not None:
-                info["initial_edges"] = [
-                    edge
-                    for edge in bm.edges
-                    if int(edge[edge_marker_layer])
-                    == int(info["session_id"])
-                ]
-            info["topology_stamp"] = (
-                len(bm.verts),
-                len(bm.edges),
-                len(bm.faces),
-            )
-            return
-
-        stamp = (len(bm.verts), len(bm.edges), len(bm.faces))
-        if not force and stamp == info.get("topology_stamp"):
-            return
-
-        initial_faces = info.get("initial_faces", ())
-        component_faces = info.get("component_faces", ())
-        initial_indices = {
-            int(face.index)
-            for face in initial_faces
-            if _retopo_face_is_valid(face)
-        }
-        component_indices = {
-            int(face.index)
-            for face in component_faces
-            if _retopo_face_is_valid(face)
-        }
-        new_faces = [
-            face
-            for face in bm.faces
-            if int(face.index) not in initial_indices
-        ]
-        new_indices = {int(face.index) for face in new_faces}
-        reachable_new_indices = set()
-        queue = deque()
-
-        for face in new_faces:
-            copied_target = (
-                target_layer is not None
-                and int(face[target_layer]) == 1
-            )
-            touches_component = any(
-                any(
-                    int(linked_face.index) in component_indices
-                    for linked_face in edge.link_faces
-                )
-                for edge in face.edges
-            )
-            if copied_target or touches_component:
-                reachable_new_indices.add(int(face.index))
-                queue.append(face)
-
-        while queue:
-            current = queue.popleft()
-            for edge in current.edges:
-                for linked_face in edge.link_faces:
-                    linked_index = int(linked_face.index)
-                    if (
-                        linked_index in reachable_new_indices
-                        or linked_index not in new_indices
-                    ):
-                        continue
-                    reachable_new_indices.add(linked_index)
-                    queue.append(linked_face)
-
-        changed = False
-        session_id = int(info["session_id"])
-        for face in new_faces:
-            if int(face[marker_layer]) == session_id:
-                face[marker_layer] = 0
-                if hide_layer is not None:
-                    face[hide_layer] = 0
-                if select_layer is not None:
-                    face[select_layer] = 0
-                if target_layer is not None:
-                    face[target_layer] = 0
-            if int(face.index) in reachable_new_indices and face.hide:
-                face.hide = False
-                changed = True
-
-        info["topology_stamp"] = stamp
-        if changed:
-            bmesh.update_edit_mesh(
-                retopo_object.data,
-                loop_triangles=False,
-                destructive=False,
-            )
-    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
-        pass
-
-
 def _retopo_restore_info(info):
     """Restore one active or orphaned Retopo isolation without mode changes."""
     if not info:
@@ -1042,8 +890,8 @@ def _retopo_restore_info(info):
             restored_direct = True
 
         # The layer fallback covers an Undo-rebuilt BMesh or a lost modal
-        # Python state.  New faces are cleared by _retopo_sync_isolation during
-        # normal operation, so they are not restored as old faces here.
+        # Python state.  New elements have no session marker, so they remain
+        # untouched and are not restored as old elements here.
         if marker_layer is not None and hide_layer is not None:
             session_id = int(info["session_id"])
             for face in bm.faces:
@@ -1144,9 +992,8 @@ def _retopo_restore_isolation(state):
     info = state.retopo_isolation
     if not info:
         return
-    # Final topology scan clears copied recovery markers from new faces before
-    # the layer fallback runs.
-    _retopo_sync_isolation(state, force=True)
+    # Restore only elements marked at activation.  New topology is deliberately
+    # left untouched so RetopoFlow edits survive FSMFO teardown.
     _retopo_restore_info(info)
     state.retopo_isolation = None
 
@@ -1826,6 +1673,76 @@ def _draw_debug_point(state):
         pass
 
 
+def _draw_indicator_text(state):
+    """Draw the MFO indicator without using the shared area header text."""
+    if not state or not state.active:
+        return
+
+    try:
+        context_area = bpy.context.area
+        context_region = bpy.context.region
+        if context_area is None or context_region is None:
+            return
+        if context_area.as_pointer() != state.area.as_pointer():
+            return
+        if context_region.as_pointer() != state.region.as_pointer():
+            return
+        if context_region.type != "WINDOW":
+            return
+
+        font_id = 0
+        # Keep the baseline below the top edge of the Window region.  On
+        # high-DPI displays a baseline only a few pixels from the edge can be
+        # clipped by the Viewport header/overlay compositor.
+        y = max(24, context_region.height - 80)
+        gpu.state.blend_set("ALPHA")
+        try:
+            blf.size(font_id, 18)
+            blf.color(font_id, 0.35, 1.0, 0.75, 1.0)
+            text_width, _text_height = blf.dimensions(
+                font_id,
+                state.indicator_text,
+            )
+            x = max(8, (context_region.width - text_width) * 0.5)
+            blf.position(font_id, x, y, 0)
+            blf.draw(font_id, state.indicator_text)
+        finally:
+            gpu.state.blend_set("NONE")
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        # The indicator is optional and must never affect viewport operation.
+        pass
+
+
+def _start_indicator_draw(state):
+    prefs = _addon_preferences()
+    if prefs is not None and not prefs.show_indicator:
+        return
+    if state.indicator_draw_handler is not None:
+        return
+    try:
+        state.indicator_draw_handler = bpy.types.SpaceView3D.draw_handler_add(
+            _draw_indicator_text,
+            (state,),
+            "WINDOW",
+            "POST_PIXEL",
+        )
+    except (AttributeError, RuntimeError, TypeError):
+        state.indicator_draw_handler = None
+
+
+def _stop_indicator_draw(state):
+    if state.indicator_draw_handler is None:
+        return
+    try:
+        bpy.types.SpaceView3D.draw_handler_remove(
+            state.indicator_draw_handler,
+            "WINDOW",
+        )
+    except (AttributeError, RuntimeError, TypeError):
+        pass
+    state.indicator_draw_handler = None
+
+
 def _start_debug_draw(state):
     prefs = _addon_preferences()
     if not prefs or not prefs.debug_display:
@@ -1866,13 +1783,7 @@ def _activate_state(state):
         rv3d.update()
     except (AttributeError, RuntimeError, TypeError):
         pass
-    prefs = _addon_preferences()
-    try:
-        state.area.header_text_set(
-            state.indicator_text if not prefs or prefs.show_indicator else None
-        )
-    except (AttributeError, ReferenceError, RuntimeError, TypeError):
-        pass
+    _start_indicator_draw(state)
     _start_debug_draw(state)
     _tag_redraw(state.area)
 
@@ -1913,10 +1824,7 @@ def _finish_state(state):
     _restore_original_view(state)
     state.active = False
     _release_polyquilt_qsnap_filter(state=state)
-    try:
-        state.area.header_text_set(None)
-    except (AttributeError, ReferenceError, RuntimeError, TypeError):
-        pass
+    _stop_indicator_draw(state)
     _stop_debug_draw(state)
     _tag_redraw(state.area)
 
@@ -2079,7 +1987,6 @@ def _resync_active_face_set_states_after_undo():
     _install_polyquilt_qsnap_filter()
     for state in active_face_set_states:
         if state.active:
-            _retopo_sync_isolation(state, force=True)
             _refresh_polyquilt_qsnap(state=state)
             _tag_redraw(state.area)
 
@@ -2306,9 +2213,6 @@ class VIEW3D_OT_mesh_focus_orbit(bpy.types.Operator):
                 _finish_operator(self)
                 return {"CANCELLED"}
             return {"PASS_THROUGH"}
-
-        if isinstance(state, _FaceSetOrbitState):
-            _retopo_sync_isolation(state)
 
         # Passing all events through is what lets Blender's native Navigation
         # Gizmo and MMB orbit continue to handle the gesture.
