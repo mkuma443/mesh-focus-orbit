@@ -715,10 +715,22 @@ def _retopo_begin_isolation(context, reference_object, proxy):
             face[select_layer] = int(face.select)
             face[target_layer] = int(face.index in component_index_set)
 
+        try:
+            bm.verts.index_update()
+        except (AttributeError, ReferenceError, RuntimeError, TypeError):
+            pass
+
         original_vert_records = []
         initial_verts = []
+        initial_vert_indices = []
+        initial_vert_hide_values = []
         for vertex in bm.verts:
             initial_verts.append(vertex)
+            try:
+                initial_vert_indices.append(int(vertex.index))
+            except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+                initial_vert_indices.append(-1)
+            initial_vert_hide_values.append(int(vertex.hide))
             original_vert_records.append(
                 (vertex, bool(vertex.hide), bool(vertex.select))
             )
@@ -768,6 +780,8 @@ def _retopo_begin_isolation(context, reference_object, proxy):
             "original_records": original_records,
             "component_faces": list(component),
             "initial_verts": initial_verts,
+            "initial_vert_indices": initial_vert_indices,
+            "initial_vert_hide_values": initial_vert_hide_values,
             "original_vert_records": original_vert_records,
             "initial_edges": initial_edges,
             "original_edge_records": original_edge_records,
@@ -1367,19 +1381,14 @@ def _retopoflow_hidden_vertex_filter_enabled():
     )
 
 
-def _retopoflow_filter_context_applies(context):
-    """Return whether *context* is the FSMFO-isolated Edit Mesh.
-
-    The runtime hook is deliberately narrower than a global RetopoFlow patch:
-    it only filters the Edit Mesh that MFO hid as part of an active Face Set
-    isolation session.
-    """
+def _retopoflow_filter_info(context):
+    """Return the active FSMFO Retopo isolation info for *context*."""
     try:
         edit_object = context.edit_object
         if edit_object is None or edit_object.mode != "EDIT":
-            return False
+            return None
     except (AttributeError, ReferenceError, RuntimeError, TypeError):
-        return False
+        return None
 
     for state in _active_states.values():
         if not isinstance(state, _FaceSetOrbitState) or not state.active:
@@ -1389,19 +1398,127 @@ def _retopoflow_filter_context_applies(context):
             continue
         try:
             if info.get("object") is edit_object:
-                return True
+                return info
             if info.get("object_name") == edit_object.name:
-                return True
+                return info
         except (AttributeError, ReferenceError, RuntimeError, TypeError):
             continue
-    return False
+    return None
 
 
-def _retopoflow_hidden_vertex_is_allowed(vertex):
+def _retopoflow_mfo_vertex_filter(context):
+    """Build a filter for only pre-existing vertices hidden by this session.
+
+    A plain ``vertex.hide`` check is too broad: it also classifies any vertex
+    created after FSMFO started.  The isolation marker is initialized on every
+    vertex that existed at activation.  Directly-created vertices use the
+    layer default, while split/copy operations may inherit custom data; the
+    saved element identity/index guard keeps those new vertices outside this
+    filter as well.
+    """
+    info = _retopoflow_filter_info(context)
+    if info is None:
+        return None
+
     try:
-        return not bool(vertex.hide)
-    except (AttributeError, ReferenceError, RuntimeError, TypeError):
-        return False
+        edit_object = context.edit_object
+        layer_names = info.get("layer_names") or {}
+        marker_name = layer_names.get("vert_marker")
+        hide_name = layer_names.get("vert_hide")
+        if not marker_name or not hide_name:
+            return None
+        bm = bmesh.from_edit_mesh(edit_object.data)
+        marker_layer = bm.verts.layers.int.get(marker_name)
+        hide_layer = bm.verts.layers.int.get(hide_name)
+        session_id = int(info["session_id"])
+        initial_vertex_pointers = set()
+        for initial_vertex in info.get("initial_verts", ()):
+            try:
+                if initial_vertex.is_valid:
+                    pointer = initial_vertex.as_pointer()
+                    if pointer:
+                        initial_vertex_pointers.add(pointer)
+            except (AttributeError, ReferenceError, RuntimeError, TypeError):
+                continue
+        initial_vertex_indices = {
+            int(index)
+            for index in info.get("initial_vert_indices", ())
+            if isinstance(index, int) and index >= 0
+        }
+        try:
+            bm.verts.index_update()
+        except (AttributeError, ReferenceError, RuntimeError, TypeError):
+            pass
+
+        initial_vertex_hide_by_index = {
+            int(index): int(hide_value)
+            for index, hide_value in zip(
+                info.get("initial_vert_indices", ()),
+                info.get("initial_vert_hide_values", ()),
+            )
+            if isinstance(index, int) and index >= 0
+        }
+
+        if marker_layer is None or hide_layer is None:
+            # RetopoFlow can rebuild the Edit BMesh and discard MFO's
+            # temporary layers.  Keep a narrow identity-based fallback so
+            # hidden pre-existing vertices remain protected without reverting
+            # to the unsafe broad ``vertex.hide`` test.
+            if not initial_vertex_hide_by_index:
+                return None
+
+            def is_allowed_without_layers(vertex):
+                try:
+                    index = int(vertex.index)
+                    if index not in initial_vertex_hide_by_index:
+                        return True
+                    return not (
+                        initial_vertex_hide_by_index[index] == 0
+                        and bool(vertex.hide)
+                    )
+                except (
+                    AttributeError,
+                    ReferenceError,
+                    RuntimeError,
+                    TypeError,
+                    ValueError,
+                ):
+                    return True
+
+            return is_allowed_without_layers
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+
+    def is_allowed(vertex):
+        try:
+            if initial_vertex_pointers:
+                try:
+                    if vertex.as_pointer() not in initial_vertex_pointers:
+                        return True
+                except (AttributeError, ReferenceError, RuntimeError, TypeError):
+                    if initial_vertex_indices:
+                        if int(vertex.index) not in initial_vertex_indices:
+                            return True
+                    else:
+                        return True
+            elif initial_vertex_indices:
+                if int(vertex.index) not in initial_vertex_indices:
+                    return True
+            else:
+                # No reliable identity data means this vertex cannot be
+                # safely classified as an FSMFO pre-existing vertex.
+                return True
+            return not (
+                int(vertex[marker_layer]) == session_id
+                and int(vertex[hide_layer]) == 0
+                and bool(vertex.hide)
+            )
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            # A stale/invalid element must not make the wrapper fail.  The
+            # original RetopoFlow routine still owns final validity checks.
+            return True
+
+    return is_allowed
 
 
 def _get_retopoflow_nearest_bmvert_class():
@@ -1507,19 +1624,39 @@ def _install_retopoflow_hidden_vertex_filter():
         except (ImportError, TypeError, ValueError):
             return False
 
+        update_signature = inspect.signature(original_update)
+
         def filtered_update(self, context, co, *args, **kwargs):
-            if _retopoflow_filter_context_applies(context):
-                caller_filter = kwargs.get("filter_fn")
-                if caller_filter is None:
-                    kwargs["filter_fn"] = _retopoflow_hidden_vertex_is_allowed
-                else:
-                    kwargs["filter_fn"] = (
-                        lambda vertex: (
-                            _retopoflow_hidden_vertex_is_allowed(vertex)
-                            and caller_filter(vertex)
-                        )
-                    )
-            return original_update(self, context, co, *args, **kwargs)
+            mfo_filter = _retopoflow_mfo_vertex_filter(context)
+            if mfo_filter is None:
+                return original_update(self, context, co, *args, **kwargs)
+
+            try:
+                bound = update_signature.bind(
+                    self,
+                    context,
+                    co,
+                    *args,
+                    **kwargs,
+                )
+            except TypeError:
+                # Preserve RetopoFlow's original argument validation instead
+                # of changing the error behavior of an invalid call.
+                return original_update(self, context, co, *args, **kwargs)
+
+            caller_filter = bound.arguments.get("filter_fn")
+            if caller_filter is None:
+                combined_filter = mfo_filter
+            else:
+                combined_filter = lambda vertex: (
+                    bool(caller_filter(vertex)) and bool(mfo_filter(vertex))
+                )
+            bound.arguments["filter_fn"] = combined_filter
+
+            # BoundArguments reconstructs positional and keyword arguments in
+            # the form required by the actual signature.  This avoids adding
+            # filter_fn to kwargs when it was supplied positionally.
+            return original_update(*bound.args, **bound.kwargs)
 
         setattr(filtered_update, _RETOPOFLOW_HIDDEN_VERTEX_FILTER_TAG, True)
         setattr(
