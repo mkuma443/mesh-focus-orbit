@@ -38,6 +38,7 @@ Sculpt Mode でカーソル位置のFace Setを髪束単位で一発適用した
 - `Double-tap Window`: 2回の押下を1回のトグルと判定する時間（秒）
 - `Show Mode Indicator`: 一時モード中に3D Viewヘッダーへ `MESH FOCUS ORBIT ON` を表示（既定ON）
 - `Debug Display`: 一時Orbit中心を青いポイントで表示（既定OFF）
+- `RetopoFlow Hidden Vertex Filter`: Face Set MFO中だけ、RetopoFlowの頂点吸着候補から非表示頂点を除外する一時フィルターを自動追加（既定OFF）。RetopoFlow本体のファイルは変更せず、FSMFO終了・Undo・ファイルロード・アドオン無効化時に自動解除します
 
 通常MFOとFace Set MFOはReference Object以外をRay Cast対象にしません。選択状態、3D Cursor、Pivot Point、Object Transform、常設の Orbit Around Selection は変更しません。
 

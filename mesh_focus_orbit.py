@@ -9,7 +9,7 @@ rotating the view.
 bl_info = {
     "name": "Mesh Focus Orbit",
     "author": "OpenAI",
-    "version": (2, 1, 18),
+    "version": (2, 1, 19),
     "blender": (5, 2, 0),
     "location": "3D View",
     "description": "Temporary mesh-centered orbit and one-click Smart Face Set Fill",
@@ -50,6 +50,9 @@ _is_registered = False
 _polyquilt_qsnap_class = None
 _polyquilt_qsnap_original_snap_objects = None
 _polyquilt_qsnap_filter_installed = False
+_retopoflow_hidden_vertex_filter_class = None
+_retopoflow_hidden_vertex_filter_original_update = None
+_retopoflow_hidden_vertex_filter_installed = False
 _retopo_isolation_serial = 0
 
 DEFAULT_DOUBLE_TAP_WINDOW = 0.28
@@ -67,6 +70,16 @@ _FACE_SET_PROXY_MESH_TAG = "mesh_focus_orbit.face_set_proxy_mesh"
 _FACE_SET_REFERENCE_TAG = "mesh_focus_orbit.reference_hidden_by_proxy"
 _FACE_SET_REFERENCE_PREVIOUS_HIDE = "mesh_focus_orbit.reference_previous_hide"
 _FACE_SET_REFERENCE_PROXY_COUNT = "mesh_focus_orbit.proxy_count"
+
+# This is a temporary runtime compatibility hook.  It never edits the
+# RetopoFlow installation; the marker lets a later reload or cleanup restore
+# only a wrapper created by Mesh Focus Orbit.
+_RETOPOFLOW_HIDDEN_VERTEX_FILTER_TAG = (
+    "mesh_focus_orbit.retopoflow_hidden_vertex_filter"
+)
+_RETOPOFLOW_HIDDEN_VERTEX_FILTER_ORIGINAL = (
+    "mesh_focus_orbit.retopoflow_original_nearest_bmvert_update"
+)
 
 # Face Set MFO may also isolate the active Edit Mesh.  These markers are
 # temporary recovery metadata only; they are removed when the mode finishes.
@@ -1345,6 +1358,191 @@ def _has_active_face_set_state():
     )
 
 
+def _retopoflow_hidden_vertex_filter_enabled():
+    prefs = _addon_preferences()
+    return bool(
+        getattr(prefs, "retopoflow_hidden_vertex_filter", False)
+        if prefs is not None
+        else False
+    )
+
+
+def _retopoflow_filter_context_applies(context):
+    """Return whether *context* is the FSMFO-isolated Edit Mesh.
+
+    The runtime hook is deliberately narrower than a global RetopoFlow patch:
+    it only filters the Edit Mesh that MFO hid as part of an active Face Set
+    isolation session.
+    """
+    try:
+        edit_object = context.edit_object
+        if edit_object is None or edit_object.mode != "EDIT":
+            return False
+    except (AttributeError, ReferenceError, RuntimeError, TypeError):
+        return False
+
+    for state in _active_states.values():
+        if not isinstance(state, _FaceSetOrbitState) or not state.active:
+            continue
+        info = state.retopo_isolation
+        if not info:
+            continue
+        try:
+            if info.get("object") is edit_object:
+                return True
+            if info.get("object_name") == edit_object.name:
+                return True
+        except (AttributeError, ReferenceError, RuntimeError, TypeError):
+            continue
+    return False
+
+
+def _retopoflow_hidden_vertex_is_allowed(vertex):
+    try:
+        return not bool(vertex.hide)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError):
+        return False
+
+
+def _get_retopoflow_nearest_bmvert_class():
+    """Return RetopoFlow's nearest-vertex helper when RetopoFlow is present."""
+    try:
+        from bl_ext.superhivemarket_com.retopoflow.retopoflow.common.bmesh import (
+            NearestBMVert,
+        )
+
+        return NearestBMVert
+    except (ImportError, AttributeError, RuntimeError, TypeError):
+        return None
+
+
+def _restore_retopoflow_hidden_vertex_filter():
+    """Restore only an MFO-owned RetopoFlow update wrapper, if present."""
+    global _retopoflow_hidden_vertex_filter_class
+    global _retopoflow_hidden_vertex_filter_original_update
+    global _retopoflow_hidden_vertex_filter_installed
+
+    classes = []
+    if _retopoflow_hidden_vertex_filter_class is not None:
+        classes.append(_retopoflow_hidden_vertex_filter_class)
+    current_class = _get_retopoflow_nearest_bmvert_class()
+    if current_class is not None and current_class not in classes:
+        classes.append(current_class)
+
+    for nearest_class in classes:
+        try:
+            current_update = nearest_class.update
+            if not getattr(
+                current_update,
+                _RETOPOFLOW_HIDDEN_VERTEX_FILTER_TAG,
+                False,
+            ):
+                continue
+            original_update = getattr(
+                current_update,
+                _RETOPOFLOW_HIDDEN_VERTEX_FILTER_ORIGINAL,
+                None,
+            )
+            if original_update is not None:
+                nearest_class.update = original_update
+        except (AttributeError, ReferenceError, RuntimeError, TypeError):
+            pass
+
+    _retopoflow_hidden_vertex_filter_class = None
+    _retopoflow_hidden_vertex_filter_original_update = None
+    _retopoflow_hidden_vertex_filter_installed = False
+
+
+def _install_retopoflow_hidden_vertex_filter():
+    """Temporarily exclude hidden BMesh vertices from RetopoFlow nearest snaps."""
+    global _retopoflow_hidden_vertex_filter_class
+    global _retopoflow_hidden_vertex_filter_original_update
+    global _retopoflow_hidden_vertex_filter_installed
+
+    if _retopoflow_hidden_vertex_filter_installed:
+        current_class = _get_retopoflow_nearest_bmvert_class()
+        try:
+            if (
+                current_class is _retopoflow_hidden_vertex_filter_class
+                and current_class is not None
+                and getattr(
+                    current_class.update,
+                    _RETOPOFLOW_HIDDEN_VERTEX_FILTER_TAG,
+                    False,
+                )
+            ):
+                return True
+        except (AttributeError, ReferenceError, RuntimeError, TypeError):
+            pass
+        _restore_retopoflow_hidden_vertex_filter()
+
+    nearest_class = _get_retopoflow_nearest_bmvert_class()
+    if nearest_class is None:
+        return False
+
+    try:
+        original_update = nearest_class.update
+        if getattr(
+            original_update,
+            _RETOPOFLOW_HIDDEN_VERTEX_FILTER_TAG,
+            False,
+        ):
+            stale_original = getattr(
+                original_update,
+                _RETOPOFLOW_HIDDEN_VERTEX_FILTER_ORIGINAL,
+                None,
+            )
+            if stale_original is None:
+                return False
+            # A module reload can leave the previous MFO wrapper on the class.
+            # Remove that stale wrapper before installing the current one.
+            nearest_class.update = stale_original
+            original_update = stale_original
+
+        try:
+            import inspect
+
+            if "filter_fn" not in inspect.signature(original_update).parameters:
+                return False
+        except (ImportError, TypeError, ValueError):
+            return False
+
+        def filtered_update(self, context, co, *args, **kwargs):
+            if _retopoflow_filter_context_applies(context):
+                caller_filter = kwargs.get("filter_fn")
+                if caller_filter is None:
+                    kwargs["filter_fn"] = _retopoflow_hidden_vertex_is_allowed
+                else:
+                    kwargs["filter_fn"] = (
+                        lambda vertex: (
+                            _retopoflow_hidden_vertex_is_allowed(vertex)
+                            and caller_filter(vertex)
+                        )
+                    )
+            return original_update(self, context, co, *args, **kwargs)
+
+        setattr(filtered_update, _RETOPOFLOW_HIDDEN_VERTEX_FILTER_TAG, True)
+        setattr(
+            filtered_update,
+            _RETOPOFLOW_HIDDEN_VERTEX_FILTER_ORIGINAL,
+            original_update,
+        )
+        nearest_class.update = filtered_update
+        _retopoflow_hidden_vertex_filter_class = nearest_class
+        _retopoflow_hidden_vertex_filter_original_update = original_update
+        _retopoflow_hidden_vertex_filter_installed = True
+        return True
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        _restore_retopoflow_hidden_vertex_filter()
+        return False
+
+
+def _release_retopoflow_hidden_vertex_filter():
+    """Release the temporary hook after the last FSMFO state finishes."""
+    if not _has_active_face_set_state():
+        _restore_retopoflow_hidden_vertex_filter()
+
+
 def _polyquilt_filtered_snap_objects(context):
     """Keep Reference snapping while excluding the visible MFO proxy."""
     original = _polyquilt_qsnap_original_snap_objects
@@ -1895,6 +2093,7 @@ def _finish_state(state):
     _remove_face_set_proxy(state)
     _restore_original_view(state)
     state.active = False
+    _release_retopoflow_hidden_vertex_filter()
     _release_polyquilt_qsnap_filter(state=state)
     _stop_indicator_draw(state)
     _stop_debug_draw(state)
@@ -1997,6 +2196,7 @@ def _cleanup_orphan_face_set_proxies():
             pass
 
     _release_polyquilt_qsnap_filter()
+    _release_retopoflow_hidden_vertex_filter()
 
     if removed_proxy_names or removed_proxy_meshes:
         for window in bpy.context.window_manager.windows:
@@ -2057,6 +2257,8 @@ def _resync_active_face_set_states_after_undo():
             _build_face_set_proxy(state)
 
     _install_polyquilt_qsnap_filter()
+    if _retopoflow_hidden_vertex_filter_enabled():
+        _install_retopoflow_hidden_vertex_filter()
     for state in active_face_set_states:
         if state.active:
             _refresh_polyquilt_qsnap(state=state)
@@ -2260,6 +2462,8 @@ class VIEW3D_OT_mesh_focus_orbit(bpy.types.Operator):
             _modal_operator_areas[operator_key] = area_key
             if face_set_mode:
                 _install_polyquilt_qsnap_filter(context=context)
+                if _retopoflow_hidden_vertex_filter_enabled():
+                    _install_retopoflow_hidden_vertex_filter()
             _activate_state(state)
         except (ReferenceError, RuntimeError, AttributeError, TypeError, ValueError):
             _active_states.pop(area_key, None)
@@ -2267,6 +2471,7 @@ class VIEW3D_OT_mesh_focus_orbit(bpy.types.Operator):
             _retopo_restore_isolation(state)
             _remove_face_set_proxy(state)
             state.active = False
+            _release_retopoflow_hidden_vertex_filter()
             _release_polyquilt_qsnap_filter(state=state)
             return {"PASS_THROUGH"}
 
@@ -2928,6 +3133,14 @@ class MESH_FOCUS_ORBIT_AddonPreferences(bpy.types.AddonPreferences):
         description="Show MESH FOCUS ORBIT ON in the 3D Viewport",
         default=True,
     )
+    retopoflow_hidden_vertex_filter: BoolProperty(
+        name="RetopoFlow Hidden Vertex Filter",
+        description=(
+            "During Face Set MFO, temporarily exclude hidden Retopo vertices "
+            "from RetopoFlow nearest-vertex snapping"
+        ),
+        default=False,
+    )
 
     def draw(self, context):
         layout = self.layout
@@ -2937,6 +3150,7 @@ class MESH_FOCUS_ORBIT_AddonPreferences(bpy.types.AddonPreferences):
         layout.prop(self, "focus_loss_behavior")
         layout.prop(self, "debug_display")
         layout.prop(self, "show_indicator")
+        layout.prop(self, "retopoflow_hidden_vertex_filter")
         layout.prop(self, "double_tap_window")
         layout.separator()
         layout.label(text="Double-tap the activation key in a 3D Viewport.")
@@ -2968,6 +3182,9 @@ def register():
             poll=_reference_object_poll,
         )
     _is_registered = True
+    # A script reload can leave an old MFO wrapper on RetopoFlow's class even
+    # though the previous module no longer has Python state for it.
+    _restore_retopoflow_hidden_vertex_filter()
     _schedule_orphan_cleanup()
     if _on_load_pre not in bpy.app.handlers.load_pre:
         bpy.app.handlers.load_pre.append(_on_load_pre)
@@ -2983,9 +3200,11 @@ def register():
 def unregister():
     global _is_registered
     if not _is_registered:
+        _restore_retopoflow_hidden_vertex_filter()
         return
     _finish_all_states()
     _cleanup_orphan_face_set_proxies()
+    _restore_retopoflow_hidden_vertex_filter()
     if _on_load_pre in bpy.app.handlers.load_pre:
         bpy.app.handlers.load_pre.remove(_on_load_pre)
     if _on_load_post in bpy.app.handlers.load_post:
