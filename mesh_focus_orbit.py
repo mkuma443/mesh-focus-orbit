@@ -771,9 +771,7 @@ def _retopo_begin_isolation(context, reference_object, proxy):
         )
         _retopo_set_object_markers(retopo_object, session_id, layer_names)
         return {
-            "object": retopo_object,
             "object_name": retopo_object.name,
-            "mesh": retopo_object.data,
             "session_id": session_id,
             "layer_names": layer_names,
             "initial_faces": initial_faces,
@@ -860,10 +858,17 @@ def _retopo_restore_info(info):
     """Restore one active or orphaned Retopo isolation without mode changes."""
     if not info:
         return False
-    retopo_object = info.get("object")
-    if retopo_object is None:
-        retopo_object = bpy.data.objects.get(info.get("object_name", ""))
-    if retopo_object is None or retopo_object.type != "MESH":
+    # Never trust the long-lived Object wrapper stored in modal state.  Undo,
+    # RetopoFlow, and Edit Mesh rebuilds can remove that StructRNA while a new
+    # Object with the same name remains in bpy.data.
+    object_name = info.get("object_name", "")
+    if not object_name:
+        return False
+    try:
+        retopo_object = bpy.data.objects.get(str(object_name))
+        if retopo_object is None or retopo_object.type != "MESH":
+            return False
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
         return False
 
     bm = None
@@ -1397,8 +1402,6 @@ def _retopoflow_filter_info(context):
         if not info:
             continue
         try:
-            if info.get("object") is edit_object:
-                return info
             if info.get("object_name") == edit_object.name:
                 return info
         except (AttributeError, ReferenceError, RuntimeError, TypeError):
@@ -1640,8 +1643,8 @@ def _install_retopoflow_hidden_vertex_filter():
                     **kwargs,
                 )
             except TypeError:
-                # Preserve RetopoFlow's original argument validation instead
-                # of changing the error behavior of an invalid call.
+                # Preserve RetopoFlow's original argument validation
+                # instead of changing the error behavior of an invalid call.
                 return original_update(self, context, co, *args, **kwargs)
 
             caller_filter = bound.arguments.get("filter_fn")
