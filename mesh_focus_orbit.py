@@ -9,7 +9,7 @@ rotating the view.
 bl_info = {
     "name": "Mesh Focus Orbit",
     "author": "OpenAI",
-    "version": (2, 1, 19),
+    "version": (3, 0, 1),
     "blender": (5, 2, 0),
     "location": "3D View",
     "description": "Temporary mesh-centered orbit and one-click Smart Face Set Fill",
@@ -37,23 +37,58 @@ from mathutils.bvhtree import BVHTree
 
 
 OPERATOR_ID = "view3d.mesh_focus_orbit"
+FACE_SET_ACTIVATION_OPERATOR_ID = "view3d.mesh_focus_face_set_activate"
+WATCHER_OPERATOR_ID = "view3d.mesh_focus_orbit_watcher"
 RECOVER_FACE_SET_STATE_OPERATOR_ID = "view3d.mesh_focus_orbit_recover_face_set_state"
 LOCAL_FACE_SET_GROW_OPERATOR_ID = "view3d.mesh_focus_local_face_set_grow_v2"
 LOCAL_FACE_SET_GROW_KEY = "E"
 
 _addon_keymaps = []
 _active_states = {}
-_modal_operator_areas = {}
 _last_tap_times = {}
+_session_serial = 0
+_session_cleanup_areas = set()
 _local_face_set_adjacency_cache = {}
 _is_registered = False
 _polyquilt_qsnap_class = None
 _polyquilt_qsnap_original_snap_objects = None
 _polyquilt_qsnap_filter_installed = False
-_retopoflow_hidden_vertex_filter_class = None
-_retopoflow_hidden_vertex_filter_original_update = None
-_retopoflow_hidden_vertex_filter_installed = False
+_retopoflow_nearest_filter_class = None
+_retopoflow_nearest_filter_original_update = None
+_retopoflow_nearest_filter_installed = False
+_retopoflow_automerge_class = None
+_retopoflow_automerge_original = None
+_retopoflow_automerge_installed = False
+_retopoflow_automerge_nearest_bmvert = None
+_retopoflow_automerge_filter = None
+_retopoflow_polypen_class = None
+_retopoflow_polypen_original_update = None
+_retopoflow_polypen_installed = False
+_retopoflow_polypen_owner = None
+_retopoflow_polypen_nearest_bmvert = None
+_retopoflow_polypen_filter = None
 _retopo_isolation_serial = 0
+
+# ``importlib.reload`` keeps names that disappeared from the source module.
+# Remove the retired Undo-resync helpers before the new module body is used so
+# an add-on reload cannot accidentally expose or call stale recovery code.
+for _stale_name in (
+    "_on_undo_pre",
+    "_on_undo_post",
+    "_resync_active_face_set_states_after_undo",
+    "_retopo_rebuild_isolation_after_undo",
+    "_debug_undo_snapshot",
+    "_debug_undo_log",
+    "_modal_operator_areas",
+    "_UNDO_DEBUG_OBSERVATION",
+    "_UNDO_DEBUG_TEXT_NAME",
+    "_UNDO_BOUNDARY_ACTIVE",
+    "_UNDO_BOUNDARY_CROSSED",
+    "_UNDO_BOUNDARY_PENDING",
+    "_UNDO_BOUNDARY_INVALID",
+):
+    globals().pop(_stale_name, None)
+del _stale_name
 
 DEFAULT_DOUBLE_TAP_WINDOW = 0.28
 
@@ -71,14 +106,20 @@ _FACE_SET_REFERENCE_TAG = "mesh_focus_orbit.reference_hidden_by_proxy"
 _FACE_SET_REFERENCE_PREVIOUS_HIDE = "mesh_focus_orbit.reference_previous_hide"
 _FACE_SET_REFERENCE_PROXY_COUNT = "mesh_focus_orbit.proxy_count"
 
-# This is a temporary runtime compatibility hook.  It never edits the
-# RetopoFlow installation; the marker lets a later reload or cleanup restore
-# only a wrapper created by Mesh Focus Orbit.
-_RETOPOFLOW_HIDDEN_VERTEX_FILTER_TAG = (
-    "mesh_focus_orbit.retopoflow_hidden_vertex_filter"
-)
-_RETOPOFLOW_HIDDEN_VERTEX_FILTER_ORIGINAL = (
+# These are temporary, narrowly-scoped runtime compatibility hooks.  They
+# never edit the RetopoFlow installation permanently; the markers let a later
+# reload or cleanup restore only wrappers created by Mesh Focus Orbit.
+_RETOPOFLOW_NEAREST_FILTER_TAG = "mesh_focus_orbit.retopoflow_nearest_filter"
+_RETOPOFLOW_NEAREST_FILTER_ORIGINAL = (
     "mesh_focus_orbit.retopoflow_original_nearest_bmvert_update"
+)
+_RETOPOFLOW_AUTOMERGE_TAG = "mesh_focus_orbit.retopoflow_automerge_hook"
+_RETOPOFLOW_AUTOMERGE_ORIGINAL = (
+    "mesh_focus_orbit.retopoflow_original_automerge"
+)
+_RETOPOFLOW_POLYPEN_TAG = "mesh_focus_orbit.retopoflow_polypen_hook"
+_RETOPOFLOW_POLYPEN_ORIGINAL = (
+    "mesh_focus_orbit.retopoflow_original_polypen_update"
 )
 
 # Face Set MFO may also isolate the active Edit Mesh.  These markers are
@@ -90,6 +131,9 @@ _RETOPO_ISOLATION_HIDE_LAYER = "mesh_focus_orbit.retopo_hide_layer"
 _RETOPO_ISOLATION_SELECT_LAYER = "mesh_focus_orbit.retopo_select_layer"
 _RETOPO_ISOLATION_TARGET_LAYER = "mesh_focus_orbit.retopo_target_layer"
 _RETOPO_ISOLATION_VERT_MARKER_LAYER = "mesh_focus_orbit.retopo_vert_marker_layer"
+_RETOPO_ISOLATION_VERT_TARGET_LAYER = "mesh_focus_orbit.retopo_vert_target_layer"
+_RETOPO_ISOLATION_VERT_ORIGIN_LAYER = "mesh_focus_orbit.retopo_vert_origin_layer"
+_RETOPO_ISOLATION_VERT_CREATED_LAYER = "mesh_focus_orbit.retopo_vert_created_layer"
 _RETOPO_ISOLATION_VERT_HIDE_LAYER = "mesh_focus_orbit.retopo_vert_hide_layer"
 _RETOPO_ISOLATION_VERT_SELECT_LAYER = "mesh_focus_orbit.retopo_vert_select_layer"
 _RETOPO_ISOLATION_EDGE_MARKER_LAYER = "mesh_focus_orbit.retopo_edge_marker_layer"
@@ -182,6 +226,56 @@ def _tag_redraw(area):
         pass
 
 
+def _next_session_id():
+    """Return a process-unique FSMFO session generation."""
+    global _session_serial
+    _session_serial += 1
+    return _session_serial
+
+
+def _session_is_current(state):
+    """Return whether *state* still owns its viewport session."""
+    if state is None:
+        return False
+    try:
+        return bool(
+            state.active
+            and state.session_id > 0
+            and _active_states.get(state.area_key) is state
+        )
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def _register_session(state):
+    """Install one state as the sole owner of its viewport."""
+    if state is None:
+        return False
+    try:
+        area_key = int(state.area_key)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return False
+    if not area_key or area_key in _session_cleanup_areas:
+        return False
+    existing = _active_states.get(area_key)
+    if existing is not None and getattr(existing, "active", False):
+        return False
+    state.session_id = _next_session_id()
+    _active_states[area_key] = state
+    return True
+
+
+def _unregister_session(state):
+    """Remove *state* only if it still owns its viewport registry entry."""
+    if state is None:
+        return
+    try:
+        if _active_states.get(state.area_key) is state:
+            _active_states.pop(state.area_key, None)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        pass
+
+
 class _TempOrbitState:
     """State for one active temporary orbit in one viewport."""
 
@@ -202,6 +296,10 @@ class _TempOrbitState:
         "indicator_draw_handler",
         "active",
         "indicator_text",
+        "session_id",
+        "area_key",
+        "watcher_operator_key",
+        "watcher_timer",
     )
 
     def __init__(self, context, hit_location, hit_distance, activation_key):
@@ -224,6 +322,13 @@ class _TempOrbitState:
         self.indicator_draw_handler = None
         self.active = True
         self.indicator_text = "MESH FOCUS ORBIT ON"
+        self.session_id = 0
+        try:
+            self.area_key = context.area.as_pointer()
+        except (AttributeError, ReferenceError, RuntimeError, TypeError):
+            self.area_key = 0
+        self.watcher_operator_key = None
+        self.watcher_timer = None
 
 
 class _FaceSetOrbitState(_TempOrbitState):
@@ -231,10 +336,13 @@ class _FaceSetOrbitState(_TempOrbitState):
 
     __slots__ = (
         "reference_object",
+        "reference_object_name",
         "face_set_id",
         "proxy_object",
+        "proxy_object_name",
         "reference_was_hidden",
         "retopo_isolation",
+        "retopo_restore_snapshot",
     )
 
     def __init__(
@@ -248,6 +356,10 @@ class _FaceSetOrbitState(_TempOrbitState):
     ):
         super().__init__(context, hit_location, hit_distance, activation_key)
         self.reference_object = reference_object
+        try:
+            self.reference_object_name = str(reference_object.name)
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            self.reference_object_name = ""
         self.face_set_id = int(face_set_id)
         try:
             self.reference_was_hidden = bool(
@@ -259,7 +371,13 @@ class _FaceSetOrbitState(_TempOrbitState):
             except (AttributeError, RuntimeError, TypeError):
                 self.reference_was_hidden = False
         self.proxy_object = None
+        self.proxy_object_name = ""
         self.retopo_isolation = None
+        # This Python-side snapshot is deliberately independent from the
+        # temporary BMesh layers.  Undo may remove those layers or rebuild the
+        # Edit BMesh before undo_post runs, but the original visibility state
+        # is still needed when FSMFO eventually ends.
+        self.retopo_restore_snapshot = None
         self.indicator_text = "FACE SET MFO ON"
 
 
@@ -574,6 +692,19 @@ def _retopo_next_session_id():
     return ((int(time.time() * 1000000) & 0x7FFFFFFF) ^ _retopo_isolation_serial) or 1
 
 
+def _retopo_element_token(element):
+    """Return a stable BMesh element token across Python wrapper reads.
+
+    Blender 5.2 BMVert/BMEdge/BMFace wrappers do not expose ``as_pointer``.
+    Their hash is backed by the underlying BMesh element identity and remains
+    stable when ``bmesh.from_edit_mesh`` returns another Python wrapper.
+    """
+    try:
+        return int(hash(element))
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+
+
 def _retopo_layer_names(session_id):
     prefix = f"__MFO_RETOPO_{session_id:08x}"
     return {
@@ -582,6 +713,9 @@ def _retopo_layer_names(session_id):
         "select": f"{prefix}_SELECT",
         "target": f"{prefix}_TARGET",
         "vert_marker": f"{prefix}_VERT_MARKER",
+        "vert_target": f"{prefix}_VERT_TARGET",
+        "vert_origin": f"{prefix}_VERT_ORIGIN",
+        "vert_created": f"{prefix}_VERT_CREATED",
         "vert_hide": f"{prefix}_VERT_HIDE",
         "vert_select": f"{prefix}_VERT_SELECT",
         "edge_marker": f"{prefix}_EDGE_MARKER",
@@ -598,6 +732,9 @@ def _retopo_set_object_markers(obj, session_id, layer_names):
     obj[_RETOPO_ISOLATION_SELECT_LAYER] = layer_names["select"]
     obj[_RETOPO_ISOLATION_TARGET_LAYER] = layer_names["target"]
     obj[_RETOPO_ISOLATION_VERT_MARKER_LAYER] = layer_names["vert_marker"]
+    obj[_RETOPO_ISOLATION_VERT_TARGET_LAYER] = layer_names["vert_target"]
+    obj[_RETOPO_ISOLATION_VERT_ORIGIN_LAYER] = layer_names["vert_origin"]
+    obj[_RETOPO_ISOLATION_VERT_CREATED_LAYER] = layer_names["vert_created"]
     obj[_RETOPO_ISOLATION_VERT_HIDE_LAYER] = layer_names["vert_hide"]
     obj[_RETOPO_ISOLATION_VERT_SELECT_LAYER] = layer_names["vert_select"]
     obj[_RETOPO_ISOLATION_EDGE_MARKER_LAYER] = layer_names["edge_marker"]
@@ -616,6 +753,9 @@ def _retopo_clear_object_markers(obj):
         _RETOPO_ISOLATION_SELECT_LAYER,
         _RETOPO_ISOLATION_TARGET_LAYER,
         _RETOPO_ISOLATION_VERT_MARKER_LAYER,
+        _RETOPO_ISOLATION_VERT_TARGET_LAYER,
+        _RETOPO_ISOLATION_VERT_ORIGIN_LAYER,
+        _RETOPO_ISOLATION_VERT_CREATED_LAYER,
         _RETOPO_ISOLATION_VERT_HIDE_LAYER,
         _RETOPO_ISOLATION_VERT_SELECT_LAYER,
         _RETOPO_ISOLATION_EDGE_MARKER_LAYER,
@@ -668,6 +808,12 @@ def _retopo_begin_isolation(context, reference_object, proxy):
             }
         if not component:
             return None
+        try:
+            bm.faces.index_update()
+            bm.edges.index_update()
+            bm.verts.index_update()
+        except (AttributeError, ReferenceError, RuntimeError, TypeError):
+            return None
         session_id = _retopo_next_session_id()
         layer_names = _retopo_layer_names(session_id)
         marker_layer = bm.faces.layers.int.new(layer_names["marker"])
@@ -675,6 +821,9 @@ def _retopo_begin_isolation(context, reference_object, proxy):
         select_layer = bm.faces.layers.int.new(layer_names["select"])
         target_layer = bm.faces.layers.int.new(layer_names["target"])
         vert_marker_layer = bm.verts.layers.int.new(layer_names["vert_marker"])
+        vert_target_layer = bm.verts.layers.int.new(layer_names["vert_target"])
+        vert_origin_layer = bm.verts.layers.int.new(layer_names["vert_origin"])
+        vert_created_layer = bm.verts.layers.int.new(layer_names["vert_created"])
         vert_hide_layer = bm.verts.layers.int.new(layer_names["vert_hide"])
         vert_select_layer = bm.verts.layers.int.new(layer_names["vert_select"])
         edge_marker_layer = bm.edges.layers.int.new(layer_names["edge_marker"])
@@ -719,22 +868,43 @@ def _retopo_begin_isolation(context, reference_object, proxy):
             bm.verts.index_update()
         except (AttributeError, ReferenceError, RuntimeError, TypeError):
             pass
+        activation_bmesh_token = _retopo_element_token(bm)
+        if activation_bmesh_token is None:
+            raise RuntimeError("Retopo BMesh identity is unavailable")
 
         original_vert_records = []
         initial_verts = []
         initial_vert_indices = []
         initial_vert_hide_values = []
+        initial_vertex_origin_ids = []
+        initial_vertex_tokens = []
+        try:
+            bm.verts.index_update()
+        except (AttributeError, ReferenceError, RuntimeError, TypeError):
+            pass
         for vertex in bm.verts:
             initial_verts.append(vertex)
             try:
-                initial_vert_indices.append(int(vertex.index))
+                vertex_index = int(vertex.index)
             except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
-                initial_vert_indices.append(-1)
+                vertex_index = -1
+            initial_vert_indices.append(vertex_index)
             initial_vert_hide_values.append(int(vertex.hide))
             original_vert_records.append(
                 (vertex, bool(vertex.hide), bool(vertex.select))
             )
             vertex[vert_marker_layer] = session_id
+            vertex[vert_target_layer] = int(vertex_index in target_vertex_indices)
+            origin_id = vertex_index + 1 if vertex_index >= 0 else len(initial_verts)
+            if origin_id <= 0:
+                origin_id = len(initial_verts)
+            vertex[vert_origin_layer] = int(origin_id)
+            vertex[vert_created_layer] = 0
+            initial_vertex_origin_ids.append(int(origin_id))
+            token = _retopo_element_token(vertex)
+            if token is None:
+                raise RuntimeError("Retopo vertex identity is unavailable")
+            initial_vertex_tokens.append(token)
             vertex[vert_hide_layer] = int(vertex.hide)
             vertex[vert_select_layer] = int(vertex.select)
 
@@ -764,13 +934,7 @@ def _retopo_begin_isolation(context, reference_object, proxy):
                 edge.hide = True
                 edge.select = False
 
-        bmesh.update_edit_mesh(
-            retopo_object.data,
-            loop_triangles=False,
-            destructive=False,
-        )
-        _retopo_set_object_markers(retopo_object, session_id, layer_names)
-        return {
+        info = {
             "object_name": retopo_object.name,
             "session_id": session_id,
             "layer_names": layer_names,
@@ -780,11 +944,25 @@ def _retopo_begin_isolation(context, reference_object, proxy):
             "initial_verts": initial_verts,
             "initial_vert_indices": initial_vert_indices,
             "initial_vert_hide_values": initial_vert_hide_values,
+            "initial_vertex_origin_ids": initial_vertex_origin_ids,
+            "initial_vertex_tokens": initial_vertex_tokens,
+            "activation_bmesh_token": activation_bmesh_token,
+            "initial_vertex_count": len(initial_verts),
             "original_vert_records": original_vert_records,
             "initial_edges": initial_edges,
             "original_edge_records": original_edge_records,
             "active_face": active_face,
         }
+        # Capture before update_edit_mesh can invalidate the temporary
+        # BMesh-element wrappers retained in the info dictionary.
+        info["restore_snapshot"] = _retopo_capture_restore_snapshot(info)
+        bmesh.update_edit_mesh(
+            retopo_object.data,
+            loop_triangles=False,
+            destructive=False,
+        )
+        _retopo_set_object_markers(retopo_object, session_id, layer_names)
+        return info
     except (
         AttributeError,
         ReferenceError,
@@ -804,6 +982,9 @@ def _retopo_begin_isolation(context, reference_object, proxy):
                         bm.faces.layers.int.remove(layer)
                 for layer in (
                     locals().get("vert_marker_layer"),
+                    locals().get("vert_target_layer"),
+                    locals().get("vert_origin_layer"),
+                    locals().get("vert_created_layer"),
                     locals().get("vert_hide_layer"),
                     locals().get("vert_select_layer"),
                 ):
@@ -825,6 +1006,329 @@ def _retopo_begin_isolation(context, reference_object, proxy):
             pass
         _retopo_clear_object_markers(retopo_object)
         return None
+
+
+def _retopo_valid_element(element):
+    try:
+        return bool(element.is_valid)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError):
+        return False
+
+
+def _retopo_coordinate_signature(coordinate):
+    try:
+        return tuple(round(float(value), 9) for value in coordinate)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _retopo_element_geometry_signature(element):
+    """Return a rebuild-tolerant local-space signature for a BMesh element."""
+    try:
+        if isinstance(element, bmesh.types.BMVert):
+            return ("V", _retopo_coordinate_signature(element.co))
+        if isinstance(element, bmesh.types.BMEdge):
+            coordinates = sorted(
+                _retopo_coordinate_signature(vertex.co)
+                for vertex in element.verts
+            )
+            return ("E", tuple(coordinates))
+        if isinstance(element, bmesh.types.BMFace):
+            coordinates = sorted(
+                _retopo_coordinate_signature(vertex.co)
+                for vertex in element.verts
+            )
+            return ("F", tuple(coordinates))
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+    return None
+
+
+def _retopo_capture_restore_snapshot(info):
+    """Capture pre-FSMFO visibility without retaining BMElement references.
+
+    BMesh layers are the authoritative *active-session* membership store, but
+    they are not a durable undo boundary.  This compact snapshot is only for
+    restoring the user's pre-FSMFO hide/select state after a later rebuild;
+    it contains no live Blender RNA or BMesh references.
+    """
+    if not info:
+        return None
+    snapshot = {
+        "object_name": str(info.get("object_name", "")),
+        "vertices": [],
+        "edges": [],
+        "faces": [],
+    }
+
+    def capture(elements_key, records_key, destination):
+        elements = list(info.get(elements_key, ()))
+        records = list(info.get(records_key, ()))
+        for index, element in enumerate(elements):
+            if not _retopo_valid_element(element):
+                continue
+            try:
+                original_hide, original_select = records[index][1:3]
+            except (IndexError, TypeError, ValueError):
+                continue
+            try:
+                element_index = int(element.index)
+            except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+                element_index = -1
+            destination.append({
+                "token": _retopo_element_token(element),
+                "index": element_index,
+                "geometry": _retopo_element_geometry_signature(element),
+                "hide": bool(original_hide),
+                "select": bool(original_select),
+            })
+
+    capture("initial_verts", "original_vert_records", snapshot["vertices"])
+    capture("initial_edges", "original_edge_records", snapshot["edges"])
+    capture("initial_faces", "original_records", snapshot["faces"])
+    return snapshot
+
+
+def _retopo_match_restore_snapshot(bm, snapshot):
+    """Match current BMesh elements to a Python-only activation snapshot."""
+    if not snapshot:
+        return {"verts": [], "edges": [], "faces": []}
+
+    def match(elements, entries):
+        entries = list(entries or ())
+        by_token = {
+            entry.get("token"): entry
+            for entry in entries
+            if entry.get("token") is not None
+        }
+        by_index_geometry = {}
+        by_geometry = {}
+        for entry in entries:
+            geometry = entry.get("geometry")
+            if geometry is None:
+                continue
+            by_index_geometry.setdefault(
+                (int(entry.get("index", -1)), geometry), []
+            ).append(entry)
+            by_geometry.setdefault(geometry, []).append(entry)
+
+        matched = []
+        used = set()
+        for element in elements:
+            if not _retopo_valid_element(element):
+                continue
+            token = _retopo_element_token(element)
+            geometry = _retopo_element_geometry_signature(element)
+            try:
+                element_index = int(element.index)
+            except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+                element_index = -1
+
+            entry = by_token.get(token)
+            if (
+                entry is not None
+                and entry.get("geometry") is not None
+                and geometry != entry.get("geometry")
+            ):
+                entry = None
+            if entry is None and geometry is not None:
+                indexed = by_index_geometry.get((element_index, geometry), ())
+                entry = next(
+                    (candidate for candidate in indexed if id(candidate) not in used),
+                    None,
+                )
+            if entry is None and geometry is not None:
+                by_geometry_candidates = by_geometry.get(geometry, ())
+                unused = [
+                    candidate
+                    for candidate in by_geometry_candidates
+                    if id(candidate) not in used
+                ]
+                if len(unused) == 1:
+                    entry = unused[0]
+            if entry is None or id(entry) in used:
+                continue
+            used.add(id(entry))
+            matched.append((element, entry))
+        return matched
+
+    return {
+        "verts": match(bm.verts, snapshot.get("vertices")),
+        "edges": match(bm.edges, snapshot.get("edges")),
+        "faces": match(bm.faces, snapshot.get("faces")),
+    }
+
+
+def _retopo_apply_restore_snapshot(info, snapshot):
+    """Rebind a fresh isolation session to the original activation elements.
+
+    Elements absent from the activation snapshot are treated as topology
+    created during FSMFO: they are made visible and have no trusted old-member
+    marker.  They can be confirmed by the normal target-connectivity path when
+    RetopoFlow creates a new snap candidate later.
+    """
+    if not info or not snapshot:
+        return True
+    object_name = str(info.get("object_name", ""))
+    retopo_object = bpy.data.objects.get(object_name)
+    if retopo_object is None or retopo_object.type != "MESH" or retopo_object.mode != "EDIT":
+        return False
+
+    try:
+        bm = bmesh.from_edit_mesh(retopo_object.data)
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+        matched = _retopo_match_restore_snapshot(bm, snapshot)
+        if not matched["faces"] and not matched["verts"]:
+            return False
+
+        names = info.get("layer_names", {})
+        face_marker = bm.faces.layers.int.get(names.get("marker", ""))
+        face_hide = bm.faces.layers.int.get(names.get("hide", ""))
+        face_select = bm.faces.layers.int.get(names.get("select", ""))
+        face_target = bm.faces.layers.int.get(names.get("target", ""))
+        vert_marker = bm.verts.layers.int.get(names.get("vert_marker", ""))
+        vert_target = bm.verts.layers.int.get(names.get("vert_target", ""))
+        vert_origin = bm.verts.layers.int.get(names.get("vert_origin", ""))
+        vert_created = bm.verts.layers.int.get(names.get("vert_created", ""))
+        vert_hide = bm.verts.layers.int.get(names.get("vert_hide", ""))
+        vert_select = bm.verts.layers.int.get(names.get("vert_select", ""))
+        edge_marker = bm.edges.layers.int.get(names.get("edge_marker", ""))
+        edge_hide = bm.edges.layers.int.get(names.get("edge_hide", ""))
+        edge_select = bm.edges.layers.int.get(names.get("edge_select", ""))
+        session_id = int(info.get("session_id", 0))
+
+        def element_key(element):
+            return _retopo_element_token(element) or id(element)
+
+        face_matches = {
+            element_key(element): entry for element, entry in matched["faces"]
+        }
+        vert_matches = {
+            element_key(element): entry for element, entry in matched["verts"]
+        }
+        edge_matches = {
+            element_key(element): entry for element, entry in matched["edges"]
+        }
+
+        for face in bm.faces:
+            entry = face_matches.get(element_key(face))
+            if entry is None:
+                if face_marker is not None:
+                    face[face_marker] = 0
+                if face_target is not None:
+                    face[face_target] = 0
+                face.hide = False
+                continue
+            if face_marker is not None:
+                face[face_marker] = session_id
+
+        for vertex in bm.verts:
+            entry = vert_matches.get(element_key(vertex))
+            if entry is None:
+                if vert_marker is not None:
+                    vertex[vert_marker] = 0
+                if vert_target is not None:
+                    vertex[vert_target] = 0
+                if vert_origin is not None:
+                    vertex[vert_origin] = 0
+                if vert_created is not None:
+                    vertex[vert_created] = 0
+                vertex.hide = False
+                continue
+            if vert_marker is not None:
+                vertex[vert_marker] = session_id
+            if vert_origin is not None:
+                vert_index = int(entry.get("index", -1))
+                vertex[vert_origin] = max(1, vert_index + 1)
+
+        for edge in bm.edges:
+            entry = edge_matches.get(element_key(edge))
+            if entry is None:
+                if edge_marker is not None:
+                    edge[edge_marker] = 0
+                edge.hide = False
+                continue
+            if edge_marker is not None:
+                edge[edge_marker] = session_id
+
+        info["initial_faces"] = [element for element, _entry in matched["faces"]]
+        info["original_records"] = [
+            (element, bool(entry.get("hide")), bool(entry.get("select")))
+            for element, entry in matched["faces"]
+        ]
+        info["initial_verts"] = [element for element, _entry in matched["verts"]]
+        info["original_vert_records"] = [
+            (element, bool(entry.get("hide")), bool(entry.get("select")))
+            for element, entry in matched["verts"]
+        ]
+        info["initial_vert_indices"] = [
+            int(entry.get("index", -1)) for _element, entry in matched["verts"]
+        ]
+        info["initial_vert_hide_values"] = [
+            int(bool(entry.get("hide"))) for _element, entry in matched["verts"]
+        ]
+        info["initial_vertex_origin_ids"] = [
+            max(1, int(entry.get("index", -1)) + 1)
+            for _element, entry in matched["verts"]
+        ]
+        info["initial_vertex_tokens"] = [
+            _retopo_element_token(element) for element, _entry in matched["verts"]
+        ]
+        info["initial_vertex_count"] = len(matched["verts"])
+        info["initial_edges"] = [element for element, _entry in matched["edges"]]
+        info["original_edge_records"] = [
+            (element, bool(entry.get("hide")), bool(entry.get("select")))
+            for element, entry in matched["edges"]
+        ]
+        active_face = info.get("active_face")
+        if (
+            not _retopo_valid_element(active_face)
+            or element_key(active_face) not in face_matches
+        ):
+            info["active_face"] = None
+
+        bmesh.update_edit_mesh(
+            retopo_object.data,
+            loop_triangles=False,
+            destructive=False,
+        )
+        return True
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def _retopo_discard_isolation_layers(info):
+    """Remove a superseded session's layers without changing hide state."""
+    if not info:
+        return
+    object_name = str(info.get("object_name", ""))
+    retopo_object = bpy.data.objects.get(object_name)
+    if retopo_object is None or retopo_object.type != "MESH" or retopo_object.mode != "EDIT":
+        return
+    try:
+        bm = bmesh.from_edit_mesh(retopo_object.data)
+        names = info.get("layer_names", {})
+        for domain, keys in (
+            (bm.faces.layers.int, ("marker", "hide", "select", "target")),
+            (bm.verts.layers.int, (
+                "vert_marker", "vert_target", "vert_origin", "vert_created",
+                "vert_hide", "vert_select",
+            )),
+            (bm.edges.layers.int, ("edge_marker", "edge_hide", "edge_select")),
+        ):
+            for key in keys:
+                layer = domain.get(names.get(key, ""))
+                if layer is not None:
+                    domain.remove(layer)
+        bmesh.update_edit_mesh(
+            retopo_object.data,
+            loop_triangles=False,
+            destructive=False,
+        )
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        pass
 
 
 def _retopo_layer_handles(bm, info):
@@ -888,6 +1392,16 @@ def _retopo_restore_info(info):
         )
         vert_marker_layer, vert_hide_layer, vert_select_layer = (
             _retopo_element_layer_handles(bm, info, "verts")
+        )
+        names = info.get("layer_names", {})
+        vert_target_layer = bm.verts.layers.int.get(
+            names.get("vert_target", "")
+        )
+        vert_origin_layer = bm.verts.layers.int.get(
+            names.get("vert_origin", "")
+        )
+        vert_created_layer = bm.verts.layers.int.get(
+            names.get("vert_created", "")
         )
         edge_marker_layer, edge_hide_layer, edge_select_layer = (
             _retopo_element_layer_handles(bm, info, "edges")
@@ -972,6 +1486,9 @@ def _retopo_restore_info(info):
 
         for layer in (
             vert_marker_layer,
+            vert_target_layer,
+            vert_origin_layer,
+            vert_created_layer,
             vert_hide_layer,
             vert_select_layer,
         ):
@@ -1018,6 +1535,116 @@ def _retopo_restore_info(info):
                 pass
 
 
+def _retopo_revalidate_isolation(info):
+    """Revalidate and reapply active FSMFO hide state after Undo.
+
+    This is a fast path only.  If the session layers are absent, the caller
+    falls back to fresh current-BMesh island detection; it never guesses from
+    indices, Python BMElement references, or current visibility.
+    """
+    if not info:
+        return False
+    object_name = str(info.get("object_name", ""))
+    session_id = int(info.get("session_id", 0))
+    if not object_name or session_id <= 0:
+        return False
+    try:
+        retopo_object = bpy.data.objects.get(object_name)
+        if retopo_object is None or retopo_object.type != "MESH":
+            return False
+        if retopo_object.mode != "EDIT":
+            return False
+        bm = bmesh.from_edit_mesh(retopo_object.data)
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+        names = info.get("layer_names") or {}
+        face_marker_layer = bm.faces.layers.int.get(names.get("marker", ""))
+        face_target_layer = bm.faces.layers.int.get(names.get("target", ""))
+        vert_marker_layer = bm.verts.layers.int.get(
+            names.get("vert_marker", "")
+        )
+        vert_target_layer = bm.verts.layers.int.get(
+            names.get("vert_target", "")
+        )
+        vert_created_layer = bm.verts.layers.int.get(
+            names.get("vert_created", "")
+        )
+        edge_marker_layer = bm.edges.layers.int.get(
+            names.get("edge_marker", "")
+        )
+        if any(
+            layer is None
+            for layer in (
+                face_marker_layer,
+                face_target_layer,
+                vert_marker_layer,
+                vert_target_layer,
+                vert_created_layer,
+                edge_marker_layer,
+            )
+        ):
+            return False
+
+        session_face_count = 0
+        for face in bm.faces:
+            if int(face[face_marker_layer]) != session_id:
+                continue
+            target = int(face[face_target_layer])
+            if target not in (0, 1):
+                return False
+            session_face_count += 1
+        if session_face_count <= 0:
+            return False
+
+        for vertex in bm.verts:
+            if int(vertex[vert_marker_layer]) != session_id:
+                continue
+            target = int(vertex[vert_target_layer])
+            created = int(vertex[vert_created_layer])
+            if target not in (0, 1):
+                return False
+            if created not in (0, session_id):
+                return False
+
+        # Reapply only the explicit target boundary.  Elements created after
+        # activation have no session marker and are deliberately left alone.
+        for face in bm.faces:
+            if int(face[face_marker_layer]) != session_id:
+                continue
+            face.hide = not bool(int(face[face_target_layer]))
+            if face.hide:
+                face.select = False
+
+        for vertex in bm.verts:
+            if int(vertex[vert_marker_layer]) != session_id:
+                continue
+            vertex.hide = not bool(int(vertex[vert_target_layer]))
+            if vertex.hide:
+                vertex.select = False
+
+        for edge in bm.edges:
+            if int(edge[edge_marker_layer]) != session_id:
+                continue
+            edge_is_target = any(
+                int(face[face_marker_layer]) == session_id
+                and int(face[face_target_layer]) == 1
+                for face in edge.link_faces
+            )
+            edge.hide = not edge_is_target
+            if edge.hide:
+                edge.select = False
+
+        bmesh.update_edit_mesh(
+            retopo_object.data,
+            loop_triangles=False,
+            destructive=False,
+        )
+        return True
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return False
+
+
 def _retopo_restore_isolation(state):
     if not isinstance(state, _FaceSetOrbitState):
         return
@@ -1057,6 +1684,15 @@ def _cleanup_orphan_retopo_isolations():
                     "target": str(obj.get(_RETOPO_ISOLATION_TARGET_LAYER, "")),
                     "vert_marker": str(
                         obj.get(_RETOPO_ISOLATION_VERT_MARKER_LAYER, "")
+                    ),
+                    "vert_target": str(
+                        obj.get(_RETOPO_ISOLATION_VERT_TARGET_LAYER, "")
+                    ),
+                    "vert_origin": str(
+                        obj.get(_RETOPO_ISOLATION_VERT_ORIGIN_LAYER, "")
+                    ),
+                    "vert_created": str(
+                        obj.get(_RETOPO_ISOLATION_VERT_CREATED_LAYER, "")
                     ),
                     "vert_hide": str(
                         obj.get(_RETOPO_ISOLATION_VERT_HIDE_LAYER, "")
@@ -1377,10 +2013,10 @@ def _has_active_face_set_state():
     )
 
 
-def _retopoflow_hidden_vertex_filter_enabled():
+def _retopoflow_snap_weld_filter_enabled():
     prefs = _addon_preferences()
     return bool(
-        getattr(prefs, "retopoflow_hidden_vertex_filter", False)
+        getattr(prefs, "retopoflow_target_island_filter", False)
         if prefs is not None
         else False
     )
@@ -1409,119 +2045,235 @@ def _retopoflow_filter_info(context):
     return None
 
 
-def _retopoflow_mfo_vertex_filter(context):
-    """Build a filter for only pre-existing vertices hidden by this session.
+class _RetopoFilterUnavailable(RuntimeError):
+    """Raised when FSMFO membership data cannot be trusted safely."""
 
-    A plain ``vertex.hide`` check is too broad: it also classifies any vertex
-    created after FSMFO started.  The isolation marker is initialized on every
-    vertex that existed at activation.  Directly-created vertices use the
-    layer default, while split/copy operations may inherit custom data; the
-    saved element identity/index guard keeps those new vertices outside this
-    filter as well.
+
+def _retopoflow_reject_all_filter(_vertex):
+    """Reject every candidate after FSMFO membership became untrusted."""
+    raise _RetopoFilterUnavailable()
+
+
+def _retopoflow_abort_untrusted_filter(info):
+    """End FSMFO instead of allowing an unclassifiable Retopo candidate."""
+    if not info or info.get("filter_invalid"):
+        return
+    info["filter_invalid"] = True
+    for state in list(_active_states.values()):
+        try:
+            if (
+                isinstance(state, _FaceSetOrbitState)
+                and state.retopo_isolation is info
+                and state.active
+            ):
+                _finish_state(state)
+                return
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            continue
+
+
+def _retopoflow_reject_active_isolations_if_context_missing():
+    """Fail closed if a hooked RF call cannot provide its Edit Context."""
+    found = False
+    for state in list(_active_states.values()):
+        try:
+            if (
+                isinstance(state, _FaceSetOrbitState)
+                and state.active
+                and state.retopo_isolation
+            ):
+                found = True
+                _retopoflow_abort_untrusted_filter(state.retopo_isolation)
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            continue
+    return _retopoflow_reject_all_filter if found else None
+
+
+def _retopoflow_target_island_filter(context):
+    """Return the session-backed target-island predicate for one Edit BMesh.
+
+    Membership layers are the runtime source of truth.  ``component_faces``
+    and long-lived BMVert references are deliberately not consulted here.
+    A newly-created vertex is accepted only after the current BMesh identity,
+    pointer identity, and an explicit connection to the target topology have
+    all been checked.  Any other unclassifiable state aborts FSMFO instead of
+    failing open and permitting a target outside the focused island.
     """
     info = _retopoflow_filter_info(context)
     if info is None:
         return None
+    if info.get("filter_invalid"):
+        return _retopoflow_reject_all_filter
 
     try:
         edit_object = context.edit_object
+        if edit_object is None or edit_object.mode != "EDIT":
+            raise _RetopoFilterUnavailable()
+        object_name = str(info.get("object_name", ""))
+        if not object_name or edit_object.name != object_name:
+            raise _RetopoFilterUnavailable()
         layer_names = info.get("layer_names") or {}
-        marker_name = layer_names.get("vert_marker")
-        hide_name = layer_names.get("vert_hide")
-        if not marker_name or not hide_name:
-            return None
         bm = bmesh.from_edit_mesh(edit_object.data)
-        marker_layer = bm.verts.layers.int.get(marker_name)
-        hide_layer = bm.verts.layers.int.get(hide_name)
-        session_id = int(info["session_id"])
-        initial_vertex_pointers = set()
-        for initial_vertex in info.get("initial_verts", ()):
-            try:
-                if initial_vertex.is_valid:
-                    pointer = initial_vertex.as_pointer()
-                    if pointer:
-                        initial_vertex_pointers.add(pointer)
-            except (AttributeError, ReferenceError, RuntimeError, TypeError):
-                continue
-        initial_vertex_indices = {
-            int(index)
-            for index in info.get("initial_vert_indices", ())
-            if isinstance(index, int) and index >= 0
-        }
-        try:
-            bm.verts.index_update()
-        except (AttributeError, ReferenceError, RuntimeError, TypeError):
-            pass
-
-        initial_vertex_hide_by_index = {
-            int(index): int(hide_value)
-            for index, hide_value in zip(
-                info.get("initial_vert_indices", ()),
-                info.get("initial_vert_hide_values", ()),
+        vert_marker_layer = bm.verts.layers.int.get(
+            layer_names.get("vert_marker", "")
+        )
+        vert_target_layer = bm.verts.layers.int.get(
+            layer_names.get("vert_target", "")
+        )
+        vert_origin_layer = bm.verts.layers.int.get(
+            layer_names.get("vert_origin", "")
+        )
+        vert_created_layer = bm.verts.layers.int.get(
+            layer_names.get("vert_created", "")
+        )
+        face_marker_layer = bm.faces.layers.int.get(
+            layer_names.get("marker", "")
+        )
+        face_target_layer = bm.faces.layers.int.get(
+            layer_names.get("target", "")
+        )
+        edge_marker_layer = bm.edges.layers.int.get(
+            layer_names.get("edge_marker", "")
+        )
+        if any(
+            layer is None
+            for layer in (
+                vert_marker_layer,
+                vert_target_layer,
+                vert_origin_layer,
+                vert_created_layer,
+                face_marker_layer,
+                face_target_layer,
+                edge_marker_layer,
             )
-            if isinstance(index, int) and index >= 0
+        ):
+            raise _RetopoFilterUnavailable()
+
+        session_id = int(info.get("session_id", 0))
+        initial_origin_ids = {
+            int(origin_id)
+            for origin_id in info.get("initial_vertex_origin_ids", ())
+            if isinstance(origin_id, int) and origin_id > 0
         }
+        if session_id <= 0 or not initial_origin_ids:
+            raise _RetopoFilterUnavailable()
+        initial_vertex_tokens = {
+            int(token)
+            for token in info.get("initial_vertex_tokens", ())
+            if isinstance(token, int)
+        }
+        activation_bmesh_token = info.get("activation_bmesh_token")
+        if not isinstance(activation_bmesh_token, int) or not initial_vertex_tokens:
+            raise _RetopoFilterUnavailable()
+        current_bmesh_token = _retopo_element_token(bm)
+        if current_bmesh_token is None:
+            raise _RetopoFilterUnavailable()
 
-        if marker_layer is None or hide_layer is None:
-            # RetopoFlow can rebuild the Edit BMesh and discard MFO's
-            # temporary layers.  Keep a narrow identity-based fallback so
-            # hidden pre-existing vertices remain protected without reverting
-            # to the unsafe broad ``vertex.hide`` test.
-            if not initial_vertex_hide_by_index:
-                return None
-
-            def is_allowed_without_layers(vertex):
-                try:
-                    index = int(vertex.index)
-                    if index not in initial_vertex_hide_by_index:
-                        return True
-                    return not (
-                        initial_vertex_hide_by_index[index] == 0
-                        and bool(vertex.hide)
-                    )
-                except (
-                    AttributeError,
-                    ReferenceError,
-                    RuntimeError,
-                    TypeError,
-                    ValueError,
+        def _has_target_connection(vertex):
+            for face in vertex.link_faces:
+                if (
+                    int(face[face_marker_layer]) == session_id
+                    and int(face[face_target_layer]) == 1
                 ):
                     return True
-
-            return is_allowed_without_layers
-    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
-        return None
-
-    def is_allowed(vertex):
-        try:
-            if initial_vertex_pointers:
-                try:
-                    if vertex.as_pointer() not in initial_vertex_pointers:
+            for edge in vertex.link_edges:
+                for linked_vertex in edge.verts:
+                    if linked_vertex is vertex:
+                        continue
+                    if (
+                        int(linked_vertex[vert_marker_layer]) == session_id
+                        and int(linked_vertex[vert_target_layer]) == 1
+                    ):
                         return True
-                except (AttributeError, ReferenceError, RuntimeError, TypeError):
-                    if initial_vertex_indices:
-                        if int(vertex.index) not in initial_vertex_indices:
-                            return True
-                    else:
-                        return True
-            elif initial_vertex_indices:
-                if int(vertex.index) not in initial_vertex_indices:
-                    return True
-            else:
-                # No reliable identity data means this vertex cannot be
-                # safely classified as an FSMFO pre-existing vertex.
-                return True
-            return not (
-                int(vertex[marker_layer]) == session_id
-                and int(vertex[hide_layer]) == 0
-                and bool(vertex.hide)
-            )
-        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
-            # A stale/invalid element must not make the wrapper fail.  The
-            # original RetopoFlow routine still owns final validity checks.
+            return False
+
+        def _mark_confirmed_new_vertex(vertex):
+            # Zero marker/origin data is not evidence of a new vertex by
+            # itself.  It is accepted only when this is still the activation
+            # BMesh, the underlying element token was not present at
+            # activation, and the new vertex is already connected to explicit
+            # target topology.
+            if current_bmesh_token != activation_bmesh_token:
+                raise _RetopoFilterUnavailable()
+            token = _retopo_element_token(vertex)
+            if token is None:
+                raise _RetopoFilterUnavailable()
+            if token in initial_vertex_tokens:
+                raise _RetopoFilterUnavailable()
+            if not _has_target_connection(vertex):
+                raise _RetopoFilterUnavailable()
+            vertex[vert_marker_layer] = session_id
+            vertex[vert_target_layer] = 1
+            vertex[vert_origin_layer] = 0
+            vertex[vert_created_layer] = session_id
             return True
 
-    return is_allowed
+        def is_allowed(vertex):
+            try:
+                if not vertex.is_valid:
+                    raise _RetopoFilterUnavailable()
+                marker = int(vertex[vert_marker_layer])
+                target = int(vertex[vert_target_layer])
+                origin = int(vertex[vert_origin_layer])
+                created = int(vertex[vert_created_layer])
+                if marker == session_id:
+                    if target not in (0, 1):
+                        raise _RetopoFilterUnavailable()
+                    if target == 0:
+                        return False
+                    if created == session_id and origin == 0:
+                        return True
+                    if created == 0 and origin in initial_origin_ids:
+                        # A copied/interpolated vertex may inherit the
+                        # activation marker and origin.  It is an activation
+                        # vertex only when its pointer is also one of the
+                        # activation pointers; otherwise require the same
+                        # explicit new-vertex proof before rewriting its
+                        # provenance.
+                        token = _retopo_element_token(vertex)
+                        if token is None:
+                            raise _RetopoFilterUnavailable()
+                        if token in initial_vertex_tokens:
+                            return True
+                        if current_bmesh_token == activation_bmesh_token:
+                            return _mark_confirmed_new_vertex(vertex)
+                        # After a BMesh rebuild the explicit current-session
+                        # target bit remains authoritative.  The vertex may
+                        # be an activation vertex with a new runtime token;
+                        # do not misclassify it as an unknown non-target.
+                        return True
+                    # A current-session target bit without either the
+                    # activation origin or an explicit created marker is
+                    # provenance-ambiguous and must not fail open.
+                    raise _RetopoFilterUnavailable()
+
+                if marker == 0 and origin == 0 and created == 0:
+                    return _mark_confirmed_new_vertex(vertex)
+
+                # Any stale, copied, partially-lost, or foreign session data
+                # is untrusted.  In particular, marker=0/origin=0 alone is
+                # never a reason to permit a candidate.
+                if marker != session_id or created != 0 or origin != 0:
+                    raise _RetopoFilterUnavailable()
+                raise _RetopoFilterUnavailable()
+            except _RetopoFilterUnavailable:
+                raise
+            except (
+                AttributeError,
+                ReferenceError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+            ) as exc:
+                raise _RetopoFilterUnavailable() from exc
+
+        return is_allowed
+    except _RetopoFilterUnavailable:
+        _retopoflow_abort_untrusted_filter(info)
+        return _retopoflow_reject_all_filter
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        _retopoflow_abort_untrusted_filter(info)
+        return _retopoflow_reject_all_filter
 
 
 def _get_retopoflow_nearest_bmvert_class():
@@ -1536,104 +2288,278 @@ def _get_retopoflow_nearest_bmvert_class():
         return None
 
 
-def _restore_retopoflow_hidden_vertex_filter():
-    """Restore only an MFO-owned RetopoFlow update wrapper, if present."""
-    global _retopoflow_hidden_vertex_filter_class
-    global _retopoflow_hidden_vertex_filter_original_update
-    global _retopoflow_hidden_vertex_filter_installed
+def _get_retopoflow_translate_class():
+    """Return RetopoFlow's translate operator class when available."""
+    try:
+        from bl_ext.superhivemarket_com.retopoflow.retopoflow.rfoperators.transform import (
+            RFOperator_Translate,
+        )
 
-    classes = []
-    if _retopoflow_hidden_vertex_filter_class is not None:
-        classes.append(_retopoflow_hidden_vertex_filter_class)
-    current_class = _get_retopoflow_nearest_bmvert_class()
-    if current_class is not None and current_class not in classes:
-        classes.append(current_class)
+        return RFOperator_Translate
+    except (ImportError, AttributeError, RuntimeError, TypeError):
+        return None
 
-    for nearest_class in classes:
+
+def _get_retopoflow_polypen_logic_class():
+    """Return RetopoFlow's PolyPen logic class when RetopoFlow is present."""
+    try:
+        from bl_ext.superhivemarket_com.retopoflow.retopoflow.rftool_polypen.polypen_logic import (
+            PP_Logic,
+        )
+
+        return PP_Logic
+    except (ImportError, AttributeError, RuntimeError, TypeError):
+        return None
+
+
+def _restore_retopoflow_hooks():
+    """Restore only MFO-owned, narrowly-scoped RetopoFlow wrappers."""
+    global _retopoflow_nearest_filter_class
+    global _retopoflow_nearest_filter_original_update
+    global _retopoflow_nearest_filter_installed
+    global _retopoflow_automerge_class
+    global _retopoflow_automerge_original
+    global _retopoflow_automerge_installed
+    global _retopoflow_automerge_nearest_bmvert
+    global _retopoflow_automerge_filter
+    global _retopoflow_polypen_class
+    global _retopoflow_polypen_original_update
+    global _retopoflow_polypen_installed
+    global _retopoflow_polypen_owner
+    global _retopoflow_polypen_nearest_bmvert
+    global _retopoflow_polypen_filter
+
+    translate_classes = []
+    if _retopoflow_automerge_class is not None:
+        translate_classes.append(_retopoflow_automerge_class)
+    current_translate_class = _get_retopoflow_translate_class()
+    if current_translate_class is not None and current_translate_class not in translate_classes:
+        translate_classes.append(current_translate_class)
+    for translate_class in translate_classes:
         try:
-            current_update = nearest_class.update
-            if not getattr(
-                current_update,
-                _RETOPOFLOW_HIDDEN_VERTEX_FILTER_TAG,
+            current = translate_class.automerge
+            if getattr(current, _RETOPOFLOW_AUTOMERGE_TAG, False):
+                original = getattr(current, _RETOPOFLOW_AUTOMERGE_ORIGINAL, None)
+                if original is not None:
+                    translate_class.automerge = original
+        except (AttributeError, ReferenceError, RuntimeError, TypeError):
+            pass
+
+    polypen_classes = []
+    if _retopoflow_polypen_class is not None:
+        polypen_classes.append(_retopoflow_polypen_class)
+    current_polypen_class = _get_retopoflow_polypen_logic_class()
+    if current_polypen_class is not None and current_polypen_class not in polypen_classes:
+        polypen_classes.append(current_polypen_class)
+    for polypen_class in polypen_classes:
+        try:
+            current = polypen_class.update
+            if getattr(current, _RETOPOFLOW_POLYPEN_TAG, False):
+                original = getattr(current, _RETOPOFLOW_POLYPEN_ORIGINAL, None)
+                if original is not None:
+                    polypen_class.update = original
+        except (AttributeError, ReferenceError, RuntimeError, TypeError):
+            pass
+
+    nearest_classes = []
+    if _retopoflow_nearest_filter_class is not None:
+        nearest_classes.append(_retopoflow_nearest_filter_class)
+    current_nearest_class = _get_retopoflow_nearest_bmvert_class()
+    if current_nearest_class is not None and current_nearest_class not in nearest_classes:
+        nearest_classes.append(current_nearest_class)
+    for nearest_class in nearest_classes:
+        try:
+            current = nearest_class.update
+            original = None
+            if getattr(current, _RETOPOFLOW_NEAREST_FILTER_TAG, False):
+                original = getattr(current, _RETOPOFLOW_NEAREST_FILTER_ORIGINAL, None)
+            # Remove wrappers from the previous pre-membership implementation
+            # as well, so an add-on reload cannot leave that hook active.
+            if original is None and getattr(
+                current,
+                "mesh_focus_orbit.retopoflow_hidden_vertex_filter",
                 False,
             ):
-                continue
-            original_update = getattr(
-                current_update,
-                _RETOPOFLOW_HIDDEN_VERTEX_FILTER_ORIGINAL,
+                original = getattr(
+                    current,
+                    "mesh_focus_orbit.retopoflow_original_nearest_bmvert_update",
+                    None,
+                )
+            if original is not None:
+                nearest_class.update = original
+        except (AttributeError, ReferenceError, RuntimeError, TypeError):
+            pass
+
+    _retopoflow_nearest_filter_class = None
+    _retopoflow_nearest_filter_original_update = None
+    _retopoflow_nearest_filter_installed = False
+    _retopoflow_automerge_class = None
+    _retopoflow_automerge_original = None
+    _retopoflow_automerge_installed = False
+    _retopoflow_automerge_nearest_bmvert = None
+    _retopoflow_automerge_filter = None
+    _retopoflow_polypen_class = None
+    _retopoflow_polypen_original_update = None
+    _retopoflow_polypen_installed = False
+    _retopoflow_polypen_owner = None
+    _retopoflow_polypen_nearest_bmvert = None
+    _retopoflow_polypen_filter = None
+
+
+def _install_retopoflow_automerge_hook():
+    """Scope membership filtering to Translate.automerge only."""
+    global _retopoflow_automerge_class
+    global _retopoflow_automerge_original
+    global _retopoflow_automerge_installed
+
+    translate_class = _get_retopoflow_translate_class()
+    if translate_class is None:
+        return False
+    try:
+        original_automerge = translate_class.automerge
+        if getattr(original_automerge, _RETOPOFLOW_AUTOMERGE_TAG, False):
+            original_automerge = getattr(
+                original_automerge,
+                _RETOPOFLOW_AUTOMERGE_ORIGINAL,
                 None,
             )
-            if original_update is not None:
-                nearest_class.update = original_update
-        except (AttributeError, ReferenceError, RuntimeError, TypeError):
-            pass
+            if original_automerge is None:
+                return False
+            translate_class.automerge = original_automerge
 
-    _retopoflow_hidden_vertex_filter_class = None
-    _retopoflow_hidden_vertex_filter_original_update = None
-    _retopoflow_hidden_vertex_filter_installed = False
-
-
-def _install_retopoflow_hidden_vertex_filter():
-    """Temporarily exclude hidden BMesh vertices from RetopoFlow nearest snaps."""
-    global _retopoflow_hidden_vertex_filter_class
-    global _retopoflow_hidden_vertex_filter_original_update
-    global _retopoflow_hidden_vertex_filter_installed
-
-    if _retopoflow_hidden_vertex_filter_installed:
-        current_class = _get_retopoflow_nearest_bmvert_class()
-        try:
-            if (
-                current_class is _retopoflow_hidden_vertex_filter_class
-                and current_class is not None
-                and getattr(
-                    current_class.update,
-                    _RETOPOFLOW_HIDDEN_VERTEX_FILTER_TAG,
-                    False,
+        def filtered_automerge(self, context, event, *args, **kwargs):
+            global _retopoflow_automerge_nearest_bmvert
+            global _retopoflow_automerge_filter
+            previous_nearest = _retopoflow_automerge_nearest_bmvert
+            previous_filter = _retopoflow_automerge_filter
+            try:
+                nearest = getattr(self, "nearest_bmv", None)
+                _retopoflow_automerge_nearest_bmvert = nearest
+                _retopoflow_automerge_filter = _retopoflow_target_island_filter(
+                    context
                 )
-            ):
-                return True
-        except (AttributeError, ReferenceError, RuntimeError, TypeError):
-            pass
-        _restore_retopoflow_hidden_vertex_filter()
+                return original_automerge(
+                    self,
+                    context,
+                    event,
+                    *args,
+                    **kwargs,
+                )
+            finally:
+                _retopoflow_automerge_nearest_bmvert = previous_nearest
+                _retopoflow_automerge_filter = previous_filter
+
+        setattr(filtered_automerge, _RETOPOFLOW_AUTOMERGE_TAG, True)
+        setattr(filtered_automerge, _RETOPOFLOW_AUTOMERGE_ORIGINAL, original_automerge)
+        translate_class.automerge = filtered_automerge
+        _retopoflow_automerge_class = translate_class
+        _retopoflow_automerge_original = original_automerge
+        _retopoflow_automerge_installed = True
+        return True
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        _restore_retopoflow_hooks()
+        return False
+
+
+def _install_retopoflow_polypen_hook():
+    """Scope membership filtering to PolyPen's own nearest BMVert instance."""
+    global _retopoflow_polypen_class
+    global _retopoflow_polypen_original_update
+    global _retopoflow_polypen_installed
+
+    polypen_class = _get_retopoflow_polypen_logic_class()
+    if polypen_class is None:
+        return False
+    try:
+        original_update = polypen_class.update
+        if getattr(original_update, _RETOPOFLOW_POLYPEN_TAG, False):
+            original_update = getattr(
+                original_update,
+                _RETOPOFLOW_POLYPEN_ORIGINAL,
+                None,
+            )
+            if original_update is None:
+                return False
+            polypen_class.update = original_update
+
+        def filtered_polypen_update(self, *args, **kwargs):
+            global _retopoflow_polypen_owner
+            global _retopoflow_polypen_nearest_bmvert
+            global _retopoflow_polypen_filter
+            context = kwargs.get("context")
+            if context is None and args:
+                context = args[0]
+            previous_nearest = _retopoflow_polypen_nearest_bmvert
+            previous_filter = _retopoflow_polypen_filter
+            previous_owner = _retopoflow_polypen_owner
+            try:
+                nearest = getattr(self, "nearest", None)
+                mfo_filter = (
+                    _retopoflow_target_island_filter(context)
+                    if context is not None
+                    else _retopoflow_reject_active_isolations_if_context_missing()
+                )
+                _retopoflow_polypen_owner = self
+                _retopoflow_polypen_nearest_bmvert = nearest
+                _retopoflow_polypen_filter = mfo_filter
+                return original_update(self, *args, **kwargs)
+            finally:
+                _retopoflow_polypen_owner = previous_owner
+                _retopoflow_polypen_nearest_bmvert = previous_nearest
+                _retopoflow_polypen_filter = previous_filter
+
+        setattr(filtered_polypen_update, _RETOPOFLOW_POLYPEN_TAG, True)
+        setattr(filtered_polypen_update, _RETOPOFLOW_POLYPEN_ORIGINAL, original_update)
+        polypen_class.update = filtered_polypen_update
+        _retopoflow_polypen_class = polypen_class
+        _retopoflow_polypen_original_update = original_update
+        _retopoflow_polypen_installed = True
+        return True
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        _restore_retopoflow_hooks()
+        return False
+
+
+def _install_retopoflow_nearest_filter_hook():
+    """Add membership only to the active PolyPen/Auto Merge Nearest call."""
+    global _retopoflow_nearest_filter_class
+    global _retopoflow_nearest_filter_original_update
+    global _retopoflow_nearest_filter_installed
 
     nearest_class = _get_retopoflow_nearest_bmvert_class()
     if nearest_class is None:
         return False
-
     try:
         original_update = nearest_class.update
-        if getattr(
-            original_update,
-            _RETOPOFLOW_HIDDEN_VERTEX_FILTER_TAG,
-            False,
-        ):
-            stale_original = getattr(
+        if getattr(original_update, _RETOPOFLOW_NEAREST_FILTER_TAG, False):
+            original_update = getattr(
                 original_update,
-                _RETOPOFLOW_HIDDEN_VERTEX_FILTER_ORIGINAL,
+                _RETOPOFLOW_NEAREST_FILTER_ORIGINAL,
                 None,
             )
-            if stale_original is None:
+            if original_update is None:
                 return False
-            # A module reload can leave the previous MFO wrapper on the class.
-            # Remove that stale wrapper before installing the current one.
-            nearest_class.update = stale_original
-            original_update = stale_original
-
-        try:
-            import inspect
-
-            if "filter_fn" not in inspect.signature(original_update).parameters:
+            nearest_class.update = original_update
+        elif getattr(
+            original_update,
+            "mesh_focus_orbit.retopoflow_hidden_vertex_filter",
+            False,
+        ):
+            original_update = getattr(
+                original_update,
+                "mesh_focus_orbit.retopoflow_original_nearest_bmvert_update",
+                None,
+            )
+            if original_update is None:
                 return False
-        except (ImportError, TypeError, ValueError):
-            return False
+            nearest_class.update = original_update
+        import inspect
 
         update_signature = inspect.signature(original_update)
+        if "filter_fn" not in update_signature.parameters:
+            return False
 
         def filtered_update(self, context, co, *args, **kwargs):
-            mfo_filter = _retopoflow_mfo_vertex_filter(context)
-            if mfo_filter is None:
-                return original_update(self, context, co, *args, **kwargs)
-
             try:
                 bound = update_signature.bind(
                     self,
@@ -1643,44 +2569,118 @@ def _install_retopoflow_hidden_vertex_filter():
                     **kwargs,
                 )
             except TypeError:
-                # Preserve RetopoFlow's original argument validation
-                # instead of changing the error behavior of an invalid call.
                 return original_update(self, context, co, *args, **kwargs)
 
             caller_filter = bound.arguments.get("filter_fn")
-            if caller_filter is None:
-                combined_filter = mfo_filter
-            else:
-                combined_filter = lambda vertex: (
-                    bool(caller_filter(vertex)) and bool(mfo_filter(vertex))
+            mode = None
+            mfo_filter = None
+            if (
+                self is _retopoflow_polypen_nearest_bmvert
+                or (
+                    _retopoflow_polypen_owner is not None
+                    and getattr(_retopoflow_polypen_owner, "nearest", None)
+                    is self
                 )
+            ):
+                mode = "polypen"
+                mfo_filter = _retopoflow_polypen_filter
+            elif self is _retopoflow_automerge_nearest_bmvert:
+                mode = "automerge"
+                mfo_filter = _retopoflow_automerge_filter
+            if mode is None or mfo_filter is None:
+                return original_update(*bound.args, **bound.kwargs)
+
+            filter_selected = bool(bound.arguments.get("filter_selected", True))
+
+            def combined_filter(vertex):
+                try:
+                    if caller_filter is not None and not caller_filter(vertex):
+                        return False
+                    # When the native call supplied no filter_fn, preserve the
+                    # exclusive filter_selected branch that RF would have
+                    # taken.  PolyPen's own filter_fn path stays exactly as RF
+                    # provided it.
+                    if caller_filter is None and filter_selected and bool(vertex.select):
+                        return False
+                    return bool(mfo_filter(vertex))
+                except _RetopoFilterUnavailable:
+                    raise
+                except (
+                    AttributeError,
+                    ReferenceError,
+                    RuntimeError,
+                    TypeError,
+                    ValueError,
+                ) as exc:
+                    raise _RetopoFilterUnavailable() from exc
+
             bound.arguments["filter_fn"] = combined_filter
+            try:
+                return original_update(*bound.args, **bound.kwargs)
+            except _RetopoFilterUnavailable:
+                # The membership session was no longer trustworthy.  Never
+                # retry the native call without a filter: that would turn a
+                # fail-closed membership failure into a fail-open weld.
+                try:
+                    self.bmv = None
+                except (AttributeError, ReferenceError, RuntimeError, TypeError):
+                    pass
+                return None
 
-            # BoundArguments reconstructs positional and keyword arguments in
-            # the form required by the actual signature.  This avoids adding
-            # filter_fn to kwargs when it was supplied positionally.
-            return original_update(*bound.args, **bound.kwargs)
-
-        setattr(filtered_update, _RETOPOFLOW_HIDDEN_VERTEX_FILTER_TAG, True)
-        setattr(
-            filtered_update,
-            _RETOPOFLOW_HIDDEN_VERTEX_FILTER_ORIGINAL,
-            original_update,
-        )
+        setattr(filtered_update, _RETOPOFLOW_NEAREST_FILTER_TAG, True)
+        setattr(filtered_update, _RETOPOFLOW_NEAREST_FILTER_ORIGINAL, original_update)
         nearest_class.update = filtered_update
-        _retopoflow_hidden_vertex_filter_class = nearest_class
-        _retopoflow_hidden_vertex_filter_original_update = original_update
-        _retopoflow_hidden_vertex_filter_installed = True
+        _retopoflow_nearest_filter_class = nearest_class
+        _retopoflow_nearest_filter_original_update = original_update
+        _retopoflow_nearest_filter_installed = True
         return True
     except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
-        _restore_retopoflow_hidden_vertex_filter()
+        _restore_retopoflow_hooks()
         return False
 
 
-def _release_retopoflow_hidden_vertex_filter():
-    """Release the temporary hook after the last FSMFO state finishes."""
+def _install_retopoflow_hooks():
+    """Install only the PolyPen and Translate candidate-boundary hooks."""
+    if not _install_retopoflow_nearest_filter_hook():
+        return False
+    if not _install_retopoflow_polypen_hook():
+        _restore_retopoflow_hooks()
+        return False
+    if not _install_retopoflow_automerge_hook():
+        _restore_retopoflow_hooks()
+        return False
+    return True
+
+
+def _release_retopoflow_hooks():
+    """Release the temporary RetopoFlow hooks after FSMFO finishes."""
     if not _has_active_face_set_state():
-        _restore_retopoflow_hidden_vertex_filter()
+        _restore_retopoflow_hooks()
+
+
+def _state_reference_object(state):
+    """Resolve a Face Set state Reference by name after Undo/rebuilds."""
+    if not isinstance(state, _FaceSetOrbitState):
+        return None
+    try:
+        name = str(state.reference_object_name)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        name = ""
+    if name:
+        try:
+            reference = bpy.data.objects.get(name)
+            if reference is not None and reference.type == "MESH":
+                state.reference_object = reference
+                return reference
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            pass
+    try:
+        reference = state.reference_object
+        if reference is not None and reference.type == "MESH":
+            return reference
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        pass
+    return None
 
 
 def _polyquilt_filtered_snap_objects(context):
@@ -1698,11 +2698,11 @@ def _polyquilt_filtered_snap_objects(context):
         objects = []
 
     active_reference_names = {
-        state.reference_object.name
+        state.reference_object_name
         for state in _active_states.values()
         if isinstance(state, _FaceSetOrbitState)
         and state.active
-        and state.reference_object is not None
+        and state.reference_object_name
     }
     for reference_name in active_reference_names:
         reference = bpy.data.objects.get(reference_name)
@@ -1867,9 +2867,18 @@ def _remove_face_set_proxy(state):
         return
 
     proxy = state.proxy_object
+    if proxy is None:
+        try:
+            proxy = bpy.data.objects.get(state.proxy_object_name)
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            proxy = None
     state.proxy_object = None
+    state.proxy_object_name = ""
     _remove_face_set_proxy_object(proxy)
-    _restore_reference_if_unused(state.reference_object, state.reference_was_hidden)
+    _restore_reference_if_unused(
+        _state_reference_object(state),
+        state.reference_was_hidden,
+    )
     _refresh_polyquilt_qsnap(state=state)
     _tag_redraw(state.area)
 
@@ -1879,7 +2888,9 @@ def _build_face_set_proxy(state):
     if not isinstance(state, _FaceSetOrbitState):
         return False
 
-    reference = state.reference_object
+    reference = _state_reference_object(state)
+    if reference is None:
+        return False
     source_mesh = reference.data
     face_set_attr = source_mesh.attributes.get(".sculpt_face_set")
     if face_set_attr is None or face_set_attr.domain != "FACE":
@@ -1928,17 +2939,16 @@ def _build_face_set_proxy(state):
         proxy_mesh.from_pydata(vertices, [], faces)
         proxy_mesh.update()
 
-        # Preserve the source material slots and smooth shading so the proxy
-        # remains visually close to the Reference Object.
-        for material in source_mesh.materials:
-            if material is not None:
-                proxy_mesh.materials.append(material)
+        # Do not share the Reference material datablocks with this temporary
+        # proxy.  The proxy can survive an Undo while the source mesh/material
+        # relation is being rebuilt; sharing those slots makes Blender's
+        # dependency-graph material builder observe stale ownership during
+        # that boundary.  The proxy's object color/display settings below are
+        # sufficient for the solid viewport isolation display.
         for proxy_polygon, source_polygon in zip(
             proxy_mesh.polygons, target_polygons
         ):
             proxy_polygon.use_smooth = bool(source_polygon.use_smooth)
-            if 0 <= source_polygon.material_index < len(proxy_mesh.materials):
-                proxy_polygon.material_index = source_polygon.material_index
 
         proxy = bpy.data.objects.new(
             f"{reference.name}__MFO_FACE_SET_PROXY__{state.area.as_pointer()}",
@@ -1965,6 +2975,7 @@ def _build_face_set_proxy(state):
             collection.objects.link(proxy)
 
         state.proxy_object = proxy
+        state.proxy_object_name = proxy.name
         if not reference.get(_FACE_SET_REFERENCE_TAG, False):
             reference[_FACE_SET_REFERENCE_PREVIOUS_HIDE] = bool(
                 state.reference_was_hidden
@@ -1986,13 +2997,24 @@ def _build_face_set_proxy(state):
     ):
         proxy = state.proxy_object or proxy
         state.proxy_object = None
+        state.proxy_object_name = ""
         _remove_face_set_proxy_object(proxy)
         _restore_reference_if_unused(reference, state.reference_was_hidden)
         return False
 
 
+def _is_live_active_state(state):
+    """Return True only while this exact state is registered and active."""
+    try:
+        if state is None or not state.active:
+            return False
+        return any(candidate is state for candidate in _active_states.values())
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return False
+
+
 def _draw_debug_point(state):
-    if not state.active:
+    if not _is_live_active_state(state):
         return
 
     try:
@@ -2060,7 +3082,7 @@ def _draw_rounded_indicator_box(x_min, y_min, x_max, y_max):
 
 def _draw_indicator_text(state):
     """Draw the MFO indicator without using the shared area header text."""
-    if not state or not state.active:
+    if not _is_live_active_state(state):
         return
 
     try:
@@ -2148,7 +3170,7 @@ def _stop_indicator_draw(state):
             state.indicator_draw_handler,
             "WINDOW",
         )
-    except (AttributeError, RuntimeError, TypeError):
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
         pass
     state.indicator_draw_handler = None
 
@@ -2173,7 +3195,7 @@ def _stop_debug_draw(state):
         return
     try:
         bpy.types.SpaceView3D.draw_handler_remove(state.draw_handler, "WINDOW")
-    except (AttributeError, RuntimeError, TypeError):
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
         pass
     state.draw_handler = None
 
@@ -2198,6 +3220,67 @@ def _activate_state(state):
     _tag_redraw(state.area)
 
 
+def _face_set_activation_artifact_present(state):
+    """Use the native Proxy Object as the FSMFO activation sentinel."""
+    if not isinstance(state, _FaceSetOrbitState):
+        return True
+    try:
+        proxy_name = str(state.proxy_object_name)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return False
+    if not proxy_name:
+        return False
+    proxy = bpy.data.objects.get(proxy_name)
+    return _is_face_set_proxy_object(proxy)
+
+
+def _stop_watcher_timer(state):
+    """Remove a session timer without touching any other session."""
+    if state is None:
+        return
+    timer = getattr(state, "watcher_timer", None)
+    if timer is None:
+        return
+    try:
+        bpy.context.window_manager.event_timer_remove(timer)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        pass
+    state.watcher_timer = None
+
+
+def _detach_watcher_operator(operator):
+    """Detach one watcher instance, never another session's watcher."""
+    if operator is None:
+        return
+    try:
+        operator_key = operator.as_pointer()
+    except (AttributeError, ReferenceError, RuntimeError, TypeError):
+        operator_key = id(operator)
+    try:
+        timer = getattr(operator, "_mfo_timer", None)
+        if timer is not None:
+            try:
+                bpy.context.window_manager.event_timer_remove(timer)
+            except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+                pass
+        area_key = int(getattr(operator, "_mfo_area_key", 0))
+        session_id = int(getattr(operator, "_mfo_session_id", 0))
+        state = _active_states.get(area_key)
+        if (
+            state is not None
+            and getattr(state, "session_id", 0) == session_id
+            and getattr(state, "watcher_operator_key", None) == operator_key
+        ):
+            state.watcher_operator_key = None
+            state.watcher_timer = None
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        pass
+    try:
+        operator._mfo_timer = None
+    except (AttributeError, ReferenceError, RuntimeError, TypeError):
+        pass
+
+
 def _restore_original_view(state):
     """Restore the complete viewport transform saved at activation."""
     if not state:
@@ -2217,34 +3300,90 @@ def _deactivate_state(state):
     """Exit temporary mode and restore the complete saved viewport view."""
     if not state or not state.active:
         return
-    area_key = state.area.as_pointer()
     _finish_state(state)
-    _active_states.pop(area_key, None)
-    for operator_key, mapped_area_key in list(_modal_operator_areas.items()):
-        if mapped_area_key == area_key:
-            _modal_operator_areas.pop(operator_key, None)
 
 
-def _finish_state(state):
-    """End the modal watcher and restore the saved viewport transform."""
-    if not state or not state.active:
+def _finish_state(state, restore_retopo=True):
+    """End one owned session with idempotent, ownership-safe cleanup."""
+    if state is None:
         return
-    _retopo_restore_isolation(state)
-    _remove_face_set_proxy(state)
-    _restore_original_view(state)
-    state.active = False
-    _release_retopoflow_hidden_vertex_filter()
-    _release_polyquilt_qsnap_filter(state=state)
-    _stop_indicator_draw(state)
-    _stop_debug_draw(state)
-    _tag_redraw(state.area)
+
+    try:
+        area_key = int(state.area_key)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        area_key = 0
+    if area_key and area_key in _session_cleanup_areas:
+        return
+    if area_key:
+        _session_cleanup_areas.add(area_key)
+
+    # Deactivate and detach drawing immediately.  Cleanup below is deliberately
+    # best-effort: a stale Object, Proxy, Area, or View3D handler must not leave
+    # the ON indicator visible or prevent the remaining cleanup steps.
+    try:
+        state.active = False
+    except (AttributeError, ReferenceError, RuntimeError, TypeError):
+        pass
+    _unregister_session(state)
+    try:
+        _stop_indicator_draw(state)
+    except Exception:
+        state.indicator_draw_handler = None
+    try:
+        _stop_debug_draw(state)
+    except Exception:
+        state.draw_handler = None
+
+    # The Watcher owns the periodic Timer.  Remove only this session's timer
+    # before touching native data so queued TIMER events cannot affect a new
+    # session that reuses the same viewport.
+    _stop_watcher_timer(state)
+    try:
+        state.watcher_operator_key = None
+    except (AttributeError, ReferenceError, RuntimeError, TypeError):
+        pass
+
+    if restore_retopo:
+        try:
+            _retopo_restore_isolation(state)
+        except Exception:
+            pass
+    elif isinstance(state, _FaceSetOrbitState):
+        # Blender has already restored the pre-FSMFO Undo state.  The old
+        # BMesh elements/layers may no longer exist, so deliberately discard
+        # the Python reference without attempting to restore it.
+        state.retopo_isolation = None
+    try:
+        _remove_face_set_proxy(state)
+    except Exception:
+        pass
+    try:
+        _restore_original_view(state)
+    except Exception:
+        pass
+
+    # These hooks are shared with RetopoFlow/PolyQuilt.  Always release them
+    # even when one of the scene/view restoration steps failed.
+    try:
+        _release_retopoflow_hooks()
+    except Exception:
+        pass
+    try:
+        _release_polyquilt_qsnap_filter(state=state)
+    except Exception:
+        pass
+    try:
+        _tag_redraw(state.area)
+    except Exception:
+        pass
+    if area_key:
+        _session_cleanup_areas.discard(area_key)
 
 
 def _finish_all_states():
     for key, state in list(_active_states.items()):
         _finish_state(state)
         _active_states.pop(key, None)
-    _modal_operator_areas.clear()
     _last_tap_times.clear()
     _local_face_set_adjacency_cache.clear()
 
@@ -2259,9 +3398,7 @@ def _finish_face_set_states():
         _finish_state(state)
         _active_states.pop(area_key, None)
 
-    for operator_key, area_key in list(_modal_operator_areas.items()):
-        if area_key in face_set_area_keys:
-            _modal_operator_areas.pop(operator_key, None)
+    _session_cleanup_areas.difference_update(face_set_area_keys)
 
 
 def _cleanup_orphan_face_set_proxies():
@@ -2276,9 +3413,15 @@ def _cleanup_orphan_face_set_proxies():
     _cleanup_orphan_retopo_isolations()
 
     active_proxy_pointers = set()
+    active_proxy_names = set()
     for state in list(_active_states.values()):
         if not isinstance(state, _FaceSetOrbitState) or not state.active:
             continue
+        try:
+            if state.proxy_object_name:
+                active_proxy_names.add(str(state.proxy_object_name))
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            pass
         proxy = state.proxy_object
         if proxy is None:
             continue
@@ -2291,6 +3434,8 @@ def _cleanup_orphan_face_set_proxies():
     removed_proxy_names = []
     for proxy in list(bpy.data.objects):
         if not _is_face_set_proxy_object(proxy):
+            continue
+        if proxy.name in active_proxy_names:
             continue
         try:
             if proxy.as_pointer() in active_proxy_pointers:
@@ -2336,7 +3481,7 @@ def _cleanup_orphan_face_set_proxies():
             pass
 
     _release_polyquilt_qsnap_filter()
-    _release_retopoflow_hidden_vertex_filter()
+    _release_retopoflow_hooks()
 
     if removed_proxy_names or removed_proxy_meshes:
         for window in bpy.context.window_manager.windows:
@@ -2356,53 +3501,6 @@ def _is_live_face_set_proxy(proxy):
         return bpy.data.objects.get(proxy.name) is proxy
     except (AttributeError, ReferenceError, RuntimeError, TypeError):
         return False
-
-
-def _resync_active_face_set_states_after_undo():
-    """Keep Face Set MFO active while repairing an undo-invalidated proxy.
-
-    Undo is a normal editing operation while MFO is active.  Blender can still
-    invalidate data-API-created proxy objects as part of the undo transaction,
-    so repair only the missing display proxy here.  The viewport transform,
-    active object, mode, and selection are intentionally left untouched.
-    """
-    active_face_set_states = [
-        state
-        for state in _active_states.values()
-        if isinstance(state, _FaceSetOrbitState) and state.active
-    ]
-    if not active_face_set_states:
-        return
-
-    for state in active_face_set_states:
-        try:
-            reference_name = state.reference_object.name
-        except (AttributeError, ReferenceError, RuntimeError, TypeError):
-            continue
-
-        reference = bpy.data.objects.get(reference_name)
-        if reference is None or reference.type != "MESH":
-            continue
-        # Undo may replace the datablock wrapper while keeping the object name.
-        # Keep the active mode state attached to the current Reference object.
-        state.reference_object = reference
-
-        if _is_live_face_set_proxy(state.proxy_object):
-            _set_object_hidden(reference, True)
-        else:
-            # The normal orphan cleanup above has already removed any stale
-            # tagged proxy and restored the saved Reference visibility.  Rebuild
-            # only the proxy belonging to this still-active FSMFO state.
-            state.proxy_object = None
-            _build_face_set_proxy(state)
-
-    _install_polyquilt_qsnap_filter()
-    if _retopoflow_hidden_vertex_filter_enabled():
-        _install_retopoflow_hidden_vertex_filter()
-    for state in active_face_set_states:
-        if state.active:
-            _refresh_polyquilt_qsnap(state=state)
-            _tag_redraw(state.area)
 
 
 def _deferred_orphan_cleanup():
@@ -2438,39 +3536,60 @@ def _on_load_post(_dummy):
     _cleanup_orphan_face_set_proxies()
 
 
-@persistent
-def _on_undo_pre(_dummy):
-    """Leave both temporary modes active while Blender performs Undo.
-
-    MFO is used while editing.  Undo therefore must undo the user's edit, not
-    terminate the orbit mode or restore the viewport from before activation.
-    The post handler repairs only a proxy that Blender actually invalidated.
-    """
-    return None
-
-
-@persistent
-def _on_undo_post(_dummy):
-    """Clean orphaned remnants without ending an active temporary mode."""
-    _cleanup_orphan_face_set_proxies()
-    _resync_active_face_set_states_after_undo()
-
-
 def _operator_key(operator):
-    """Get a stable key without storing Python attributes on bpy.types.Operator."""
+    """Get a stable key for session ownership diagnostics."""
     try:
         return operator.as_pointer()
     except (AttributeError, ReferenceError, RuntimeError):
         return id(operator)
 
 
-def _finish_operator(operator):
-    operator_key = _operator_key(operator)
-    area_key = _modal_operator_areas.pop(operator_key, None)
-    if area_key is None:
-        return
-    state = _active_states.pop(area_key, None)
-    _finish_state(state)
+def _start_session(context, state, face_set=False):
+    """Create one native activation and attach exactly one Watcher."""
+    if state is None or not _register_session(state):
+        return False
+    try:
+        if face_set:
+            if not _build_face_set_proxy(state):
+                raise RuntimeError("Unable to create Face Set proxy")
+            state.retopo_isolation = _retopo_begin_isolation(
+                context,
+                state.reference_object,
+                state.proxy_object,
+            )
+            if state.retopo_isolation:
+                state.retopo_restore_snapshot = (
+                    state.retopo_isolation.get("restore_snapshot")
+                    or _retopo_capture_restore_snapshot(state.retopo_isolation)
+                )
+
+        if face_set:
+            _install_polyquilt_qsnap_filter(context=context)
+            if (
+                _retopoflow_snap_weld_filter_enabled()
+                and state.retopo_isolation
+            ):
+                # RetopoFlow is optional.  Its absence must not prevent
+                # normal Face Set MFO activation; when present, the hook
+                # installer owns its own all-or-nothing rollback.
+                _install_retopoflow_hooks()
+
+        _activate_state(state)
+        watcher_result = bpy.ops.view3d.mesh_focus_orbit_watcher(
+            "INVOKE_DEFAULT"
+        )
+        if "RUNNING_MODAL" not in watcher_result:
+            raise RuntimeError("FSMFO Watcher did not start")
+        return True
+    except (
+        AttributeError,
+        ReferenceError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ):
+        _finish_state(state)
+        return False
 
 
 class VIEW3D_OT_mesh_focus_orbit_recover_face_set_state(bpy.types.Operator):
@@ -2501,8 +3620,184 @@ class VIEW3D_OT_mesh_focus_orbit_recover_face_set_state(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class VIEW3D_OT_mesh_focus_orbit_watcher(bpy.types.Operator):
+    """Monitor one owned FSMFO session without creating Undo data."""
+
+    bl_idname = WATCHER_OPERATOR_ID
+    bl_label = "Mesh Focus Orbit Watcher"
+    bl_options = {"INTERNAL"}
+
+    def invoke(self, context, _event):
+        try:
+            area_key = context.area.as_pointer()
+        except (AttributeError, ReferenceError, RuntimeError, TypeError):
+            return {"CANCELLED"}
+        state = _active_states.get(area_key)
+        if not _session_is_current(state):
+            return {"CANCELLED"}
+        if getattr(state, "watcher_operator_key", None) is not None:
+            # A second Watcher must never replace the owner of a live session.
+            return {"CANCELLED"}
+
+        operator_key = _operator_key(self)
+        try:
+            timer = context.window_manager.event_timer_add(
+                0.25,
+                window=context.window,
+            )
+            self._mfo_area_key = area_key
+            self._mfo_session_id = state.session_id
+            self._mfo_timer = timer
+            state.watcher_operator_key = operator_key
+            state.watcher_timer = timer
+            context.window_manager.modal_handler_add(self)
+        except (
+            AttributeError,
+            ReferenceError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ):
+            _detach_watcher_operator(self)
+            return {"CANCELLED"}
+        return {"RUNNING_MODAL"}
+
+    def modal(self, _context, event):
+        area_key = getattr(self, "_mfo_area_key", 0)
+        session_id = getattr(self, "_mfo_session_id", 0)
+        state = _active_states.get(area_key)
+        if (
+            state is None
+            or not state.active
+            or state.session_id != session_id
+            or state.watcher_operator_key != _operator_key(self)
+        ):
+            # This watcher lost ownership.  It must not touch the current
+            # session's Proxy, Reference, isolation, hooks, or timers.
+            _detach_watcher_operator(self)
+            return {"CANCELLED"}
+
+        if event.type == "TIMER":
+            if (
+                isinstance(state, _FaceSetOrbitState)
+                and not _face_set_activation_artifact_present(state)
+            ):
+                # Native Undo removed the Activation step.  This is a normal
+                # end event, not a damaged session: do not rebuild anything.
+                _finish_state(state, restore_retopo=False)
+                _detach_watcher_operator(self)
+                return {"CANCELLED"}
+            return {"PASS_THROUGH"}
+
+        if event.type == "WINDOW_DEACTIVATE":
+            prefs = _addon_preferences()
+            if prefs and prefs.focus_loss_behavior == "EXIT":
+                _finish_state(state)
+                _detach_watcher_operator(self)
+                return {"CANCELLED"}
+
+        # Passing events through preserves Navigation Gizmo, MMB orbit, and
+        # RetopoFlow's own modal input.
+        return {"PASS_THROUGH"}
+
+    def __del__(self):
+        try:
+            _detach_watcher_operator(self)
+        except (ReferenceError, RuntimeError, AttributeError):
+            pass
+
+
+class VIEW3D_OT_mesh_focus_face_set_activate(bpy.types.Operator):
+    """Create one Face Set MFO activation Undo step, then finish."""
+
+    bl_idname = FACE_SET_ACTIVATION_OPERATOR_ID
+    bl_label = "Mesh Focus Orbit: Face Set Activation"
+    bl_options = {"INTERNAL", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return (
+            context.area is not None
+            and context.area.type == "VIEW_3D"
+            and context.region is not None
+            and context.region.type == "WINDOW"
+            and context.space_data is not None
+            and context.mode in {"OBJECT", "EDIT_MESH"}
+        )
+
+    def invoke(self, context, event):
+        """Handle FSMFO's Ctrl+double-tap without an outer trigger operator."""
+        if not self.poll(context):
+            return {"PASS_THROUGH"}
+
+        try:
+            area_key = context.area.as_pointer()
+        except (AttributeError, ReferenceError, RuntimeError, TypeError):
+            return {"PASS_THROUGH"}
+
+        prefs = _addon_preferences()
+        activation_key = prefs.activation_key if prefs else "RIGHT_SHIFT"
+        double_tap_window = (
+            prefs.double_tap_window if prefs else DEFAULT_DOUBLE_TAP_WINDOW
+        )
+        if event.type != activation_key or event.value != "PRESS":
+            return {"PASS_THROUGH"}
+        if not getattr(event, "ctrl", False):
+            return {"PASS_THROUGH"}
+        if getattr(event, "alt", False) or getattr(event, "oskey", False):
+            return {"PASS_THROUGH"}
+
+        tap_key = ("face_set", area_key)
+        now = time.monotonic()
+        previous_tap = _last_tap_times.get(tap_key)
+        if previous_tap is None or now - previous_tap > double_tap_window:
+            _last_tap_times[tap_key] = now
+            return {"PASS_THROUGH"}
+
+        _last_tap_times.pop(tap_key, None)
+        return self.execute(context)
+
+    def execute(self, context):
+        if not self.poll(context):
+            return {"CANCELLED"}
+        try:
+            area_key = context.area.as_pointer()
+        except (AttributeError, ReferenceError, RuntimeError, TypeError):
+            return {"CANCELLED"}
+        if area_key in _session_cleanup_areas:
+            return {"CANCELLED"}
+        existing = _active_states.get(area_key)
+        if existing is not None and existing.active:
+            if isinstance(existing, _FaceSetOrbitState):
+                # FSMFO uses this same direct Activation operator for OFF.
+                # CANCELLED avoids creating a second UNDO step for the
+                # runtime-only teardown.
+                _deactivate_state(existing)
+                return {"CANCELLED"}
+            return {"CANCELLED"}
+
+        hit = _raycast_reference_face_set(context)
+        if hit is None:
+            return {"CANCELLED"}
+        reference_object, _face_index, face_set_id, hit_location, hit_distance = hit
+        prefs = _addon_preferences()
+        activation_key = prefs.activation_key if prefs else "RIGHT_SHIFT"
+        state = _FaceSetOrbitState(
+            context,
+            hit_location,
+            hit_distance,
+            activation_key,
+            reference_object,
+            face_set_id,
+        )
+        if not _start_session(context, state, face_set=True):
+            return {"CANCELLED"}
+        # This operator must end here.  Only the Watcher remains modal.
+        return {"FINISHED"}
+
+
 class VIEW3D_OT_mesh_focus_orbit(bpy.types.Operator):
-    """Double-tap the configured key to toggle the viewport-center orbit target."""
+    """Double-tap the configured key to start or stop an MFO session."""
 
     bl_idname = OPERATOR_ID
     bl_label = "Mesh Focus Orbit"
@@ -2529,118 +3824,47 @@ class VIEW3D_OT_mesh_focus_orbit(bpy.types.Operator):
         double_tap_window = (
             prefs.double_tap_window if prefs else DEFAULT_DOUBLE_TAP_WINDOW
         )
-
         if event.type != activation_key or event.value != "PRESS":
             return {"PASS_THROUGH"}
         if getattr(event, "alt", False) or getattr(event, "oskey", False):
             return {"PASS_THROUGH"}
 
-        # The configured key keeps the normal MFO shortcut.  Holding Ctrl while
-        # double-tapping it selects the independent Face Set MFO mode.
-        face_set_mode = bool(getattr(event, "ctrl", False))
-        tap_key = (area_key, face_set_mode)
+        # FSMFO has its own direct Ctrl keymap item and its own Activation
+        # operator.  This operator is intentionally normal-MFO only.
+        if getattr(event, "ctrl", False):
+            return {"PASS_THROUGH"}
 
+        tap_key = ("normal", area_key)
         now = time.monotonic()
         previous_tap = _last_tap_times.get(tap_key)
         if previous_tap is None or now - previous_tap > double_tap_window:
             _last_tap_times[tap_key] = now
-            # A single tap must remain a normal Blender modifier event.
             return {"PASS_THROUGH"}
-
         _last_tap_times.pop(tap_key, None)
+
         existing_state = _active_states.get(area_key)
-        if existing_state and existing_state.active:
-            same_mode = (
-                isinstance(existing_state, _FaceSetOrbitState)
-                if face_set_mode
-                else not isinstance(existing_state, _FaceSetOrbitState)
-            )
-            if same_mode:
+        if existing_state is not None and existing_state.active:
+            if not isinstance(existing_state, _FaceSetOrbitState):
                 _deactivate_state(existing_state)
-                return {"FINISHED"}
-            return {"PASS_THROUGH"}
-
-        # A previous modal instance may have been invalidated by Undo or
-        # window/file lifecycle events.  Recover scene remnants before a new
-        # Face Set MFO activation can create another proxy.
-        _cleanup_orphan_face_set_proxies()
-
-        if face_set_mode:
-            hit = _raycast_reference_face_set(context)
-            if hit is None:
-                # No Reference Object surface or Face Set at the center.
-                return {"PASS_THROUGH"}
-            reference_object, _face_index, face_set_id, hit_location, hit_distance = hit
-            state = _FaceSetOrbitState(
-                context,
-                hit_location,
-                hit_distance,
-                activation_key,
-                reference_object,
-                face_set_id,
-            )
-        else:
-            hit = _find_center_hit(context)
-            if hit is None:
-                # No Reference Object surface at the center: do nothing.
-                return {"PASS_THROUGH"}
-            state = _TempOrbitState(context, hit[0], hit[1], activation_key)
-
-        operator_key = _operator_key(self)
-
-        try:
-            if face_set_mode and not _build_face_set_proxy(state):
-                state.active = False
-                return {"PASS_THROUGH"}
-            if face_set_mode:
-                state.retopo_isolation = _retopo_begin_isolation(
-                    context,
-                    state.reference_object,
-                    state.proxy_object,
-                )
-            _active_states[area_key] = state
-            _modal_operator_areas[operator_key] = area_key
-            if face_set_mode:
-                _install_polyquilt_qsnap_filter(context=context)
-                if _retopoflow_hidden_vertex_filter_enabled():
-                    _install_retopoflow_hidden_vertex_filter()
-            _activate_state(state)
-        except (ReferenceError, RuntimeError, AttributeError, TypeError, ValueError):
-            _active_states.pop(area_key, None)
-            _modal_operator_areas.pop(operator_key, None)
-            _retopo_restore_isolation(state)
-            _remove_face_set_proxy(state)
-            state.active = False
-            _release_retopoflow_hidden_vertex_filter()
-            _release_polyquilt_qsnap_filter(state=state)
-            return {"PASS_THROUGH"}
-
-        context.window_manager.modal_handler_add(self)
-        return {"RUNNING_MODAL"}
-
-    def modal(self, _context, event):
-        area_key = _modal_operator_areas.get(_operator_key(self))
-        state = _active_states.get(area_key)
-        if state is None or not state.active:
-            return {"CANCELLED"}
-
-        if event.type == "WINDOW_DEACTIVATE":
-            prefs = _addon_preferences()
-            if prefs and prefs.focus_loss_behavior == "EXIT":
-                _finish_operator(self)
+                # This trigger operator has no UNDO flag, so manual OFF does
+                # not create an extra Undo boundary.
                 return {"CANCELLED"}
             return {"PASS_THROUGH"}
 
-        # Passing all events through is what lets Blender's native Navigation
-        # Gizmo and MMB orbit continue to handle the gesture.
-        return {"PASS_THROUGH"}
+        if area_key in _session_cleanup_areas:
+            return {"CANCELLED"}
 
-    def __del__(self):
-        # Covers cancellation during workspace/window teardown.
-        try:
-            _finish_operator(self)
-        except (ReferenceError, RuntimeError, AttributeError):
-            pass
+        # Recovery is limited to tagged stale artifacts.  It never rebuilds
+        # the new session and is not part of Undo handling.
+        _cleanup_orphan_face_set_proxies()
+
+        hit = _find_center_hit(context)
+        if hit is None:
+            return {"PASS_THROUGH"}
+        state = _TempOrbitState(context, hit[0], hit[1], activation_key)
+        if not _start_session(context, state, face_set=False):
+            return {"PASS_THROUGH"}
+        return {"FINISHED"}
 
 
 def _raycast_sculpt_face_set(context, coord):
@@ -3169,6 +4393,7 @@ def _remove_keymaps():
             return
         owned_operator_ids = {
             OPERATOR_ID,
+            FACE_SET_ACTIVATION_OPERATOR_ID,
             LOCAL_FACE_SET_GROW_OPERATOR_ID,
         }
         for keymap in keyconfig.keymaps:
@@ -3202,12 +4427,26 @@ def _rebuild_keymaps():
             region_type="WINDOW",
         )
         activation_key = prefs.activation_key if prefs else "RIGHT_SHIFT"
-        keymap_item = keymap.keymap_items.new(OPERATOR_ID, activation_key, "PRESS")
-        # The configured event itself is a modifier key.  Accept Ctrl here so
-        # Ctrl+double-tap can select Face Set MFO; Alt/OSKey are rejected in
-        # invoke() because they are not part of either activation gesture.
-        keymap_item.any = True
+        # Keep normal MFO and Face Set MFO in separate keymap items.  The
+        # normal item must not use ``any=True``: otherwise Ctrl+activation_key
+        # also reaches this operator and competes with the direct FSMFO item.
+        keymap_item = keymap.keymap_items.new(
+            OPERATOR_ID,
+            activation_key,
+            "PRESS",
+            any=False,
+            ctrl=False,
+        )
         _addon_keymaps.append((keymap, keymap_item))
+
+        face_set_item = keymap.keymap_items.new(
+            FACE_SET_ACTIVATION_OPERATOR_ID,
+            activation_key,
+            "PRESS",
+            any=False,
+            ctrl=True,
+        )
+        _addon_keymaps.append((keymap, face_set_item))
 
         local_grow_item = keymap.keymap_items.new(
             LOCAL_FACE_SET_GROW_OPERATOR_ID,
@@ -3273,11 +4512,11 @@ class MESH_FOCUS_ORBIT_AddonPreferences(bpy.types.AddonPreferences):
         description="Show MESH FOCUS ORBIT ON in the 3D Viewport",
         default=True,
     )
-    retopoflow_hidden_vertex_filter: BoolProperty(
-        name="RetopoFlow Hidden Vertex Filter",
+    retopoflow_target_island_filter: BoolProperty(
+        name="RetopoFlow Focus-Island Snap/Weld Filter",
         description=(
-            "During Face Set MFO, temporarily exclude hidden Retopo vertices "
-            "from RetopoFlow nearest-vertex snapping"
+            "During Face Set MFO, restrict PolyPen and Auto Merge targets to "
+            "the recorded target Retopo island"
         ),
         default=False,
     )
@@ -3290,7 +4529,7 @@ class MESH_FOCUS_ORBIT_AddonPreferences(bpy.types.AddonPreferences):
         layout.prop(self, "focus_loss_behavior")
         layout.prop(self, "debug_display")
         layout.prop(self, "show_indicator")
-        layout.prop(self, "retopoflow_hidden_vertex_filter")
+        layout.prop(self, "retopoflow_target_island_filter")
         layout.prop(self, "double_tap_window")
         layout.separator()
         layout.label(text="Double-tap the activation key in a 3D Viewport.")
@@ -3300,6 +4539,8 @@ class MESH_FOCUS_ORBIT_AddonPreferences(bpy.types.AddonPreferences):
 
 CLASSES = (
     VIEW3D_OT_mesh_focus_orbit_recover_face_set_state,
+    VIEW3D_OT_mesh_focus_orbit_watcher,
+    VIEW3D_OT_mesh_focus_face_set_activate,
     VIEW3D_OT_mesh_focus_orbit,
     VIEW3D_OT_mesh_focus_local_face_set_grow,
     MESH_FOCUS_ORBIT_AddonPreferences,
@@ -3324,35 +4565,27 @@ def register():
     _is_registered = True
     # A script reload can leave an old MFO wrapper on RetopoFlow's class even
     # though the previous module no longer has Python state for it.
-    _restore_retopoflow_hidden_vertex_filter()
+    _restore_retopoflow_hooks()
     _schedule_orphan_cleanup()
     if _on_load_pre not in bpy.app.handlers.load_pre:
         bpy.app.handlers.load_pre.append(_on_load_pre)
     if _on_load_post not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_on_load_post)
-    if _on_undo_pre not in bpy.app.handlers.undo_pre:
-        bpy.app.handlers.undo_pre.append(_on_undo_pre)
-    if _on_undo_post not in bpy.app.handlers.undo_post:
-        bpy.app.handlers.undo_post.append(_on_undo_post)
     _rebuild_keymaps()
 
 
 def unregister():
     global _is_registered
     if not _is_registered:
-        _restore_retopoflow_hidden_vertex_filter()
+        _restore_retopoflow_hooks()
         return
     _finish_all_states()
     _cleanup_orphan_face_set_proxies()
-    _restore_retopoflow_hidden_vertex_filter()
+    _restore_retopoflow_hooks()
     if _on_load_pre in bpy.app.handlers.load_pre:
         bpy.app.handlers.load_pre.remove(_on_load_pre)
     if _on_load_post in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_on_load_post)
-    if _on_undo_pre in bpy.app.handlers.undo_pre:
-        bpy.app.handlers.undo_pre.remove(_on_undo_pre)
-    if _on_undo_post in bpy.app.handlers.undo_post:
-        bpy.app.handlers.undo_post.remove(_on_undo_post)
     _remove_keymaps()
     _local_face_set_adjacency_cache.clear()
     _is_registered = False
