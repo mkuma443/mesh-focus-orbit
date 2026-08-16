@@ -9,7 +9,7 @@ rotating the view.
 bl_info = {
     "name": "Mesh Focus Orbit",
     "author": "OpenAI",
-    "version": (3, 0, 1),
+    "version": (3, 0, 12),
     "blender": (5, 2, 0),
     "location": "3D View",
     "description": "Temporary mesh-centered orbit and one-click Smart Face Set Fill",
@@ -2073,7 +2073,7 @@ def _retopoflow_abort_untrusted_filter(info):
 
 
 def _retopoflow_reject_active_isolations_if_context_missing():
-    """Fail closed if a hooked RF call cannot provide its Edit Context."""
+    """Reject a context-less hooked call without ending active FSMFO."""
     found = False
     for state in list(_active_states.values()):
         try:
@@ -2083,25 +2083,21 @@ def _retopoflow_reject_active_isolations_if_context_missing():
                 and state.retopo_isolation
             ):
                 found = True
-                _retopoflow_abort_untrusted_filter(state.retopo_isolation)
         except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
             continue
     return _retopoflow_reject_all_filter if found else None
 
 
 def _retopoflow_target_island_filter(context):
-    """Return the session-backed target-island predicate for one Edit BMesh.
+    """Return the live visibility boundary for an active RetopoFlow call.
 
-    Membership layers are the runtime source of truth.  ``component_faces``
-    and long-lived BMVert references are deliberately not consulted here.
-    A newly-created vertex is accepted only after the current BMesh identity,
-    pointer identity, and an explicit connection to the target topology have
-    all been checked.  Any other unclassifiable state aborts FSMFO instead of
-    failing open and permitting a target outside the focused island.
+    A candidate is accepted exactly when a live Edge walk reaches a surviving
+    Target component seed.  Candidate hide state and copied metadata are not
+    membership evidence.
     """
     info = _retopoflow_filter_info(context)
     if info is None:
-        return None
+        return _retopoflow_reject_active_isolations_if_context_missing()
     if info.get("filter_invalid"):
         return _retopoflow_reject_all_filter
 
@@ -2109,173 +2105,95 @@ def _retopoflow_target_island_filter(context):
         edit_object = context.edit_object
         if edit_object is None or edit_object.mode != "EDIT":
             raise _RetopoFilterUnavailable()
-        object_name = str(info.get("object_name", ""))
-        if not object_name or edit_object.name != object_name:
+        if str(info.get("object_name", "")) != str(edit_object.name):
             raise _RetopoFilterUnavailable()
-        layer_names = info.get("layer_names") or {}
         bm = bmesh.from_edit_mesh(edit_object.data)
-        vert_marker_layer = bm.verts.layers.int.get(
-            layer_names.get("vert_marker", "")
-        )
-        vert_target_layer = bm.verts.layers.int.get(
-            layer_names.get("vert_target", "")
-        )
-        vert_origin_layer = bm.verts.layers.int.get(
-            layer_names.get("vert_origin", "")
-        )
-        vert_created_layer = bm.verts.layers.int.get(
-            layer_names.get("vert_created", "")
-        )
-        face_marker_layer = bm.faces.layers.int.get(
-            layer_names.get("marker", "")
-        )
-        face_target_layer = bm.faces.layers.int.get(
-            layer_names.get("target", "")
-        )
-        edge_marker_layer = bm.edges.layers.int.get(
-            layer_names.get("edge_marker", "")
-        )
-        if any(
-            layer is None
-            for layer in (
-                vert_marker_layer,
-                vert_target_layer,
-                vert_origin_layer,
-                vert_created_layer,
-                face_marker_layer,
-                face_target_layer,
-                edge_marker_layer,
-            )
-        ):
-            raise _RetopoFilterUnavailable()
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
 
-        session_id = int(info.get("session_id", 0))
-        initial_origin_ids = {
-            int(origin_id)
-            for origin_id in info.get("initial_vertex_origin_ids", ())
-            if isinstance(origin_id, int) and origin_id > 0
-        }
-        if session_id <= 0 or not initial_origin_ids:
-            raise _RetopoFilterUnavailable()
-        initial_vertex_tokens = {
-            int(token)
-            for token in info.get("initial_vertex_tokens", ())
-            if isinstance(token, int)
-        }
-        activation_bmesh_token = info.get("activation_bmesh_token")
-        if not isinstance(activation_bmesh_token, int) or not initial_vertex_tokens:
-            raise _RetopoFilterUnavailable()
-        current_bmesh_token = _retopo_element_token(bm)
-        if current_bmesh_token is None:
-            raise _RetopoFilterUnavailable()
+        def valid(element):
+            try:
+                return bool(element.is_valid)
+            except (AttributeError, ReferenceError, RuntimeError, TypeError):
+                return False
 
-        def _has_target_connection(vertex):
-            for face in vertex.link_faces:
-                if (
-                    int(face[face_marker_layer]) == session_id
-                    and int(face[face_target_layer]) == 1
-                ):
-                    return True
-            for edge in vertex.link_edges:
-                for linked_vertex in edge.verts:
-                    if linked_vertex is vertex:
+        def seed_vertices():
+            seeds = []
+            for face in info.get("component_faces", ()):
+                if valid(face):
+                    try:
+                        seeds.extend(vertex for vertex in face.verts if valid(vertex))
+                    except (AttributeError, ReferenceError, RuntimeError, TypeError):
                         continue
+
+            for vertex in info.get("live_component_vertices", ()):
+                if valid(vertex):
+                    seeds.append(vertex)
+
+            if seeds:
+                return tuple(dict.fromkeys(seeds))
+
+            # After an Edit BMesh rebuild the old wrappers may be invalid.  The
+            # activation layer is only a seed recovery aid; it is never read
+            # from the candidate and never serves as negative evidence.
+            names = info.get("layer_names") or {}
+            marker_layer = bm.faces.layers.int.get(names.get("marker", ""))
+            target_layer = bm.faces.layers.int.get(names.get("target", ""))
+            session_id = int(info.get("session_id", 0))
+            if marker_layer is None or target_layer is None or session_id <= 0:
+                return ()
+            for face in bm.faces:
+                try:
                     if (
-                        int(linked_vertex[vert_marker_layer]) == session_id
-                        and int(linked_vertex[vert_target_layer]) == 1
+                        valid(face)
+                        and int(face[marker_layer]) == session_id
+                        and int(face[target_layer]) == 1
                     ):
-                        return True
+                        seeds.extend(vertex for vertex in face.verts if valid(vertex))
+                except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+                    continue
+            return tuple(dict.fromkeys(seeds))
+
+        seeds = seed_vertices()
+
+        def connected_to_seed(candidate):
+            if not valid(candidate) or not seeds:
+                return False
+            pending = [candidate]
+            visited = set()
+            live_vertices = []
+            while pending:
+                vertex = pending.pop()
+                identity = id(vertex)
+                if identity in visited or not valid(vertex):
+                    continue
+                visited.add(identity)
+                live_vertices.append(vertex)
+                if any(vertex is seed for seed in seeds):
+                    info["live_component_vertices"] = tuple(live_vertices)
+                    return True
+                try:
+                    edges = tuple(vertex.link_edges)
+                except (AttributeError, ReferenceError, RuntimeError, TypeError):
+                    continue
+                for edge in edges:
+                    if not valid(edge):
+                        continue
+                    try:
+                        edge_vertices = tuple(edge.verts)
+                    except (AttributeError, ReferenceError, RuntimeError, TypeError):
+                        continue
+                    for linked in edge_vertices:
+                        if linked is not vertex and valid(linked):
+                            pending.append(linked)
             return False
 
-        def _mark_confirmed_new_vertex(vertex):
-            # Zero marker/origin data is not evidence of a new vertex by
-            # itself.  It is accepted only when this is still the activation
-            # BMesh, the underlying element token was not present at
-            # activation, and the new vertex is already connected to explicit
-            # target topology.
-            if current_bmesh_token != activation_bmesh_token:
-                raise _RetopoFilterUnavailable()
-            token = _retopo_element_token(vertex)
-            if token is None:
-                raise _RetopoFilterUnavailable()
-            if token in initial_vertex_tokens:
-                raise _RetopoFilterUnavailable()
-            if not _has_target_connection(vertex):
-                raise _RetopoFilterUnavailable()
-            vertex[vert_marker_layer] = session_id
-            vertex[vert_target_layer] = 1
-            vertex[vert_origin_layer] = 0
-            vertex[vert_created_layer] = session_id
-            return True
-
-        def is_allowed(vertex):
-            try:
-                if not vertex.is_valid:
-                    raise _RetopoFilterUnavailable()
-                marker = int(vertex[vert_marker_layer])
-                target = int(vertex[vert_target_layer])
-                origin = int(vertex[vert_origin_layer])
-                created = int(vertex[vert_created_layer])
-                if marker == session_id:
-                    if target not in (0, 1):
-                        raise _RetopoFilterUnavailable()
-                    if target == 0:
-                        return False
-                    if created == session_id and origin == 0:
-                        return True
-                    if created == 0 and origin in initial_origin_ids:
-                        # A copied/interpolated vertex may inherit the
-                        # activation marker and origin.  It is an activation
-                        # vertex only when its pointer is also one of the
-                        # activation pointers; otherwise require the same
-                        # explicit new-vertex proof before rewriting its
-                        # provenance.
-                        token = _retopo_element_token(vertex)
-                        if token is None:
-                            raise _RetopoFilterUnavailable()
-                        if token in initial_vertex_tokens:
-                            return True
-                        if current_bmesh_token == activation_bmesh_token:
-                            return _mark_confirmed_new_vertex(vertex)
-                        # After a BMesh rebuild the explicit current-session
-                        # target bit remains authoritative.  The vertex may
-                        # be an activation vertex with a new runtime token;
-                        # do not misclassify it as an unknown non-target.
-                        return True
-                    # A current-session target bit without either the
-                    # activation origin or an explicit created marker is
-                    # provenance-ambiguous and must not fail open.
-                    raise _RetopoFilterUnavailable()
-
-                if marker == 0 and origin == 0 and created == 0:
-                    return _mark_confirmed_new_vertex(vertex)
-
-                # Any stale, copied, partially-lost, or foreign session data
-                # is untrusted.  In particular, marker=0/origin=0 alone is
-                # never a reason to permit a candidate.
-                if marker != session_id or created != 0 or origin != 0:
-                    raise _RetopoFilterUnavailable()
-                raise _RetopoFilterUnavailable()
-            except _RetopoFilterUnavailable:
-                raise
-            except (
-                AttributeError,
-                ReferenceError,
-                RuntimeError,
-                TypeError,
-                ValueError,
-            ) as exc:
-                raise _RetopoFilterUnavailable() from exc
-
-        return is_allowed
+        return connected_to_seed
     except _RetopoFilterUnavailable:
-        _retopoflow_abort_untrusted_filter(info)
         return _retopoflow_reject_all_filter
     except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
-        _retopoflow_abort_untrusted_filter(info)
         return _retopoflow_reject_all_filter
-
-
 def _get_retopoflow_nearest_bmvert_class():
     """Return RetopoFlow's nearest-vertex helper when RetopoFlow is present."""
     try:
