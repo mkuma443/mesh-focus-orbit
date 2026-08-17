@@ -9,7 +9,7 @@ rotating the view.
 bl_info = {
     "name": "Mesh Focus Orbit",
     "author": "OpenAI",
-    "version": (3, 0, 12),
+    "version": (3, 1, 0),
     "blender": (5, 2, 0),
     "location": "3D View",
     "description": "Temporary mesh-centered orbit and one-click Smart Face Set Fill",
@@ -21,8 +21,11 @@ import bmesh
 import blf
 import gpu
 import heapq
+import json
 import math
+import os
 import statistics
+import tempfile
 import time
 from array import array
 from collections import deque
@@ -61,13 +64,41 @@ _retopoflow_automerge_original = None
 _retopoflow_automerge_installed = False
 _retopoflow_automerge_nearest_bmvert = None
 _retopoflow_automerge_filter = None
+_retopoflow_automerge_session_id = None
+_retopoflow_automerge_retopo_session_id = None
 _retopoflow_polypen_class = None
 _retopoflow_polypen_original_update = None
 _retopoflow_polypen_installed = False
 _retopoflow_polypen_owner = None
 _retopoflow_polypen_nearest_bmvert = None
 _retopoflow_polypen_filter = None
+_retopoflow_polypen_session_id = None
+_retopoflow_polypen_retopo_session_id = None
+_retopoflow_translate_preview_class = None
+_retopoflow_translate_preview_original = None
+_retopoflow_translate_preview_installed = False
+_retopoflow_translate_preview_owner = None
+_retopoflow_translate_preview_nearest_bmvert = None
+_retopoflow_translate_preview_filter = None
+_retopoflow_translate_preview_session_id = None
+_retopoflow_translate_preview_retopo_session_id = None
 _retopo_isolation_serial = 0
+_RETOPO_DEBUG_LOG_PATH = os.path.join(
+    tempfile.gettempdir(),
+    "mesh_focus_orbit_debug.jsonl",
+)
+_RETOPO_DEBUG_LOG_BACKUP = _RETOPO_DEBUG_LOG_PATH + ".1"
+_RETOPO_DEBUG_SCHEMA_VERSION = 1
+_RETOPO_DEBUG_MAX_BYTES = 2 * 1024 * 1024
+_RETOPO_DEBUG_MAX_RECORDS = 256
+_RETOPO_DEBUG_BUCKET_LIMITS = {
+    "normal": 128,
+    "priority": 64,
+    "release": 32,
+    "lifecycle": 32,
+}
+_retopo_debug_sessions = {}
+_retopo_debug_file_size = None
 
 # ``importlib.reload`` keeps names that disappeared from the source module.
 # Remove the retired Undo-resync helpers before the new module body is used so
@@ -120,6 +151,12 @@ _RETOPOFLOW_AUTOMERGE_ORIGINAL = (
 _RETOPOFLOW_POLYPEN_TAG = "mesh_focus_orbit.retopoflow_polypen_hook"
 _RETOPOFLOW_POLYPEN_ORIGINAL = (
     "mesh_focus_orbit.retopoflow_original_polypen_update"
+)
+_RETOPOFLOW_TRANSLATE_PREVIEW_TAG = (
+    "mesh_focus_orbit.retopoflow_translate_preview_hook"
+)
+_RETOPOFLOW_TRANSLATE_PREVIEW_ORIGINAL = (
+    "mesh_focus_orbit.retopoflow_original_translate_preview"
 )
 
 # Face Set MFO may also isolate the active Edit Mesh.  These markers are
@@ -410,28 +447,80 @@ def _retopo_face_is_valid(face):
 
 
 def _retopo_connected_components(bm):
-    """Return all BMFace edge-connected components in the Edit Mesh."""
+    """Return Ctrl+L-style valid Vert/Edge connectivity components.
+
+    Faces remain attached to the same connectivity record for Face Set/BVH
+    ranking, while wire and open-topology edges are retained in the component
+    itself.  Visibility is deliberately not consulted.
+    """
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
     bm.faces.ensure_lookup_table()
-    visited = set()
+    visited_vertices = set()
     components = []
-    for face in bm.faces:
-        if not _retopo_face_is_valid(face) or face in visited:
+    for start in bm.verts:
+        if not _retopo_valid_element(start) or start in visited_vertices:
             continue
-        component = {face}
-        visited.add(face)
-        queue = deque([face])
+        component_vertices = {start}
+        component_edges = set()
+        component_faces = set()
+        visited_vertices.add(start)
+        queue = deque([start])
         while queue:
-            current = queue.popleft()
-            for edge in current.edges:
-                for linked_face in edge.link_faces:
-                    if (
-                        _retopo_face_is_valid(linked_face)
-                        and linked_face not in visited
-                    ):
-                        visited.add(linked_face)
-                        component.add(linked_face)
-                        queue.append(linked_face)
-        components.append(component)
+            vertex = queue.popleft()
+            try:
+                linked_edges = tuple(vertex.link_edges)
+            except (AttributeError, ReferenceError, RuntimeError, TypeError):
+                linked_edges = ()
+            for edge in linked_edges:
+                if not _retopo_valid_element(edge):
+                    continue
+                component_edges.add(edge)
+                try:
+                    edge_vertices = tuple(edge.verts)
+                except (AttributeError, ReferenceError, RuntimeError, TypeError):
+                    edge_vertices = ()
+                for linked_vertex in edge_vertices:
+                    if not _retopo_valid_element(linked_vertex):
+                        continue
+                    component_vertices.add(linked_vertex)
+                    if linked_vertex not in visited_vertices:
+                        visited_vertices.add(linked_vertex)
+                        queue.append(linked_vertex)
+                try:
+                    linked_faces = tuple(edge.link_faces)
+                except (AttributeError, ReferenceError, RuntimeError, TypeError):
+                    linked_faces = ()
+                for face in linked_faces:
+                    if not _retopo_face_is_valid(face):
+                        continue
+                    component_faces.add(face)
+                    try:
+                        face_edges = tuple(face.edges)
+                    except (AttributeError, ReferenceError, RuntimeError, TypeError):
+                        face_edges = ()
+                    for face_edge in face_edges:
+                        if not _retopo_valid_element(face_edge):
+                            continue
+                        component_edges.add(face_edge)
+                        try:
+                            face_vertices = tuple(face_edge.verts)
+                        except (AttributeError, ReferenceError, RuntimeError, TypeError):
+                            face_vertices = ()
+                        for face_vertex in face_vertices:
+                            if not _retopo_valid_element(face_vertex):
+                                continue
+                            component_vertices.add(face_vertex)
+                            if face_vertex not in visited_vertices:
+                                visited_vertices.add(face_vertex)
+                                queue.append(face_vertex)
+        components.append(
+            {
+                "faces": component_faces,
+                "verts": component_vertices,
+                "edges": component_edges,
+            }
+        )
     return components
 
 
@@ -482,9 +571,10 @@ def _retopo_proxy_bvh(proxy):
 
 
 def _retopo_island_metrics(retopo_object, component, proxy_bvh):
+    faces = component.get("faces", ()) if isinstance(component, dict) else component
     vertices = []
     seen_vertices = set()
-    for face in component:
+    for face in faces:
         for vertex in face.verts:
             if vertex not in seen_vertices:
                 seen_vertices.add(vertex)
@@ -496,7 +586,7 @@ def _retopo_island_metrics(retopo_object, component, proxy_bvh):
             nearest = proxy_bvh.find_nearest(
                 retopo_object.matrix_world @ vertex.co
             )
-        except (ReferenceError, RuntimeError, TypeError, ValueError):
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
             nearest = None
         if nearest is not None and nearest[3] is not None:
             distances.append(float(nearest[3]))
@@ -529,7 +619,7 @@ def _retopo_island_metrics(retopo_object, component, proxy_bvh):
         )
     return {
         "component": component,
-        "face_count": len(component),
+        "face_count": len(faces),
         "vertex_count": len(vertices),
         "sample_count": len(samples),
         "near_ratio": near_ratio,
@@ -578,6 +668,14 @@ def _retopo_selected_element(bm):
 
 
 def _retopo_component_matches_element(component, element):
+    if isinstance(component, dict):
+        if isinstance(element, bmesh.types.BMFace):
+            return element in component.get("faces", ())
+        if isinstance(element, bmesh.types.BMEdge):
+            return element in component.get("edges", ())
+        if isinstance(element, bmesh.types.BMVert):
+            return element in component.get("verts", ())
+        return False
     if isinstance(element, bmesh.types.BMFace):
         return any(face is element for face in component)
     if isinstance(element, bmesh.types.BMEdge):
@@ -595,9 +693,17 @@ def _retopo_select_island(context, reference_object, proxy):
 
     try:
         bm = bmesh.from_edit_mesh(retopo_object.data)
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+        bm.verts.index_update()
+        bm.edges.index_update()
+        bm.faces.index_update()
         components = _retopo_connected_components(bm)
         proxy_bvh = _retopo_proxy_bvh(proxy)
-        if not components or proxy_bvh is None:
+        if not components:
+            return None
+        if proxy_bvh is None:
             return None
 
         metrics = [
@@ -664,16 +770,29 @@ def _retopo_select_island(context, reference_object, proxy):
 
         if chosen is None:
             return None
+        chosen_component = chosen["component"]
         return {
             "object": retopo_object,
-            "component": list(chosen["component"]),
+            "component": list(chosen_component.get("faces", ())),
+            "component_verts": list(chosen_component.get("verts", ())),
+            "component_edges": list(chosen_component.get("edges", ())),
+            "component_vert_indices": [
+                int(vertex.index)
+                for vertex in chosen_component.get("verts", ())
+                if _retopo_valid_element(vertex)
+            ],
+            "component_edge_indices": [
+                int(edge.index)
+                for edge in chosen_component.get("edges", ())
+                if _retopo_valid_element(edge)
+            ],
             # This is only a hand-off between two immediate BMesh reads during
             # activation.  It is not used for restoration after topology
             # changes; direct face refs and the temporary marker layer are
             # used for that purpose.
             "component_indices": [
                 int(face.index)
-                for face in chosen["component"]
+                for face in chosen_component.get("faces", ())
                 if _retopo_face_is_valid(face)
             ],
             "metrics": metrics,
@@ -777,6 +896,30 @@ def _retopo_begin_isolation(context, reference_object, proxy):
 
     retopo_object = chosen["object"]
     component = chosen["component"]
+    component_vertices = list(chosen.get("component_verts", ()))
+    component_edges = list(chosen.get("component_edges", ()))
+    component_vertex_indices = set(
+        int(index)
+        for index in chosen.get("component_vert_indices", ())
+        if isinstance(index, int) or isinstance(index, float)
+    )
+    component_edge_indices = set(
+        int(index)
+        for index in chosen.get("component_edge_indices", ())
+        if isinstance(index, int) or isinstance(index, float)
+    )
+    if "component_vert_indices" not in chosen:
+        component_vertex_indices = {
+            int(vertex.index)
+            for vertex in component_vertices
+            if _retopo_valid_element(vertex)
+        }
+    if "component_edge_indices" not in chosen:
+        component_edge_indices = {
+            int(edge.index)
+            for edge in component_edges
+            if _retopo_valid_element(edge)
+        }
     try:
         bm = bmesh.from_edit_mesh(retopo_object.data)
         bm.verts.ensure_lookup_table()
@@ -806,7 +949,26 @@ def _retopo_begin_isolation(context, reference_object, proxy):
                 for face in component
                 if _retopo_face_is_valid(face)
             }
-        if not component:
+        component_vertices = [
+            vertex
+            for vertex in component_vertices
+            if _retopo_valid_element(vertex)
+        ]
+        component_edges = [
+            edge
+            for edge in component_edges
+            if _retopo_valid_element(edge)
+        ]
+        # A Ctrl+L connectivity component may consist entirely of a loose
+        # vertex/edge chain.  Faces are only a ranking/proxy derivative; they
+        # are not required for membership or isolation.
+        if (
+            not component
+            and not component_vertices
+            and not component_edges
+            and not component_vertex_indices
+            and not component_edge_indices
+        ):
             return None
         try:
             bm.faces.index_update()
@@ -814,6 +976,18 @@ def _retopo_begin_isolation(context, reference_object, proxy):
             bm.verts.index_update()
         except (AttributeError, ReferenceError, RuntimeError, TypeError):
             return None
+        component_vertices = [
+            bm.verts[index]
+            for index in sorted(component_vertex_indices)
+            if 0 <= index < len(bm.verts)
+            and _retopo_valid_element(bm.verts[index])
+        ]
+        component_edges = [
+            bm.edges[index]
+            for index in sorted(component_edge_indices)
+            if 0 <= index < len(bm.edges)
+            and _retopo_valid_element(bm.edges[index])
+        ]
         session_id = _retopo_next_session_id()
         layer_names = _retopo_layer_names(session_id)
         marker_layer = bm.faces.layers.int.new(layer_names["marker"])
@@ -830,18 +1004,24 @@ def _retopo_begin_isolation(context, reference_object, proxy):
         edge_hide_layer = bm.edges.layers.int.new(layer_names["edge_hide"])
         edge_select_layer = bm.edges.layers.int.new(layer_names["edge_select"])
 
-        target_vertex_indices = {
-            int(vertex.index)
-            for face in bm.faces
-            if int(face.index) in component_index_set
-            for vertex in face.verts
-        }
-        target_edge_indices = {
-            int(edge.index)
-            for face in bm.faces
-            if int(face.index) in component_index_set
-            for edge in face.edges
-        }
+        # Creating BMesh custom layers can invalidate element wrappers even
+        # when the underlying BMesh token is unchanged.  Rebind from the
+        # index hand-off after all layers exist, and keep the already captured
+        # index sets as the authoritative hide/target masks.
+        component_vertices = [
+            bm.verts[index]
+            for index in sorted(component_vertex_indices)
+            if 0 <= index < len(bm.verts)
+            and _retopo_valid_element(bm.verts[index])
+        ]
+        component_edges = [
+            bm.edges[index]
+            for index in sorted(component_edge_indices)
+            if 0 <= index < len(bm.edges)
+            and _retopo_valid_element(bm.edges[index])
+        ]
+        target_vertex_indices = set(component_vertex_indices)
+        target_edge_indices = set(component_edge_indices)
 
         active = bm.select_history.active
         active_face = (
@@ -941,6 +1121,12 @@ def _retopo_begin_isolation(context, reference_object, proxy):
             "initial_faces": initial_faces,
             "original_records": original_records,
             "component_faces": list(component),
+            "component_vertices": list(component_vertices),
+            "component_edges": list(component_edges),
+            "target_members": set(component_vertices),
+            "target_member_edges": set(component_edges),
+            "target_member_faces": set(component),
+            "target_members_bmesh_token": activation_bmesh_token,
             "initial_verts": initial_verts,
             "initial_vert_indices": initial_vert_indices,
             "initial_vert_hide_values": initial_vert_hide_values,
@@ -961,6 +1147,51 @@ def _retopo_begin_isolation(context, reference_object, proxy):
             loop_triangles=False,
             destructive=False,
         )
+        # ``update_edit_mesh`` may refresh face wrappers independently of
+        # verts/edges.  Rebind all three component domains once more so the
+        # runtime isolation record never carries a stale face-only view while
+        # the underlying BMesh token is unchanged.
+        try:
+            bm_post = bmesh.from_edit_mesh(retopo_object.data)
+            bm_post.verts.ensure_lookup_table()
+            bm_post.edges.ensure_lookup_table()
+            bm_post.faces.ensure_lookup_table()
+            bm_post.verts.index_update()
+            bm_post.edges.index_update()
+            bm_post.faces.index_update()
+            rebound_faces = [
+                bm_post.faces[index]
+                for index in sorted(component_index_set)
+                if 0 <= index < len(bm_post.faces)
+                and _retopo_face_is_valid(bm_post.faces[index])
+            ]
+            rebound_vertices = [
+                bm_post.verts[index]
+                for index in sorted(target_vertex_indices)
+                if 0 <= index < len(bm_post.verts)
+                and _retopo_valid_element(bm_post.verts[index])
+            ]
+            rebound_edges = [
+                bm_post.edges[index]
+                for index in sorted(target_edge_indices)
+                if 0 <= index < len(bm_post.edges)
+                and _retopo_valid_element(bm_post.edges[index])
+            ]
+            info["component_faces"] = rebound_faces
+            info["component_vertices"] = rebound_vertices
+            info["component_edges"] = rebound_edges
+            info["target_members"] = set(rebound_vertices)
+            info["target_member_edges"] = set(rebound_edges)
+            info["target_member_faces"] = set(rebound_faces)
+            info["target_members_bmesh_token"] = _retopo_element_token(bm_post)
+        except (
+            AttributeError,
+            ReferenceError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ):
+            pass
         _retopo_set_object_markers(retopo_object, session_id, layer_names)
         return info
     except (
@@ -2088,17 +2319,591 @@ def _retopoflow_reject_active_isolations_if_context_missing():
     return _retopoflow_reject_all_filter if found else None
 
 
-def _retopoflow_target_island_filter(context):
-    """Return the live visibility boundary for an active RetopoFlow call.
+def _retopo_debug_enabled():
+    """Return the existing Debug Display preference without touching the log."""
+    try:
+        prefs = _addon_preferences()
+        return bool(prefs and getattr(prefs, "debug_display", False))
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return False
 
-    A candidate is accepted exactly when a live Edge walk reaches a surviving
-    Target component seed.  Candidate hide state and copied metadata are not
-    membership evidence.
+
+def _retopo_debug_coordinate(coordinate):
+    try:
+        return [round(float(value), 9) for value in coordinate]
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _retopo_debug_element(element, include_hide=False):
+    """Capture one already-known element without enumerating its BMesh."""
+    if element is None:
+        return None
+    result = {"id": id(element)}
+    try:
+        result["hash"] = hash(element)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        result["hash"] = None
+    try:
+        result["index"] = int(element.index)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        result["index"] = None
+    try:
+        result["co"] = _retopo_debug_coordinate(element.co)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        result["co"] = None
+    if include_hide:
+        try:
+            result["hide"] = bool(element.hide)
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            result["hide"] = None
+    return result
+
+
+def _retopo_debug_bmv(nearest):
+    try:
+        return getattr(nearest, "bmv", None)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _retopo_debug_valid_session_id(session_id):
+    try:
+        return int(session_id) > 0
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def _retopo_debug_new_state(
+    mfo_session_id,
+    phase,
+    object_name=None,
+    retopo_session_id=None,
+):
+    global _retopo_debug_file_size
+    if not _retopo_debug_valid_session_id(mfo_session_id):
+        return None
+    try:
+        if _retopo_debug_file_size is None:
+            _retopo_debug_file_size = os.path.getsize(_RETOPO_DEBUG_LOG_PATH)
+        size = int(_retopo_debug_file_size)
+    except FileNotFoundError:
+        size = 0
+        _retopo_debug_file_size = 0
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+    return {
+        "mfo_session_id": mfo_session_id,
+        "retopo_session_id": retopo_session_id,
+        "phase": phase,
+        "object_name": object_name,
+        "active": True,
+        "sequence": 0,
+        "file_size": size,
+        "disabled": False,
+        "counts": {bucket: 0 for bucket in _RETOPO_DEBUG_BUCKET_LIMITS},
+    }
+
+
+def _retopo_debug_write(mfo_session_id, event, payload, bucket="normal"):
+    """Append one active-session record; never affect addon behavior."""
+    global _retopo_debug_file_size
+    if not _retopo_debug_valid_session_id(mfo_session_id):
+        return False
+    state = _retopo_debug_sessions.get(mfo_session_id)
+    if not state or not state.get("active") or state.get("disabled"):
+        return False
+    if state.get("mfo_session_id") != mfo_session_id:
+        return False
+    if bucket not in _RETOPO_DEBUG_BUCKET_LIMITS:
+        bucket = "normal"
+    counts = state.get("counts") or {}
+    if counts.get(bucket, 0) >= _RETOPO_DEBUG_BUCKET_LIMITS[bucket]:
+        return False
+    if sum(counts.values()) >= _RETOPO_DEBUG_MAX_RECORDS:
+        return False
+    try:
+        record = {
+            "event": event,
+            "version": list(bl_info.get("version", ())),
+            "timestamp": time.time(),
+            "sequence": int(state.get("sequence", 0)) + 1,
+            # ``session_id`` is retained as the logger's stable public key,
+            # and is always the MFO state session.  RetopoFlow's independent
+            # isolation/session id is carried separately and never indexes
+            # ``_retopo_debug_sessions``.
+            "session_id": mfo_session_id,
+            "mfo_session_id": mfo_session_id,
+            "retopo_session_id": state.get("retopo_session_id"),
+        }
+        record.update(payload or {})
+        # Event payloads cannot relabel a record onto the Retopo session.
+        record["session_id"] = mfo_session_id
+        record["mfo_session_id"] = mfo_session_id
+        record["retopo_session_id"] = state.get("retopo_session_id")
+        line = json.dumps(
+            record,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+        ) + "\n"
+        line_size = len(line.encode("utf-8"))
+        if line_size > _RETOPO_DEBUG_MAX_BYTES:
+            state["disabled"] = True
+            return False
+        if int(_retopo_debug_file_size or 0) + line_size > _RETOPO_DEBUG_MAX_BYTES:
+            os.replace(_RETOPO_DEBUG_LOG_PATH, _RETOPO_DEBUG_LOG_BACKUP)
+            _retopo_debug_file_size = 0
+        with open(_RETOPO_DEBUG_LOG_PATH, "a", encoding="utf-8", newline="\n") as handle:
+            handle.write(line)
+            handle.flush()
+        state["sequence"] = int(state.get("sequence", 0)) + 1
+        _retopo_debug_file_size = int(_retopo_debug_file_size or 0) + line_size
+        state["file_size"] = _retopo_debug_file_size
+        counts[bucket] = counts.get(bucket, 0) + 1
+        state["counts"] = counts
+        return True
+    except Exception:
+        state["disabled"] = True
+        return False
+
+
+def _retopo_debug_begin_session(
+    mfo_session_id,
+    phase,
+    object_name=None,
+    retopo_session_id=None,
+):
+    """Activate logging only after one MFO session is fully established."""
+    if not _retopo_debug_valid_session_id(mfo_session_id):
+        return False
+    if not _retopo_debug_enabled():
+        return False
+    existing = _retopo_debug_sessions.get(mfo_session_id)
+    if existing and existing.get("active") and not existing.get("disabled"):
+        return True
+    state = _retopo_debug_new_state(
+        mfo_session_id,
+        phase,
+        object_name,
+        retopo_session_id,
+    )
+    if state is None:
+        return False
+    _retopo_debug_sessions[mfo_session_id] = state
+    if _retopo_debug_write(
+        mfo_session_id,
+        "session_start",
+        {
+            "schema_version": _RETOPO_DEBUG_SCHEMA_VERSION,
+            "phase": phase,
+            "object_name": object_name,
+        },
+        bucket="lifecycle",
+    ):
+        return True
+    state["active"] = False
+    _retopo_debug_sessions.pop(mfo_session_id, None)
+    return False
+
+
+def _retopo_debug_is_active(mfo_session_id):
+    if not _retopo_debug_valid_session_id(mfo_session_id):
+        return False
+    state = _retopo_debug_sessions.get(mfo_session_id)
+    if not state or not state.get("active") or state.get("disabled"):
+        return False
+    # Debug preference is sampled once by _retopo_debug_begin_session.  An
+    # active map entry remains the sole session association until its end
+    # record is attempted and the entry is retired.
+    return True
+
+
+def _retopo_debug_lifecycle(mfo_session_id, phase, object_name=None):
+    if not _retopo_debug_is_active(mfo_session_id):
+        return
+    _retopo_debug_write(
+        mfo_session_id,
+        "lifecycle",
+        {
+            "phase": phase,
+            "object_name": object_name,
+        },
+        bucket="lifecycle",
+    )
+
+
+def _retopo_debug_end_session(mfo_session_id, reason):
+    if not _retopo_debug_valid_session_id(mfo_session_id):
+        return
+    state = _retopo_debug_sessions.get(mfo_session_id)
+    if not state:
+        return
+    try:
+        _retopo_debug_write(
+            mfo_session_id,
+            "session_end",
+            {"reason": reason},
+            bucket="lifecycle",
+        )
+    finally:
+        state["active"] = False
+        _retopo_debug_sessions.pop(mfo_session_id, None)
+
+
+def _retopo_debug_predicate(
+    mfo_session_id,
+    mode,
+    candidate,
+    decision,
+    direct_source,
+    source_vertices,
+    source_ambiguous,
+    reached_source,
+    hop_distance,
+    visited_count,
+    source_kind=None,
+    source_count=None,
+    source_summary=None,
+    target_member_count=None,
+    local_hit=False,
+    full_fallback=False,
+):
+    if not _retopo_debug_is_active(mfo_session_id):
+        return
+    if source_count is None:
+        try:
+            source_count = len(source_vertices)
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            source_count = 0
+    if source_summary is None:
+        source_summary = []
+        try:
+            for vertex in source_vertices:
+                source_summary.append(_retopo_debug_element(vertex))
+                if len(source_summary) >= 4:
+                    break
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            source_summary = []
+    if target_member_count is None:
+        target_member_count = source_count
+    priority = bool(source_ambiguous) or hop_distance == 12 or bool(full_fallback)
+    _retopo_debug_write(
+        mfo_session_id,
+        "membership",
+        {
+            "mode": mode,
+            "source_kind": source_kind or mode,
+            "candidate": _retopo_debug_element(candidate, include_hide=True),
+            "direct_before": bool(direct_source),
+            "direct_before_basis": "source_bmverts",
+            "decision": bool(decision),
+            "direct_after": bool(direct_source),
+            "cache_len_before": None,
+            "cache_len_after": None,
+            "cache_updated": False,
+            "reached_seed": None,
+            "source_count": source_count,
+            "source_summary": source_summary,
+            "source_ambiguous": bool(source_ambiguous),
+            "reached_source": _retopo_debug_element(reached_source),
+            "hop_distance": hop_distance,
+            "visited_count": visited_count,
+            "component_faces_valid": None,
+            "target_members_count": target_member_count,
+            "local_hit": bool(local_hit),
+            "full_fallback": bool(full_fallback),
+        },
+        bucket="priority" if priority else "normal",
+    )
+
+
+def _retopo_debug_nearest(
+    mfo_session_id,
+    mode,
+    nearest,
+    coordinate,
+    caller_filter,
+    filter_selected,
+    before,
+    after,
+):
+    if not _retopo_debug_is_active(mfo_session_id):
+        return
+    before_nonnull = before is not None
+    after_nonnull = after is not None
+    priority = before_nonnull != after_nonnull
+    _retopo_debug_write(
+        mfo_session_id,
+        "nearest_update",
+        {
+            "mode": mode,
+            "self": id(nearest),
+            "input_co": _retopo_debug_coordinate(coordinate),
+            "caller_filter": caller_filter is not None,
+            "filter_selected": bool(filter_selected),
+            "bmv_before": _retopo_debug_element(before),
+            "bmv_after": _retopo_debug_element(after),
+        },
+        bucket="priority" if priority else "normal",
+    )
+
+
+def _retopo_debug_polypen_tick(mfo_session_id, owner, nearest, result=None):
+    if not _retopo_debug_is_active(mfo_session_id):
+        return
+    try:
+        state = str(getattr(owner, "state", None))
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        state = None
+    try:
+        hit = _retopo_debug_coordinate(owner.hit)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        hit = None
+    before = _retopo_debug_bmv(nearest)
+    _retopo_debug_write(
+        mfo_session_id,
+        "polypen_tick",
+        {
+            "mode": "polypen",
+            "owner": id(owner),
+            "state": state,
+            "result": result,
+            "source": _retopo_debug_element(_retopo_debug_bmv(owner)),
+            "nearest_bmv": _retopo_debug_element(before),
+            "hit": hit,
+        },
+    )
+
+
+def _retopo_debug_release(mfo_session_id, operator, nearest, bmv_before, result):
+    if not _retopo_debug_is_active(mfo_session_id):
+        return
+    bmv_after = _retopo_debug_bmv(nearest)
+    _retopo_debug_write(
+        mfo_session_id,
+        "automerge_release",
+        {
+            "mode": "automerge",
+            "owner": id(operator),
+            "result": result,
+            "nearest": id(nearest) if nearest is not None else None,
+            "bmv_before": _retopo_debug_element(bmv_before),
+            "bmv_after": _retopo_debug_element(bmv_after),
+        },
+        bucket="release",
+    )
+
+
+def _retopoflow_valid_element(element):
+    try:
+        return bool(element.is_valid)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def _retopoflow_refresh_target_members(info):
+    """Drop dead wrappers and rebind members after a live BMesh rebuild.
+
+    Normal preview calls retain the session set and do not traverse the
+    BMesh.  A changed BMesh token is the explicit exception: the existing
+    activation vertex-target layer is used once to bind current wrappers, so
+    Undo/rebuild cannot revive a deleted identity or keep an old wrapper as a
+    positive membership witness.
+    """
+    if not isinstance(info, dict):
+        return False
+    target_members = info.get("target_members")
+    if not isinstance(target_members, set):
+        return False
+    try:
+        live_members = set()
+        for member in tuple(target_members):
+            if _retopoflow_valid_element(member):
+                try:
+                    live_members.add(member)
+                except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+                    pass
+        target_members.clear()
+        target_members.update(live_members)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return False
+
+    object_name = str(info.get("object_name", ""))
+    if not object_name:
+        return False
+    try:
+        retopo_object = bpy.data.objects.get(object_name)
+        if (
+            retopo_object is None
+            or retopo_object.type != "MESH"
+            or retopo_object.mode != "EDIT"
+        ):
+            return False
+        bm = bmesh.from_edit_mesh(retopo_object.data)
+        bm.verts.ensure_lookup_table()
+        current_token = _retopo_element_token(bm)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return False
+    if current_token is None:
+        return False
+    previous_token = info.get("target_members_bmesh_token")
+    if previous_token == current_token and live_members:
+        return True
+
+    names = info.get("layer_names") or {}
+    try:
+        target_layer = bm.verts.layers.int.get(names.get("vert_target", ""))
+        marker_layer = bm.verts.layers.int.get(names.get("vert_marker", ""))
+        session_id = int(info.get("session_id", 0))
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return False
+    if target_layer is None:
+        return False
+
+    rebound = set()
+    try:
+        for vertex in bm.verts:
+            if not _retopoflow_valid_element(vertex):
+                continue
+            if marker_layer is not None and int(vertex[marker_layer]) != session_id:
+                continue
+            if int(vertex[target_layer]) == 1:
+                rebound.add(vertex)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return False
+    if not rebound:
+        return False
+    target_members.clear()
+    target_members.update(rebound)
+    info["component_vertices"] = list(rebound)
+    info["target_members_bmesh_token"] = current_token
+    return True
+
+
+def _retopoflow_append_source_vertex(vertices, seen, vertex):
+    if not _retopoflow_valid_element(vertex):
+        return False
+    identity = id(vertex)
+    if identity in seen:
+        return True
+    seen.add(identity)
+    vertices.append(vertex)
+    return True
+
+
+def _retopoflow_polypen_source(owner):
+    """Resolve only PP_Logic's live selected editing source, lazily."""
+    vertices = []
+    seen = set()
+    invalid = False
+    try:
+        selected = getattr(owner, "selected")
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return {
+            "vertices": (),
+            "ambiguous": True,
+            "kind": "polypen_selected",
+        }
+    if selected is None or not hasattr(selected, "get"):
+        return {
+            "vertices": (),
+            "ambiguous": True,
+            "kind": "polypen_selected",
+        }
+
+    def add_values(key, include_vertices=False):
+        nonlocal invalid
+        try:
+            values = selected.get(key, ()) or ()
+            values = tuple(values)
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            invalid = True
+            return
+        for element in values:
+            if not _retopoflow_valid_element(element):
+                invalid = True
+                continue
+            if include_vertices:
+                try:
+                    element_vertices = tuple(element.verts)
+                except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+                    invalid = True
+                    continue
+                for vertex in element_vertices:
+                    if not _retopoflow_append_source_vertex(vertices, seen, vertex):
+                        invalid = True
+            elif not _retopoflow_append_source_vertex(vertices, seen, element):
+                invalid = True
+
+    add_values(bmesh.types.BMVert)
+    add_values(bmesh.types.BMEdge, include_vertices=True)
+    add_values(bmesh.types.BMFace, include_vertices=True)
+    # RetopoFlow has already established this as the live edit source.  Do
+    # not add a second bounded connectivity witness here: a valid source
+    # group may span more than twelve edges, and session membership is
+    # intentionally monotonic until FSMFO ends.
+    ambiguous = invalid or not vertices
+    return {
+        "vertices": tuple(vertices),
+        "ambiguous": ambiguous,
+        "kind": "polypen_selected",
+    }
+
+
+def _retopoflow_translate_source(operator):
+    """Resolve RFOperator_Translate.bmvs without reading its nearest helper."""
+    vertices = []
+    seen = set()
+    invalid = False
+    try:
+        values = getattr(operator, "bmvs")
+        values = tuple(values)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return {
+            "vertices": (),
+            "ambiguous": True,
+            "kind": "translate_bmvs",
+        }
+    for vertex in values:
+        if not _retopoflow_append_source_vertex(vertices, seen, vertex):
+            invalid = True
+    ambiguous = invalid or not vertices
+    return {
+        "vertices": tuple(vertices),
+        "ambiguous": ambiguous,
+        "kind": "translate_bmvs",
+    }
+
+
+def _retopoflow_target_island_filter(context, source_provider=None, mode=None):
+    """Return the shared source-first, two-stage connectivity predicate.
+
+    RetopoFlow's live editing source is resolved lazily, after the caller has
+    established its current selection.  The normal path walks only from the
+    candidate to those source vertices, up to twelve edge hops.  It never
+    scans the session member set.  Only when that local source walk misses do
+    we continue the same queue through the candidate's complete live
+    BMVert/BMEdge component and test that component against the confirmed
+    activation/source members.  Candidates and BFS-visited vertices are not
+    promoted; only the live source group is recorded as confirmed membership.
     """
     info = _retopoflow_filter_info(context)
     if info is None:
         return _retopoflow_reject_active_isolations_if_context_missing()
+    # RetopoFlow's isolation/session id is intentionally separate from the
+    # MFO state session id that owns the logger.  Only the latter can activate
+    # diagnostic I/O or index the active logger map.
+    mfo_session_id = info.get("mfo_session_id")
+    retopo_session_id = info.get("session_id")
+    diag_enabled = _retopo_debug_is_active(mfo_session_id)
     if info.get("filter_invalid"):
+        return _retopoflow_reject_all_filter
+
+    target_members = info.get("target_members")
+    if not isinstance(target_members, set):
+        return _retopoflow_reject_all_filter
+    if not _retopoflow_refresh_target_members(info):
         return _retopoflow_reject_all_filter
 
     try:
@@ -2107,89 +2912,298 @@ def _retopoflow_target_island_filter(context):
             raise _RetopoFilterUnavailable()
         if str(info.get("object_name", "")) != str(edit_object.name):
             raise _RetopoFilterUnavailable()
-        bm = bmesh.from_edit_mesh(edit_object.data)
-        bm.verts.ensure_lookup_table()
-        bm.edges.ensure_lookup_table()
-        bm.faces.ensure_lookup_table()
 
-        def valid(element):
+        operation_mode = mode or "unknown"
+        source_resolved = False
+        source_vertices = ()
+        source_set = set()
+        source_ambiguous = True
+        source_kind = "source_unresolved"
+
+        def resolve_source():
+            nonlocal source_resolved
+            nonlocal source_vertices
+            nonlocal source_set
+            nonlocal source_ambiguous
+            nonlocal source_kind
+            if source_resolved:
+                return
+            source_resolved = True
+            payload = None
             try:
-                return bool(element.is_valid)
-            except (AttributeError, ReferenceError, RuntimeError, TypeError):
-                return False
-
-        def seed_vertices():
-            seeds = []
-            for face in info.get("component_faces", ()):
-                if valid(face):
-                    try:
-                        seeds.extend(vertex for vertex in face.verts if valid(vertex))
-                    except (AttributeError, ReferenceError, RuntimeError, TypeError):
-                        continue
-
-            for vertex in info.get("live_component_vertices", ()):
-                if valid(vertex):
-                    seeds.append(vertex)
-
-            if seeds:
-                return tuple(dict.fromkeys(seeds))
-
-            # After an Edit BMesh rebuild the old wrappers may be invalid.  The
-            # activation layer is only a seed recovery aid; it is never read
-            # from the candidate and never serves as negative evidence.
-            names = info.get("layer_names") or {}
-            marker_layer = bm.faces.layers.int.get(names.get("marker", ""))
-            target_layer = bm.faces.layers.int.get(names.get("target", ""))
-            session_id = int(info.get("session_id", 0))
-            if marker_layer is None or target_layer is None or session_id <= 0:
-                return ()
-            for face in bm.faces:
+                payload = source_provider() if callable(source_provider) else None
+            except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+                payload = None
+            if isinstance(payload, dict):
+                source_kind = str(payload.get("kind") or operation_mode)
+                source_ambiguous = bool(payload.get("ambiguous", False))
+                payload = payload.get("vertices", ())
+            else:
+                source_kind = operation_mode
+            try:
+                values = tuple(payload or ())
+            except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+                values = ()
+                source_ambiguous = True
+            valid_sources = []
+            seen_sources = set()
+            for vertex in values:
+                if not _retopoflow_valid_element(vertex):
+                    source_ambiguous = True
+                    continue
                 try:
-                    if (
-                        valid(face)
-                        and int(face[marker_layer]) == session_id
-                        and int(face[target_layer]) == 1
-                    ):
-                        seeds.extend(vertex for vertex in face.verts if valid(vertex))
+                    if vertex in seen_sources:
+                        continue
+                    seen_sources.add(vertex)
                 except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+                    source_ambiguous = True
                     continue
-            return tuple(dict.fromkeys(seeds))
-
-        seeds = seed_vertices()
-
-        def connected_to_seed(candidate):
-            if not valid(candidate) or not seeds:
-                return False
-            pending = [candidate]
-            visited = set()
-            live_vertices = []
-            while pending:
-                vertex = pending.pop()
-                identity = id(vertex)
-                if identity in visited or not valid(vertex):
-                    continue
-                visited.add(identity)
-                live_vertices.append(vertex)
-                if any(vertex is seed for seed in seeds):
-                    info["live_component_vertices"] = tuple(live_vertices)
-                    return True
+                valid_sources.append(vertex)
+            if not valid_sources:
+                source_ambiguous = True
+            if source_ambiguous:
+                source_vertices = tuple(valid_sources)
+                source_set = set()
+                return
+            source_vertices = tuple(valid_sources)
+            try:
+                source_set = set(source_vertices)
+            except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+                source_set = set()
+                source_ambiguous = True
+                return
+            # A source is an already visible RetopoFlow edit member.  Record
+            # that confirmed fact once for later slow fallbacks; do not add
+            # the candidate or any source-walk intermediates here.
+            for vertex in source_vertices:
                 try:
-                    edges = tuple(vertex.link_edges)
-                except (AttributeError, ReferenceError, RuntimeError, TypeError):
-                    continue
-                for edge in edges:
-                    if not valid(edge):
-                        continue
-                    try:
-                        edge_vertices = tuple(edge.verts)
-                    except (AttributeError, ReferenceError, RuntimeError, TypeError):
-                        continue
-                    for linked in edge_vertices:
-                        if linked is not vertex and valid(linked):
-                            pending.append(linked)
-            return False
+                    target_members.add(vertex)
+                except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+                    source_ambiguous = True
+                    return
 
-        return connected_to_seed
+        def _member_hit(vertex):
+            try:
+                return vertex in target_members
+            except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+                return False
+
+        def connected_to_target(candidate):
+            resolve_source()
+            source_count = len(source_vertices)
+            if not _retopoflow_valid_element(candidate):
+                if diag_enabled:
+                    _retopo_debug_predicate(
+                        mfo_session_id,
+                        operation_mode,
+                        candidate,
+                        False,
+                        False,
+                        source_vertices,
+                        source_ambiguous,
+                        None,
+                        None,
+                        0,
+                        source_kind,
+                        source_count=source_count,
+                        target_member_count=len(target_members),
+                        local_hit=False,
+                        full_fallback=False,
+                    )
+                return False
+
+            if source_ambiguous or not source_set:
+                if diag_enabled:
+                    _retopo_debug_predicate(
+                        mfo_session_id,
+                        operation_mode,
+                        candidate,
+                        False,
+                        False,
+                        source_vertices,
+                        True,
+                        None,
+                        None,
+                        0,
+                        source_kind,
+                        source_count=source_count,
+                        target_member_count=len(target_members),
+                        local_hit=False,
+                        full_fallback=False,
+                    )
+                return False
+
+            try:
+                direct_source = candidate in source_set
+            except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+                direct_source = False
+            if direct_source:
+                decision = True
+                reached_source = candidate
+                hop_distance = 0
+                visited_count = 1
+                local_hit = True
+                full_fallback = False
+            else:
+                decision = False
+                reached_source = None
+                hop_distance = None
+                local_hit = False
+                full_fallback = False
+                try:
+                    visited = {candidate: 0}
+                except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+                    visited = {}
+                if not visited:
+                    if diag_enabled:
+                        _retopo_debug_predicate(
+                            mfo_session_id,
+                            operation_mode,
+                            candidate,
+                            False,
+                            False,
+                            source_vertices,
+                            True,
+                            None,
+                            None,
+                            0,
+                            source_kind,
+                            source_count=source_count,
+                            target_member_count=len(target_members),
+                            local_hit=False,
+                            full_fallback=False,
+                        )
+                    return False
+                pending = deque([(candidate, 0)])
+                # Fast path: BFS in nondecreasing distance order, stopping at
+                # the first depth-12 frontier.  The frontier remains in the
+                # same deque for the slow fallback below.
+                while pending and pending[0][1] < 12:
+                    vertex, depth = pending.popleft()
+                    try:
+                        edges = tuple(vertex.link_edges)
+                    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+                        continue
+                    for edge in edges:
+                        if not _retopoflow_valid_element(edge):
+                            continue
+                        try:
+                            edge_vertices = tuple(edge.verts)
+                        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+                            continue
+                        for linked in edge_vertices:
+                            if linked is vertex or not _retopoflow_valid_element(linked):
+                                continue
+                            next_depth = depth + 1
+                            try:
+                                if linked in visited:
+                                    continue
+                                visited[linked] = next_depth
+                            except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+                                continue
+                            try:
+                                linked_is_source = linked in source_set
+                            except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+                                linked_is_source = False
+                            if linked_is_source:
+                                decision = True
+                                reached_source = linked
+                                hop_distance = next_depth
+                                local_hit = True
+                                pending.clear()
+                                break
+                            if next_depth >= 12:
+                                # Preserve the frontier for full fallback;
+                                # no further fast-path expansion is allowed.
+                                pending.append((linked, next_depth))
+                                continue
+                            pending.append((linked, next_depth))
+                        if decision:
+                            break
+                    if decision:
+                        break
+
+                if not decision:
+                    full_fallback = True
+                    # First inspect the already visited local ball.  This is
+                    # the first point where session-membership lookup is
+                    # permitted; the normal source fast path never performs
+                    # this lookup.
+                    for vertex, depth in tuple(visited.items()):
+                        if _member_hit(vertex):
+                            decision = True
+                            reached_source = vertex
+                            hop_distance = depth
+                            break
+                    while not decision and pending:
+                        vertex, depth = pending.popleft()
+                        try:
+                            edges = tuple(vertex.link_edges)
+                        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+                            continue
+                        for edge in edges:
+                            if not _retopoflow_valid_element(edge):
+                                continue
+                            try:
+                                edge_vertices = tuple(edge.verts)
+                            except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+                                continue
+                            for linked in edge_vertices:
+                                if linked is vertex or not _retopoflow_valid_element(linked):
+                                    continue
+                                next_depth = depth + 1
+                                try:
+                                    if linked in visited:
+                                        continue
+                                    visited[linked] = next_depth
+                                except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+                                    continue
+                                if _member_hit(linked):
+                                    decision = True
+                                    reached_source = linked
+                                    hop_distance = next_depth
+                                    break
+                                pending.append((linked, next_depth))
+                            if decision:
+                                break
+                        if decision:
+                            break
+                visited_count = len(visited)
+            if diag_enabled:
+                _retopo_debug_predicate(
+                    mfo_session_id,
+                    operation_mode,
+                    candidate,
+                    decision,
+                    direct_source,
+                    source_vertices,
+                    source_ambiguous,
+                    reached_source,
+                    hop_distance,
+                    visited_count,
+                    source_kind,
+                    source_count=source_count,
+                    target_member_count=len(target_members),
+                    local_hit=local_hit,
+                    full_fallback=full_fallback,
+                )
+            return decision
+
+        if diag_enabled:
+            try:
+                setattr(
+                    connected_to_target,
+                    "mesh_focus_orbit_mfo_session_id",
+                    mfo_session_id,
+                )
+                setattr(
+                    connected_to_target,
+                    "mesh_focus_orbit_retopo_session_id",
+                    retopo_session_id,
+                )
+            except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+                pass
+        return connected_to_target
     except _RetopoFilterUnavailable:
         return _retopoflow_reject_all_filter
     except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
@@ -2240,20 +3254,49 @@ def _restore_retopoflow_hooks():
     global _retopoflow_automerge_installed
     global _retopoflow_automerge_nearest_bmvert
     global _retopoflow_automerge_filter
+    global _retopoflow_automerge_session_id
+    global _retopoflow_automerge_retopo_session_id
     global _retopoflow_polypen_class
     global _retopoflow_polypen_original_update
     global _retopoflow_polypen_installed
     global _retopoflow_polypen_owner
     global _retopoflow_polypen_nearest_bmvert
     global _retopoflow_polypen_filter
+    global _retopoflow_polypen_session_id
+    global _retopoflow_polypen_retopo_session_id
+    global _retopoflow_translate_preview_class
+    global _retopoflow_translate_preview_original
+    global _retopoflow_translate_preview_installed
+    global _retopoflow_translate_preview_owner
+    global _retopoflow_translate_preview_nearest_bmvert
+    global _retopoflow_translate_preview_filter
+    global _retopoflow_translate_preview_session_id
+    global _retopoflow_translate_preview_retopo_session_id
 
     translate_classes = []
     if _retopoflow_automerge_class is not None:
         translate_classes.append(_retopoflow_automerge_class)
+    if (
+        _retopoflow_translate_preview_class is not None
+        and _retopoflow_translate_preview_class not in translate_classes
+    ):
+        translate_classes.append(_retopoflow_translate_preview_class)
     current_translate_class = _get_retopoflow_translate_class()
     if current_translate_class is not None and current_translate_class not in translate_classes:
         translate_classes.append(current_translate_class)
     for translate_class in translate_classes:
+        try:
+            current = translate_class.translate
+            if getattr(current, _RETOPOFLOW_TRANSLATE_PREVIEW_TAG, False):
+                original = getattr(
+                    current,
+                    _RETOPOFLOW_TRANSLATE_PREVIEW_ORIGINAL,
+                    None,
+                )
+                if original is not None:
+                    translate_class.translate = original
+        except (AttributeError, ReferenceError, RuntimeError, TypeError):
+            pass
         try:
             current = translate_class.automerge
             if getattr(current, _RETOPOFLOW_AUTOMERGE_TAG, False):
@@ -2316,12 +3359,24 @@ def _restore_retopoflow_hooks():
     _retopoflow_automerge_installed = False
     _retopoflow_automerge_nearest_bmvert = None
     _retopoflow_automerge_filter = None
+    _retopoflow_automerge_session_id = None
+    _retopoflow_automerge_retopo_session_id = None
     _retopoflow_polypen_class = None
     _retopoflow_polypen_original_update = None
     _retopoflow_polypen_installed = False
     _retopoflow_polypen_owner = None
     _retopoflow_polypen_nearest_bmvert = None
     _retopoflow_polypen_filter = None
+    _retopoflow_polypen_session_id = None
+    _retopoflow_polypen_retopo_session_id = None
+    _retopoflow_translate_preview_class = None
+    _retopoflow_translate_preview_original = None
+    _retopoflow_translate_preview_installed = False
+    _retopoflow_translate_preview_owner = None
+    _retopoflow_translate_preview_nearest_bmvert = None
+    _retopoflow_translate_preview_filter = None
+    _retopoflow_translate_preview_session_id = None
+    _retopoflow_translate_preview_retopo_session_id = None
 
 
 def _install_retopoflow_automerge_hook():
@@ -2348,24 +3403,60 @@ def _install_retopoflow_automerge_hook():
         def filtered_automerge(self, context, event, *args, **kwargs):
             global _retopoflow_automerge_nearest_bmvert
             global _retopoflow_automerge_filter
+            global _retopoflow_automerge_session_id
+            global _retopoflow_automerge_retopo_session_id
             previous_nearest = _retopoflow_automerge_nearest_bmvert
             previous_filter = _retopoflow_automerge_filter
+            previous_session_id = _retopoflow_automerge_session_id
+            previous_retopo_session_id = _retopoflow_automerge_retopo_session_id
             try:
                 nearest = getattr(self, "nearest_bmv", None)
                 _retopoflow_automerge_nearest_bmvert = nearest
                 _retopoflow_automerge_filter = _retopoflow_target_island_filter(
-                    context
+                    context,
+                    source_provider=lambda: _retopoflow_translate_source(self),
+                    mode="automerge",
                 )
-                return original_automerge(
+                _retopoflow_automerge_session_id = (
+                    getattr(
+                        _retopoflow_automerge_filter,
+                        "mesh_focus_orbit_mfo_session_id",
+                        None,
+                    )
+                )
+                _retopoflow_automerge_retopo_session_id = (
+                    getattr(
+                        _retopoflow_automerge_filter,
+                        "mesh_focus_orbit_retopo_session_id",
+                        None,
+                    )
+                )
+                bmv_before = (
+                    _retopo_debug_bmv(nearest)
+                    if _retopo_debug_is_active(_retopoflow_automerge_session_id)
+                    else None
+                )
+                result = original_automerge(
                     self,
                     context,
                     event,
                     *args,
                     **kwargs,
                 )
+                if _retopo_debug_is_active(_retopoflow_automerge_session_id):
+                    _retopo_debug_release(
+                        _retopoflow_automerge_session_id,
+                        self,
+                        nearest,
+                        bmv_before,
+                        result,
+                    )
+                return result
             finally:
                 _retopoflow_automerge_nearest_bmvert = previous_nearest
                 _retopoflow_automerge_filter = previous_filter
+                _retopoflow_automerge_session_id = previous_session_id
+                _retopoflow_automerge_retopo_session_id = previous_retopo_session_id
 
         setattr(filtered_automerge, _RETOPOFLOW_AUTOMERGE_TAG, True)
         setattr(filtered_automerge, _RETOPOFLOW_AUTOMERGE_ORIGINAL, original_automerge)
@@ -2373,6 +3464,92 @@ def _install_retopoflow_automerge_hook():
         _retopoflow_automerge_class = translate_class
         _retopoflow_automerge_original = original_automerge
         _retopoflow_automerge_installed = True
+        return True
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        _restore_retopoflow_hooks()
+        return False
+
+
+def _install_retopoflow_translate_preview_hook():
+    """Scope membership filtering to RFOperator_Translate.translate only."""
+    global _retopoflow_translate_preview_class
+    global _retopoflow_translate_preview_original
+    global _retopoflow_translate_preview_installed
+
+    translate_class = _get_retopoflow_translate_class()
+    if translate_class is None:
+        return False
+    try:
+        original_translate = translate_class.translate
+        if getattr(original_translate, _RETOPOFLOW_TRANSLATE_PREVIEW_TAG, False):
+            original_translate = getattr(
+                original_translate,
+                _RETOPOFLOW_TRANSLATE_PREVIEW_ORIGINAL,
+                None,
+            )
+            if original_translate is None:
+                return False
+            translate_class.translate = original_translate
+
+        def filtered_translate(self, context, event, *args, **kwargs):
+            global _retopoflow_translate_preview_owner
+            global _retopoflow_translate_preview_nearest_bmvert
+            global _retopoflow_translate_preview_filter
+            global _retopoflow_translate_preview_session_id
+            global _retopoflow_translate_preview_retopo_session_id
+            previous_owner = _retopoflow_translate_preview_owner
+            previous_nearest = _retopoflow_translate_preview_nearest_bmvert
+            previous_filter = _retopoflow_translate_preview_filter
+            previous_session_id = _retopoflow_translate_preview_session_id
+            previous_retopo_session_id = (
+                _retopoflow_translate_preview_retopo_session_id
+            )
+            try:
+                nearest = getattr(self, "nearest_bmv", None)
+                mfo_filter = (
+                    _retopoflow_target_island_filter(
+                        context,
+                        source_provider=lambda: _retopoflow_translate_source(self),
+                        mode="translate_preview",
+                    )
+                    if context is not None
+                    else _retopoflow_reject_active_isolations_if_context_missing()
+                )
+                if mfo_filter is None:
+                    return original_translate(self, context, event, *args, **kwargs)
+                _retopoflow_translate_preview_owner = self
+                _retopoflow_translate_preview_nearest_bmvert = nearest
+                _retopoflow_translate_preview_filter = mfo_filter
+                _retopoflow_translate_preview_session_id = getattr(
+                    mfo_filter,
+                    "mesh_focus_orbit_mfo_session_id",
+                    None,
+                )
+                _retopoflow_translate_preview_retopo_session_id = getattr(
+                    mfo_filter,
+                    "mesh_focus_orbit_retopo_session_id",
+                    None,
+                )
+                return original_translate(self, context, event, *args, **kwargs)
+            finally:
+                _retopoflow_translate_preview_owner = previous_owner
+                _retopoflow_translate_preview_nearest_bmvert = previous_nearest
+                _retopoflow_translate_preview_filter = previous_filter
+                _retopoflow_translate_preview_session_id = previous_session_id
+                _retopoflow_translate_preview_retopo_session_id = (
+                    previous_retopo_session_id
+                )
+
+        setattr(filtered_translate, _RETOPOFLOW_TRANSLATE_PREVIEW_TAG, True)
+        setattr(
+            filtered_translate,
+            _RETOPOFLOW_TRANSLATE_PREVIEW_ORIGINAL,
+            original_translate,
+        )
+        translate_class.translate = filtered_translate
+        _retopoflow_translate_preview_class = translate_class
+        _retopoflow_translate_preview_original = original_translate
+        _retopoflow_translate_preview_installed = True
         return True
     except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
         _restore_retopoflow_hooks()
@@ -2404,27 +3581,60 @@ def _install_retopoflow_polypen_hook():
             global _retopoflow_polypen_owner
             global _retopoflow_polypen_nearest_bmvert
             global _retopoflow_polypen_filter
+            global _retopoflow_polypen_session_id
+            global _retopoflow_polypen_retopo_session_id
             context = kwargs.get("context")
             if context is None and args:
                 context = args[0]
             previous_nearest = _retopoflow_polypen_nearest_bmvert
             previous_filter = _retopoflow_polypen_filter
+            previous_session_id = _retopoflow_polypen_session_id
+            previous_retopo_session_id = _retopoflow_polypen_retopo_session_id
             previous_owner = _retopoflow_polypen_owner
             try:
                 nearest = getattr(self, "nearest", None)
                 mfo_filter = (
-                    _retopoflow_target_island_filter(context)
+                    _retopoflow_target_island_filter(
+                        context,
+                        source_provider=lambda: _retopoflow_polypen_source(self),
+                        mode="polypen",
+                    )
                     if context is not None
                     else _retopoflow_reject_active_isolations_if_context_missing()
                 )
                 _retopoflow_polypen_owner = self
                 _retopoflow_polypen_nearest_bmvert = nearest
                 _retopoflow_polypen_filter = mfo_filter
-                return original_update(self, *args, **kwargs)
+                _retopoflow_polypen_session_id = (
+                    getattr(
+                        mfo_filter,
+                        "mesh_focus_orbit_mfo_session_id",
+                        None,
+                    )
+                )
+                _retopoflow_polypen_retopo_session_id = (
+                    getattr(
+                        mfo_filter,
+                        "mesh_focus_orbit_retopo_session_id",
+                        None,
+                    )
+                )
+                result = original_update(self, *args, **kwargs)
+                post_nearest = getattr(self, "nearest", None)
+                if _retopo_debug_is_active(_retopoflow_polypen_session_id):
+                    _retopo_debug_polypen_tick(
+                        _retopoflow_polypen_session_id,
+                        self,
+                        post_nearest,
+                        result,
+                    )
+                return result
             finally:
                 _retopoflow_polypen_owner = previous_owner
                 _retopoflow_polypen_nearest_bmvert = previous_nearest
                 _retopoflow_polypen_filter = previous_filter
+                _retopoflow_polypen_session_id = previous_session_id
+                _retopoflow_polypen_retopo_session_id = previous_retopo_session_id
 
         setattr(filtered_polypen_update, _RETOPOFLOW_POLYPEN_TAG, True)
         setattr(filtered_polypen_update, _RETOPOFLOW_POLYPEN_ORIGINAL, original_update)
@@ -2439,7 +3649,7 @@ def _install_retopoflow_polypen_hook():
 
 
 def _install_retopoflow_nearest_filter_hook():
-    """Add membership only to the active PolyPen/Auto Merge Nearest call."""
+    """Add membership only to active PolyPen/Translate/Auto Merge calls."""
     global _retopoflow_nearest_filter_class
     global _retopoflow_nearest_filter_original_update
     global _retopoflow_nearest_filter_installed
@@ -2505,10 +3715,55 @@ def _install_retopoflow_nearest_filter_hook():
             elif self is _retopoflow_automerge_nearest_bmvert:
                 mode = "automerge"
                 mfo_filter = _retopoflow_automerge_filter
+            elif (
+                self is _retopoflow_translate_preview_nearest_bmvert
+                or (
+                    _retopoflow_translate_preview_owner is not None
+                    and getattr(
+                        _retopoflow_translate_preview_owner,
+                        "nearest_bmv",
+                        None,
+                    )
+                    is self
+                )
+            ):
+                mode = "translate_preview"
+                mfo_filter = _retopoflow_translate_preview_filter
+            filter_selected = bool(bound.arguments.get("filter_selected", True))
             if mode is None or mfo_filter is None:
+                if _active_states and _retopo_debug_sessions:
+                    info = _retopoflow_filter_info(context)
+                    mfo_session_id = (
+                        info.get("mfo_session_id") if info is not None else None
+                    )
+                    if _retopo_debug_is_active(mfo_session_id):
+                        before = _retopo_debug_bmv(self)
+                        result = original_update(*bound.args, **bound.kwargs)
+                        after = _retopo_debug_bmv(self)
+                        _retopo_debug_nearest(
+                            mfo_session_id,
+                            "other",
+                            self,
+                            co,
+                            caller_filter,
+                            filter_selected,
+                            before,
+                            after,
+                        )
+                        return result
                 return original_update(*bound.args, **bound.kwargs)
 
-            filter_selected = bool(bound.arguments.get("filter_selected", True))
+            mfo_session_id = (
+                _retopoflow_polypen_session_id
+                if mode == "polypen"
+                else (
+                    _retopoflow_automerge_session_id
+                    if mode == "automerge"
+                    else _retopoflow_translate_preview_session_id
+                )
+            )
+            debug_enabled = _retopo_debug_is_active(mfo_session_id)
+            before = _retopo_debug_bmv(self) if debug_enabled else None
 
             def combined_filter(vertex):
                 try:
@@ -2534,7 +3789,7 @@ def _install_retopoflow_nearest_filter_hook():
 
             bound.arguments["filter_fn"] = combined_filter
             try:
-                return original_update(*bound.args, **bound.kwargs)
+                result = original_update(*bound.args, **bound.kwargs)
             except _RetopoFilterUnavailable:
                 # The membership session was no longer trustworthy.  Never
                 # retry the native call without a filter: that would turn a
@@ -2543,7 +3798,19 @@ def _install_retopoflow_nearest_filter_hook():
                     self.bmv = None
                 except (AttributeError, ReferenceError, RuntimeError, TypeError):
                     pass
-                return None
+                result = None
+            if debug_enabled:
+                _retopo_debug_nearest(
+                    mfo_session_id,
+                    mode,
+                    self,
+                    co,
+                    caller_filter,
+                    filter_selected,
+                    before,
+                    _retopo_debug_bmv(self),
+                )
+            return result
 
         setattr(filtered_update, _RETOPOFLOW_NEAREST_FILTER_TAG, True)
         setattr(filtered_update, _RETOPOFLOW_NEAREST_FILTER_ORIGINAL, original_update)
@@ -2565,6 +3832,9 @@ def _install_retopoflow_hooks():
         _restore_retopoflow_hooks()
         return False
     if not _install_retopoflow_automerge_hook():
+        _restore_retopoflow_hooks()
+        return False
+    if not _install_retopoflow_translate_preview_hook():
         _restore_retopoflow_hooks()
         return False
     return True
@@ -3230,6 +4500,11 @@ def _finish_state(state, restore_retopo=True):
         area_key = int(state.area_key)
     except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
         area_key = 0
+    try:
+        session_id = int(state.session_id)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        session_id = None
+    restore_error = False
     if area_key and area_key in _session_cleanup_areas:
         return
     if area_key:
@@ -3265,6 +4540,8 @@ def _finish_state(state, restore_retopo=True):
         try:
             _retopo_restore_isolation(state)
         except Exception:
+            restore_error = True
+            _retopo_debug_lifecycle(session_id, "fsmfo_restore_exception")
             pass
     elif isinstance(state, _FaceSetOrbitState):
         # Blender has already restored the pre-FSMFO Undo state.  The old
@@ -3285,6 +4562,8 @@ def _finish_state(state, restore_retopo=True):
     try:
         _release_retopoflow_hooks()
     except Exception:
+        restore_error = True
+        _retopo_debug_lifecycle(session_id, "retopoflow_hook_release_exception")
         pass
     try:
         _release_polyquilt_qsnap_filter(state=state)
@@ -3294,6 +4573,14 @@ def _finish_state(state, restore_retopo=True):
         _tag_redraw(state.area)
     except Exception:
         pass
+    _retopo_debug_end_session(
+        session_id,
+        "restore_error"
+        if restore_error
+        else "undo_restore"
+        if not restore_retopo
+        else "restore",
+    )
     if area_key:
         _session_cleanup_areas.discard(area_key)
 
@@ -3498,6 +4785,27 @@ def _start_session(context, state, face_set=False):
         )
         if "RUNNING_MODAL" not in watcher_result:
             raise RuntimeError("FSMFO Watcher did not start")
+        if _retopo_debug_enabled():
+            try:
+                info = getattr(state, "retopo_isolation", None)
+                object_name = info.get("object_name") if info else None
+                if object_name is None:
+                    object_name = getattr(state, "reference_object_name", None)
+                retopo_session_id = info.get("session_id") if info else None
+                # This is a Python-only association on the live isolation
+                # dictionary.  It is never copied to BMesh layers, objects,
+                # or scene data, and the logger remains keyed only by MFO's
+                # state.session_id.
+                if info is not None:
+                    info["mfo_session_id"] = state.session_id
+                _retopo_debug_begin_session(
+                    state.session_id,
+                    "fsmfo_session" if face_set else "mfo_session",
+                    object_name,
+                    retopo_session_id,
+                )
+            except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+                pass
         return True
     except (
         AttributeError,
