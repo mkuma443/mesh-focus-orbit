@@ -9,7 +9,7 @@ rotating the view.
 bl_info = {
     "name": "Mesh Focus Orbit",
     "author": "OpenAI",
-    "version": (3, 1, 0),
+    "version": (3, 1, 6),
     "blender": (5, 2, 0),
     "location": "3D View",
     "description": "Temporary mesh-centered orbit and one-click Smart Face Set Fill",
@@ -19,6 +19,7 @@ bl_info = {
 import bpy
 import bmesh
 import blf
+import copy
 import gpu
 import heapq
 import json
@@ -51,6 +52,11 @@ _active_states = {}
 _last_tap_times = {}
 _session_serial = 0
 _session_cleanup_areas = set()
+_undo_orphan_cleanup_pending = False
+_undo_orphan_cleanup_retries = 0
+_last_undo_post_perf = None
+_retopo_undo_retry_pending = False
+_retopo_undo_tombstones = {}
 _local_face_set_adjacency_cache = {}
 _is_registered = False
 _polyquilt_qsnap_class = None
@@ -90,19 +96,36 @@ _RETOPO_DEBUG_LOG_PATH = os.path.join(
 _RETOPO_DEBUG_LOG_BACKUP = _RETOPO_DEBUG_LOG_PATH + ".1"
 _RETOPO_DEBUG_SCHEMA_VERSION = 1
 _RETOPO_DEBUG_MAX_BYTES = 2 * 1024 * 1024
-_RETOPO_DEBUG_MAX_RECORDS = 256
+_RETOPO_DEBUG_MAX_RECORDS = 320
 _RETOPO_DEBUG_BUCKET_LIMITS = {
     "normal": 128,
     "priority": 64,
     "release": 32,
     "lifecycle": 32,
+    "diagnostic": 64,
 }
 _retopo_debug_sessions = {}
+_retopo_debug_retired_sessions = {}
+_retopo_debug_last_session_id = None
 _retopo_debug_file_size = None
+_retopo_debug_file_records = None
 
 # ``importlib.reload`` keeps names that disappeared from the source module.
 # Remove the retired Undo-resync helpers before the new module body is used so
 # an add-on reload cannot accidentally expose or call stale recovery code.
+for _stale_callback_name in (
+    "_retopo_debug_followup_01",
+    "_retopo_debug_followup_05",
+):
+    _stale_callback = globals().get(_stale_callback_name)
+    if callable(_stale_callback):
+        try:
+            if bpy.app.timers.is_registered(_stale_callback):
+                bpy.app.timers.unregister(_stale_callback)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            pass
+del _stale_callback_name, _stale_callback
+
 for _stale_name in (
     "_on_undo_pre",
     "_on_undo_post",
@@ -117,6 +140,12 @@ for _stale_name in (
     "_UNDO_BOUNDARY_CROSSED",
     "_UNDO_BOUNDARY_PENDING",
     "_UNDO_BOUNDARY_INVALID",
+    "_retopo_debug_followup_01",
+    "_retopo_debug_followup_05",
+    "_retopo_debug_schedule_followups",
+    "_retopo_debug_cancel_followups",
+    "_retopo_debug_followup_targets",
+    "_retopo_debug_followup_pending",
 ):
     globals().pop(_stale_name, None)
 del _stale_name
@@ -895,6 +924,7 @@ def _retopo_begin_isolation(context, reference_object, proxy):
         return None
 
     retopo_object = chosen["object"]
+    _retopo_discard_undo_tombstones_for_object(retopo_object.name)
     component = chosen["component"]
     component_vertices = list(chosen.get("component_verts", ()))
     component_edges = list(chosen.get("component_edges", ()))
@@ -1589,6 +1619,19 @@ def _retopo_element_layer_handles(bm, info, domain):
         return None, None, None
 
 
+def _retopo_remove_named_layers(bm, domain, names):
+    """Remove owned integer layers by name, reacquiring after each removal."""
+    for name in names:
+        if not name:
+            continue
+        try:
+            layer = domain.get(name)
+            if layer is not None:
+                domain.remove(layer)
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            pass
+
+
 def _retopo_restore_info(info):
     """Restore one active or orphaned Retopo isolation without mode changes."""
     if not info:
@@ -1703,42 +1746,25 @@ def _retopo_restore_info(info):
             except (AttributeError, ReferenceError, RuntimeError, TypeError):
                 pass
 
-        for layer in (
-            marker_layer,
-            hide_layer,
-            select_layer,
-            _target_layer,
-        ):
-            if layer is not None:
-                try:
-                    bm.faces.layers.int.remove(layer)
-                except (AttributeError, ReferenceError, RuntimeError, TypeError):
-                    pass
-
-        for layer in (
-            vert_marker_layer,
-            vert_target_layer,
-            vert_origin_layer,
-            vert_created_layer,
-            vert_hide_layer,
-            vert_select_layer,
-        ):
-            if layer is not None:
-                try:
-                    bm.verts.layers.int.remove(layer)
-                except (AttributeError, ReferenceError, RuntimeError, TypeError):
-                    pass
-
-        for layer in (
-            edge_marker_layer,
-            edge_hide_layer,
-            edge_select_layer,
-        ):
-            if layer is not None:
-                try:
-                    bm.edges.layers.int.remove(layer)
-                except (AttributeError, ReferenceError, RuntimeError, TypeError):
-                    pass
+        _retopo_remove_named_layers(
+            bm,
+            bm.faces.layers.int,
+            (names.get("marker", ""), names.get("hide", ""),
+             names.get("select", ""), names.get("target", "")),
+        )
+        _retopo_remove_named_layers(
+            bm,
+            bm.verts.layers.int,
+            (names.get("vert_marker", ""), names.get("vert_target", ""),
+             names.get("vert_origin", ""), names.get("vert_created", ""),
+             names.get("vert_hide", ""), names.get("vert_select", "")),
+        )
+        _retopo_remove_named_layers(
+            bm,
+            bm.edges.layers.int,
+            (names.get("edge_marker", ""), names.get("edge_hide", ""),
+             names.get("edge_select", "")),
+        )
 
         if owns_bmesh:
             bm.to_mesh(retopo_object.data)
@@ -1876,20 +1902,516 @@ def _retopo_revalidate_isolation(info):
         return False
 
 
+def _retopo_capture_undo_visibility(obj):
+    """Capture the exact ON-state hide/select surface for safe fallback use."""
+    if obj is None or obj.type != "MESH" or obj.mode != "EDIT":
+        return None
+    try:
+        bm = bmesh.from_edit_mesh(obj.data)
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+        return {
+            domain_name: [
+                {
+                    "geometry": _retopo_element_geometry_signature(element),
+                    "hide": bool(element.hide),
+                    "select": bool(element.select),
+                }
+                for element in elements
+                if _retopo_element_geometry_signature(element) is not None
+            ]
+            for domain_name, elements in (
+                ("verts", bm.verts),
+                ("edges", bm.edges),
+                ("faces", bm.faces),
+            )
+        }
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _retopo_visibility_match_status(obj, expected):
+    """Classify the recorded ON-state without conflating mismatch and retry."""
+    if obj is None or obj.type != "MESH" or obj.mode != "EDIT" or not expected:
+        return "mismatch"
+    try:
+        bm = bmesh.from_edit_mesh(obj.data)
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+        for domain_name, elements in (
+            ("verts", bm.verts),
+            ("edges", bm.edges),
+            ("faces", bm.faces),
+        ):
+            candidates = {}
+            for element in elements:
+                geometry = _retopo_element_geometry_signature(element)
+                if geometry is not None:
+                    candidates.setdefault(geometry, []).append(element)
+            for entry in expected.get(domain_name, ()):
+                geometry = entry.get("geometry")
+                matches = candidates.get(geometry, [])
+                match_index = next(
+                    (
+                        index
+                        for index, element in enumerate(matches)
+                        if bool(element.hide) == bool(entry.get("hide"))
+                        and bool(element.select) == bool(entry.get("select"))
+                    ),
+                    None,
+                )
+                if match_index is None:
+                    return "mismatch"
+                matches.pop(match_index)
+        return "matched"
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return "unavailable"
+
+
+def _retopo_visibility_matches_tombstone(obj, expected):
+    """Verify native Undo restored the recorded ON-state before fallback."""
+    return _retopo_visibility_match_status(obj, expected) == "matched"
+
+
+def _retopo_make_undo_tombstone(info, snapshot=None):
+    """Capture ended-session identity before normal OFF clears native markers."""
+    if not info:
+        return None
+    object_name = str(info.get("object_name", ""))
+    retopo_object = bpy.data.objects.get(object_name)
+    if (
+        not object_name
+        or retopo_object is None
+        or retopo_object.type != "MESH"
+        or retopo_object.data is None
+    ):
+        return None
+    session_id = int(info.get("session_id", 0))
+    layer_names = dict(info.get("layer_names") or {})
+    if session_id <= 0 or not layer_names.get("marker"):
+        return None
+    if snapshot is None:
+        snapshot = _retopo_capture_restore_snapshot(info)
+    return {
+        "object_name": object_name,
+        "mesh_name": str(retopo_object.data.name),
+        "session_id": session_id,
+        "layer_names": layer_names,
+        "snapshot": copy.deepcopy(snapshot) if snapshot else None,
+        "undo_visibility": _retopo_capture_undo_visibility(retopo_object),
+        # Set only for a transient BMesh access failure in the current
+        # undo_post event.  A normal state mismatch is a dormant tombstone.
+        "retry_pending": False,
+        # ``armed`` permits the one initial snapshot fallback.  Once a
+        # session-layer restore succeeds, retain this tombstone as a
+        # fail-closed history guard for later native Undo states from the
+        # same ended FSMFO session.
+        "guard_mode": "armed",
+        "successful_restore_count": 0,
+        "last_restore_method": None,
+    }
+
+
+def _retopo_record_undo_tombstone(info, snapshot=None):
+    """Remember one ended session for the next native Undo reconciliation."""
+    tombstone = _retopo_make_undo_tombstone(info, snapshot=snapshot)
+    if tombstone is None:
+        return None
+    key = (
+        tombstone["object_name"],
+        tombstone["mesh_name"],
+        tombstone["session_id"],
+    )
+    existing = _retopo_undo_tombstones.get(key)
+    if existing is not None:
+        if not existing.get("snapshot") and tombstone.get("snapshot"):
+            existing["snapshot"] = tombstone["snapshot"]
+        if not existing.get("undo_visibility") and tombstone.get("undo_visibility"):
+            existing["undo_visibility"] = tombstone["undo_visibility"]
+        return existing
+    _retopo_undo_tombstones[key] = tombstone
+    return tombstone
+
+
+def _retopo_discard_undo_tombstones_for_object(object_name):
+    object_name = str(object_name or "")
+    for key in list(_retopo_undo_tombstones):
+        if key[0] == object_name:
+            _retopo_undo_tombstones.pop(key, None)
+
+
+def _retopo_tombstone_info(tombstone, obj):
+    return {
+        "object": obj,
+        "object_name": tombstone["object_name"],
+        "session_id": tombstone["session_id"],
+        "layer_names": dict(tombstone["layer_names"]),
+        "original_records": [],
+        "original_vert_records": [],
+        "original_edge_records": [],
+        "active_face": None,
+    }
+
+
+def _retopo_tombstone_session_layer_status(obj, tombstone):
+    """Classify temporary layers while preserving transient BMesh failures."""
+    if obj is None or obj.type != "MESH" or obj.mode != "EDIT":
+        return "mismatch"
+    try:
+        bm = bmesh.from_edit_mesh(obj.data)
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+        session_id = int(tombstone.get("session_id", 0))
+        names = tombstone.get("layer_names") or {}
+        for elements, key in (
+            (bm.faces, "marker"),
+            (bm.verts, "vert_marker"),
+            (bm.edges, "edge_marker"),
+        ):
+            layer = elements.layers.int.get(names.get(key, ""))
+            if layer is not None and any(
+                int(element[layer]) == session_id for element in elements
+            ):
+                return "matched"
+        return "missing"
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return "unavailable"
+
+
+def _retopo_tombstone_has_session_layers(obj, tombstone):
+    """Require an actual session marker before consuming temporary layers."""
+    return _retopo_tombstone_session_layer_status(obj, tombstone) == "matched"
+
+
+def _retopo_restore_snapshot_visibility(info, snapshot):
+    """Restore only exact snapshot-matched elements when layers are absent."""
+    if not info or not snapshot:
+        return False
+    object_name = str(info.get("object_name", ""))
+    retopo_object = bpy.data.objects.get(object_name)
+    if (
+        retopo_object is None
+        or retopo_object.type != "MESH"
+        or retopo_object.mode != "EDIT"
+    ):
+        return False
+    try:
+        bm = bmesh.from_edit_mesh(retopo_object.data)
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+        matched = _retopo_match_restore_snapshot(bm, snapshot)
+        matched_count = 0
+        for elements in matched.values():
+            for element, entry in elements:
+                element.select = bool(entry.get("select", False))
+                element.hide = bool(entry.get("hide", False))
+                if not bool(entry.get("select", False)):
+                    try:
+                        element.select_set(False)
+                    except (AttributeError, ReferenceError, RuntimeError, TypeError):
+                        element.select = False
+                matched_count += 1
+        if not matched_count:
+            return False
+        bmesh.update_edit_mesh(
+            retopo_object.data,
+            loop_triangles=False,
+            destructive=False,
+        )
+        return True
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def _retopo_reconcile_undo_tombstones():
+    """Reconcile ended sessions whose Object markers vanished during Undo."""
+    global _retopo_undo_retry_pending
+    reconcile_started = time.perf_counter()
+    _retopo_undo_retry_pending = False
+    active_object_names = {
+        state.retopo_isolation.get("object_name")
+        for state in _active_states.values()
+        if isinstance(state, _FaceSetOrbitState)
+        and state.active
+        and state.retopo_isolation
+    }
+    pending = False
+    for key, tombstone in list(_retopo_undo_tombstones.items()):
+        object_name = tombstone["object_name"]
+        if object_name in active_object_names:
+            _retopo_debug_emit(
+                "undo_reconcile_result",
+                {
+                    "tombstone_key": key,
+                    "decision": "skip_active_state",
+                    "reason": "active_object_exclusion",
+                },
+            )
+            continue
+        obj = bpy.data.objects.get(object_name)
+        _retopo_debug_emit(
+            "undo_reconcile_probe",
+            {
+                "tombstone_key": key,
+                "active_object_excluded": False,
+                "object_name": object_name,
+                "mesh_name": str(tombstone.get("mesh_name", "")),
+                "guard_mode": str(tombstone.get("guard_mode", "armed")),
+            },
+        )
+        if obj is None or obj.type != "MESH":
+            _retopo_undo_tombstones.pop(key, None)
+            _retopo_debug_emit(
+                "undo_reconcile_result",
+                {
+                    "tombstone_key": key,
+                    "decision": "discard",
+                    "reason": "object_missing_or_wrong_type",
+                },
+            )
+            continue
+        if str(obj.data.name) != tombstone["mesh_name"]:
+            _retopo_undo_tombstones.pop(key, None)
+            _retopo_debug_emit(
+                "undo_reconcile_result",
+                {
+                    "tombstone_key": key,
+                    "decision": "discard",
+                    "reason": "mesh_identity_mismatch",
+                    "expected_mesh_name": str(tombstone["mesh_name"]),
+                    "actual_mesh_name": str(obj.data.name),
+                },
+            )
+            continue
+        tombstone["retry_pending"] = False
+        if obj.mode != "EDIT":
+            _retopo_debug_emit(
+                "undo_reconcile_result",
+                {
+                    "tombstone_key": key,
+                    "decision": "dormant",
+                    "reason": "object_not_edit_mode",
+                },
+            )
+            continue
+        info = _retopo_tombstone_info(tombstone, obj)
+        restored = False
+        restore_method = None
+        guard_mode = str(tombstone.get("guard_mode", "armed"))
+        layer_status = _retopo_tombstone_session_layer_status(obj, tombstone)
+        if layer_status == "unavailable":
+            tombstone["retry_pending"] = True
+            _retopo_undo_retry_pending = True
+            pending = True
+            _retopo_debug_emit(
+                "undo_reconcile_result",
+                {
+                    "tombstone_key": key,
+                    "decision": "retry",
+                    "reason": "bmesh_unavailable_layer_probe",
+                    "guard_mode": guard_mode,
+                },
+            )
+            continue
+        if layer_status == "matched":
+            restore_method = "layers"
+            restored = _retopo_restore_info(info)
+        if not restored and layer_status == "missing":
+            if guard_mode != "armed":
+                # A successful restore has converted this tombstone into a
+                # history guard.  Fingerprint-only matching is no longer
+                # trusted: later unrelated user states must remain untouched.
+                _retopo_debug_emit(
+                    "undo_reconcile_result",
+                    {
+                        "tombstone_key": key,
+                        "decision": "dormant",
+                        "reason": "history_guard_requires_exact_session_layers",
+                        "guard_mode": guard_mode,
+                    },
+                )
+                continue
+            visibility_status = _retopo_visibility_match_status(
+                obj,
+                tombstone.get("undo_visibility"),
+            )
+            if visibility_status == "unavailable":
+                tombstone["retry_pending"] = True
+                _retopo_undo_retry_pending = True
+                pending = True
+                _retopo_debug_emit(
+                    "undo_reconcile_result",
+                    {
+                        "tombstone_key": key,
+                        "decision": "retry",
+                        "reason": "bmesh_unavailable_visibility_probe",
+                        "guard_mode": guard_mode,
+                    },
+                )
+                continue
+            if visibility_status == "matched":
+                restore_method = "snapshot"
+                restored = _retopo_restore_snapshot_visibility(
+                    info,
+                    tombstone.get("snapshot"),
+                )
+        elif not restored and layer_status == "matched":
+            # _retopo_restore_info() deliberately converts its own failures
+            # to False.  Retry only when a follow-up BMesh probe confirms the
+            # data became temporarily unavailable; a stable failed/mismatch
+            # state is dormant and must wait for a later undo_post.
+            if _retopo_tombstone_session_layer_status(obj, tombstone) == "unavailable":
+                tombstone["retry_pending"] = True
+                _retopo_undo_retry_pending = True
+                pending = True
+                _retopo_debug_emit(
+                    "undo_reconcile_result",
+                    {
+                        "tombstone_key": key,
+                        "decision": "retry",
+                        "reason": "bmesh_unavailable_after_restore_info_false",
+                        "guard_mode": guard_mode,
+                    },
+                )
+                continue
+        if restored:
+            _retopo_clear_object_markers(obj)
+            tombstone["retry_pending"] = False
+            tombstone["last_restore_method"] = restore_method
+            tombstone["successful_restore_count"] = int(
+                tombstone.get("successful_restore_count", 0)
+            ) + 1
+            tombstone["guard_mode"] = (
+                "layer_guard" if restore_method == "layers" else "snapshot_guard"
+            )
+            _retopo_debug_emit(
+                "undo_reconcile_result",
+                {
+                    "tombstone_key": key,
+                    "decision": "guarded",
+                    "reason": "restore_success_guard_retained",
+                    "restore_method": restore_method,
+                    "guard_mode": tombstone.get("guard_mode"),
+                    "successful_restore_count": tombstone.get(
+                        "successful_restore_count", 0
+                    ),
+                    "restore_info_result": bool(restore_method == "layers"),
+                    "snapshot_fallback_result": bool(restore_method == "snapshot"),
+                },
+            )
+        else:
+            _retopo_debug_emit(
+                "undo_reconcile_result",
+                {
+                    "tombstone_key": key,
+                    "decision": "dormant",
+                    "reason": "stable_layer_or_visibility_mismatch",
+                    "restore_method": restore_method,
+                    "restore_info_result": False if restore_method == "layers" else None,
+                    "snapshot_fallback_result": False if restore_method == "snapshot" else None,
+                    "guard_mode": guard_mode,
+                },
+            )
+        # Missing layers plus a nonmatching fingerprint is deliberately
+        # dormant.  A later native undo may restore the ended ON state.
+    _retopo_debug_emit(
+        "undo_reconcile_timing",
+        {
+            "duration_ms": round(
+                (time.perf_counter() - reconcile_started) * 1000.0,
+                3,
+            ),
+            "pending": bool(pending),
+            "tombstone_count": len(_retopo_undo_tombstones),
+        },
+    )
+    return pending
+
+
 def _retopo_restore_isolation(state):
     if not isinstance(state, _FaceSetOrbitState):
         return
     info = state.retopo_isolation
     if not info:
         return
+    # Native Undo may restore the temporary BMesh layers but not the Object
+    # custom properties that identify them.  Keep a runtime-only tombstone
+    # before normal OFF removes those properties and layers.
+    snapshot = (
+        state.retopo_restore_snapshot
+        or info.get("restore_snapshot")
+        or _retopo_capture_restore_snapshot(info)
+    )
+    tombstone = _retopo_record_undo_tombstone(info, snapshot=snapshot)
+    session_id = getattr(state, "session_id", None)
+    retopo_object = bpy.data.objects.get(str(info.get("object_name", "")))
+    restore_started = time.perf_counter()
+    _retopo_debug_emit(
+        "undo_off_before_restore",
+        {
+            "area_key": str(getattr(state, "area_key", "")),
+            "state_session_id": session_id,
+            "object_name": str(info.get("object_name", "")),
+            "mesh_name": (
+                str(retopo_object.data.name)
+                if retopo_object is not None
+                and getattr(retopo_object, "type", None) == "MESH"
+                and getattr(retopo_object, "data", None) is not None
+                else None
+            ),
+            "tombstone_created": bool(tombstone is not None),
+            "tombstone_key": (
+                [
+                    str(tombstone["object_name"]),
+                    str(tombstone["mesh_name"]),
+                    str(tombstone["session_id"]),
+                ]
+                if tombstone is not None
+                else None
+            ),
+        },
+        session_id=session_id,
+    )
     # Restore only elements marked at activation.  New topology is deliberately
     # left untouched so RetopoFlow edits survive FSMFO teardown.
-    _retopo_restore_info(info)
+    restore_result = _retopo_restore_info(info)
+    _retopo_debug_emit(
+        "undo_off_after_restore",
+        {
+            "restore_info_result": bool(restore_result),
+            "duration_ms": round(
+                (time.perf_counter() - restore_started) * 1000.0,
+                3,
+            ),
+            "tombstone_count": len(_retopo_undo_tombstones),
+            "tombstone_key": (
+                [
+                    str(tombstone["object_name"]),
+                    str(tombstone["mesh_name"]),
+                    str(tombstone["session_id"]),
+                ]
+                if tombstone is not None
+                else None
+            ),
+        },
+        session_id=session_id,
+    )
     state.retopo_isolation = None
 
 
 def _cleanup_orphan_retopo_isolations():
     """Restore tagged Retopo hide state when FSMFO Python state is gone."""
+    _retopo_debug_emit(
+        "tagged_retopo_cleanup_before",
+        {
+            "active_state_count": len(_active_states),
+            "tombstone_count": len(_retopo_undo_tombstones),
+        },
+    )
     active_object_names = {
         state.retopo_isolation.get("object_name")
         for state in _active_states.values()
@@ -1944,10 +2466,27 @@ def _cleanup_orphan_retopo_isolations():
                 "original_records": [],
                 "active_face": None,
             }
-            if _retopo_restore_info(info):
+            restore_result = _retopo_restore_info(info)
+            _retopo_debug_emit(
+                "tagged_retopo_restore",
+                {
+                    "object_name": str(obj.name),
+                    "restore_info_result": bool(restore_result),
+                },
+            )
+            if restore_result:
                 restored_names.append(obj.name)
         except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
             pass
+    _retopo_debug_emit(
+        "tagged_retopo_cleanup_after",
+        {
+            "restored_names": [str(name) for name in restored_names],
+            "restored_count": len(restored_names),
+            "active_state_count": len(_active_states),
+            "tombstone_count": len(_retopo_undo_tombstones),
+        },
+    )
     return restored_names
 
 
@@ -2380,16 +2919,19 @@ def _retopo_debug_new_state(
     object_name=None,
     retopo_session_id=None,
 ):
-    global _retopo_debug_file_size
+    global _retopo_debug_file_size, _retopo_debug_file_records
     if not _retopo_debug_valid_session_id(mfo_session_id):
         return None
     try:
-        if _retopo_debug_file_size is None:
+        if _retopo_debug_file_size is None or _retopo_debug_file_records is None:
             _retopo_debug_file_size = os.path.getsize(_RETOPO_DEBUG_LOG_PATH)
+            with open(_RETOPO_DEBUG_LOG_PATH, "rb") as handle:
+                _retopo_debug_file_records = sum(1 for _line in handle)
         size = int(_retopo_debug_file_size)
     except FileNotFoundError:
         size = 0
         _retopo_debug_file_size = 0
+        _retopo_debug_file_records = 0
     except (OSError, RuntimeError, TypeError, ValueError):
         return None
     return {
@@ -2405,13 +2947,25 @@ def _retopo_debug_new_state(
     }
 
 
-def _retopo_debug_write(mfo_session_id, event, payload, bucket="normal"):
-    """Append one active-session record; never affect addon behavior."""
-    global _retopo_debug_file_size
+def _retopo_debug_write(
+    mfo_session_id,
+    event,
+    payload,
+    bucket="normal",
+    allow_inactive=False,
+):
+    """Append one bounded record; never affect addon behavior."""
+    global _retopo_debug_file_size, _retopo_debug_file_records
     if not _retopo_debug_valid_session_id(mfo_session_id):
         return False
     state = _retopo_debug_sessions.get(mfo_session_id)
-    if not state or not state.get("active") or state.get("disabled"):
+    if state is None and allow_inactive:
+        state = _retopo_debug_retired_sessions.get(mfo_session_id)
+    if (
+        not state
+        or (not state.get("active") and not allow_inactive)
+        or state.get("disabled")
+    ):
         return False
     if state.get("mfo_session_id") != mfo_session_id:
         return False
@@ -2451,14 +3005,20 @@ def _retopo_debug_write(mfo_session_id, event, payload, bucket="normal"):
         if line_size > _RETOPO_DEBUG_MAX_BYTES:
             state["disabled"] = True
             return False
-        if int(_retopo_debug_file_size or 0) + line_size > _RETOPO_DEBUG_MAX_BYTES:
-            os.replace(_RETOPO_DEBUG_LOG_PATH, _RETOPO_DEBUG_LOG_BACKUP)
+        if (
+            int(_retopo_debug_file_size or 0) + line_size > _RETOPO_DEBUG_MAX_BYTES
+            or int(_retopo_debug_file_records or 0) >= _RETOPO_DEBUG_MAX_RECORDS
+        ):
+            if os.path.exists(_RETOPO_DEBUG_LOG_PATH):
+                os.replace(_RETOPO_DEBUG_LOG_PATH, _RETOPO_DEBUG_LOG_BACKUP)
             _retopo_debug_file_size = 0
+            _retopo_debug_file_records = 0
         with open(_RETOPO_DEBUG_LOG_PATH, "a", encoding="utf-8", newline="\n") as handle:
             handle.write(line)
             handle.flush()
         state["sequence"] = int(state.get("sequence", 0)) + 1
         _retopo_debug_file_size = int(_retopo_debug_file_size or 0) + line_size
+        _retopo_debug_file_records = int(_retopo_debug_file_records or 0) + 1
         state["file_size"] = _retopo_debug_file_size
         counts[bucket] = counts.get(bucket, 0) + 1
         state["counts"] = counts
@@ -2475,6 +3035,7 @@ def _retopo_debug_begin_session(
     retopo_session_id=None,
 ):
     """Activate logging only after one MFO session is fully established."""
+    global _retopo_debug_last_session_id
     if not _retopo_debug_valid_session_id(mfo_session_id):
         return False
     if not _retopo_debug_enabled():
@@ -2490,6 +3051,8 @@ def _retopo_debug_begin_session(
     )
     if state is None:
         return False
+    _retopo_debug_last_session_id = int(mfo_session_id)
+    _retopo_debug_retired_sessions.pop(int(mfo_session_id), None)
     _retopo_debug_sessions[mfo_session_id] = state
     if _retopo_debug_write(
         mfo_session_id,
@@ -2534,6 +3097,7 @@ def _retopo_debug_lifecycle(mfo_session_id, phase, object_name=None):
 
 
 def _retopo_debug_end_session(mfo_session_id, reason):
+    global _retopo_debug_last_session_id
     if not _retopo_debug_valid_session_id(mfo_session_id):
         return
     state = _retopo_debug_sessions.get(mfo_session_id)
@@ -2549,6 +3113,429 @@ def _retopo_debug_end_session(mfo_session_id, reason):
     finally:
         state["active"] = False
         _retopo_debug_sessions.pop(mfo_session_id, None)
+        _retopo_debug_last_session_id = int(mfo_session_id)
+        _retopo_debug_retired_sessions[int(mfo_session_id)] = state
+        while len(_retopo_debug_retired_sessions) > 8:
+            oldest = next(iter(_retopo_debug_retired_sessions))
+            _retopo_debug_retired_sessions.pop(oldest, None)
+
+
+def _retopo_debug_exception(error):
+    try:
+        return {
+            "type": type(error).__name__,
+            "message": str(error)[:160],
+        }
+    except Exception:
+        return {"type": "Unknown", "message": "unavailable"}
+
+
+def _retopo_debug_object_identity(obj):
+    if obj is None:
+        return {"found": False}
+    result = {"found": True, "name": None, "pointer": None, "mode": None}
+    try:
+        result["name"] = str(obj.name)
+    except Exception as error:
+        result["name_error"] = _retopo_debug_exception(error)
+    try:
+        result["pointer"] = int(obj.as_pointer())
+    except Exception as error:
+        result["pointer_error"] = _retopo_debug_exception(error)
+    try:
+        result["mode"] = str(obj.mode)
+    except Exception as error:
+        result["mode_error"] = _retopo_debug_exception(error)
+    try:
+        mesh = obj.data if obj.type == "MESH" else None
+        result["mesh"] = {
+            "found": mesh is not None,
+            "name": str(mesh.name) if mesh is not None else None,
+            "pointer": int(mesh.as_pointer()) if mesh is not None else None,
+        }
+    except Exception as error:
+        result["mesh_error"] = _retopo_debug_exception(error)
+    return result
+
+
+def _retopo_debug_marker_summary(obj):
+    if obj is None:
+        return {}
+    names = (
+        _RETOPO_ISOLATION_TAG,
+        _RETOPO_ISOLATION_SESSION,
+        _RETOPO_ISOLATION_MARKER_LAYER,
+        _RETOPO_ISOLATION_HIDE_LAYER,
+        _RETOPO_ISOLATION_SELECT_LAYER,
+        _RETOPO_ISOLATION_TARGET_LAYER,
+        _RETOPO_ISOLATION_VERT_MARKER_LAYER,
+        _RETOPO_ISOLATION_VERT_TARGET_LAYER,
+        _RETOPO_ISOLATION_VERT_ORIGIN_LAYER,
+        _RETOPO_ISOLATION_VERT_CREATED_LAYER,
+        _RETOPO_ISOLATION_VERT_HIDE_LAYER,
+        _RETOPO_ISOLATION_VERT_SELECT_LAYER,
+        _RETOPO_ISOLATION_EDGE_MARKER_LAYER,
+        _RETOPO_ISOLATION_EDGE_HIDE_LAYER,
+        _RETOPO_ISOLATION_EDGE_SELECT_LAYER,
+    )
+    result = {}
+    for name in names:
+        try:
+            if name in obj:
+                result[name] = obj[name]
+        except Exception:
+            continue
+    return result
+
+
+def _retopo_debug_layer_summary(obj, layer_names=None, session_id=None):
+    """Read-only BMesh counts; never writes layers, hide, or selection."""
+    result = {
+        "bmesh_available": False,
+        "mode": None,
+        "domains": {},
+    }
+    if obj is None:
+        return result
+    try:
+        result["mode"] = str(obj.mode)
+    except Exception:
+        pass
+    if getattr(obj, "type", None) != "MESH" or result.get("mode") != "EDIT":
+        return result
+    try:
+        bm = bmesh.from_edit_mesh(obj.data)
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+        result["bmesh_available"] = True
+        names = layer_names or {}
+        domain_specs = (
+            ("faces", bm.faces, "marker"),
+            ("verts", bm.verts, "vert_marker"),
+            ("edges", bm.edges, "edge_marker"),
+        )
+        for domain_name, elements, marker_key in domain_specs:
+            domain = elements.layers.int
+            expected = []
+            for key, value in names.items():
+                if value and key not in expected and value not in expected:
+                    expected.append(value)
+            present = []
+            layer_details = {}
+            for name in expected:
+                try:
+                    layer = domain.get(name)
+                    layer_details[name] = {"present": layer is not None}
+                    if layer is not None:
+                        present.append(name)
+                except Exception as error:
+                    layer_details[name] = {
+                        "present": False,
+                        "error": _retopo_debug_exception(error),
+                    }
+            marker_name = names.get(marker_key, "")
+            marker_layer = domain.get(marker_name) if marker_name else None
+            marker_count = 0
+            marker_nonzero_count = 0
+            marker_session_count = 0
+            hide_count = 0
+            select_count = 0
+            for element in elements:
+                try:
+                    marker_value = int(element[marker_layer]) if marker_layer is not None else None
+                    if marker_layer is not None:
+                        marker_count += 1
+                        if marker_value:
+                            marker_nonzero_count += 1
+                        if session_id is not None and marker_value == int(session_id):
+                            marker_session_count += 1
+                except Exception:
+                    pass
+                try:
+                    hide_count += int(bool(element.hide))
+                except Exception:
+                    pass
+                try:
+                    select_count += int(bool(element.select))
+                except Exception:
+                    pass
+            result["domains"][domain_name] = {
+                "count": len(elements),
+                "hide_count": hide_count,
+                "select_count": select_count,
+                "layer_names_present": present,
+                "layer_details": layer_details,
+                "marker_name": marker_name or None,
+                "marker_value_count": marker_count,
+                "marker_nonzero_count": marker_nonzero_count,
+                "marker_session_match_count": marker_session_count,
+            }
+    except Exception as error:
+        result["error"] = _retopo_debug_exception(error)
+    return result
+
+
+def _retopo_debug_visibility_counts(visibility):
+    result = {}
+    for domain_name, entries in (visibility or {}).items():
+        try:
+            entries = list(entries or ())
+            result[domain_name] = {
+                "count": len(entries),
+                "hide_count": sum(int(bool(entry.get("hide", False))) for entry in entries),
+                "select_count": sum(int(bool(entry.get("select", False))) for entry in entries),
+            }
+        except Exception as error:
+            result[domain_name] = {"error": _retopo_debug_exception(error)}
+    return result
+
+
+def _retopo_debug_snapshot_counts(snapshot):
+    result = {}
+    for domain_name, entries in (snapshot or {}).items():
+        try:
+            result[domain_name] = len(entries or ())
+        except Exception:
+            result[domain_name] = None
+    return result
+
+
+def _retopo_debug_restore_counts(obj, snapshot):
+    """Count snapshot entries and exact post-restore hide/select matches."""
+    result = {}
+    if obj is None or getattr(obj, "type", None) != "MESH" or not snapshot:
+        return result
+    try:
+        if obj.mode != "EDIT":
+            return {name: {"snapshot_count": len(snapshot.get(name, ())), "matched_count": 0,
+                           "state_match_count": 0} for name in snapshot}
+        bm = bmesh.from_edit_mesh(obj.data)
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+        matched = _retopo_match_restore_snapshot(bm, snapshot)
+        for domain_name, entries in snapshot.items():
+            pairs = matched.get(domain_name, ())
+            state_matches = sum(
+                int(
+                    bool(element.hide) == bool(entry.get("hide", False))
+                    and bool(element.select) == bool(entry.get("select", False))
+                )
+                for element, entry in pairs
+            )
+            result[domain_name] = {
+                "snapshot_count": len(entries or ()),
+                "matched_count": len(pairs),
+                "state_match_count": state_matches,
+            }
+    except Exception as error:
+        result["error"] = _retopo_debug_exception(error)
+    return result
+
+
+def _retopo_debug_record_followup_target(tombstone=None, obj=None):
+    try:
+        if tombstone:
+            object_name = str(tombstone.get("object_name", ""))
+            mesh_name = str(tombstone.get("mesh_name", ""))
+            session_id = int(tombstone.get("session_id", 0))
+            layer_names = dict(tombstone.get("layer_names") or {})
+        elif obj is not None:
+            object_name = str(obj.name)
+            mesh_name = str(obj.data.name) if obj.type == "MESH" else ""
+            session_id = 0
+            layer_names = {}
+        else:
+            return
+        if object_name and mesh_name:
+            _retopo_debug_followup_targets[object_name] = {
+                "object_name": object_name,
+                "mesh_name": mesh_name,
+                "session_id": session_id,
+                "layer_names": layer_names,
+            }
+            while len(_retopo_debug_followup_targets) > 8:
+                oldest = next(iter(_retopo_debug_followup_targets))
+                _retopo_debug_followup_targets.pop(oldest, None)
+    except Exception:
+        pass
+
+
+def _retopo_debug_followup_target_snapshots():
+    result = []
+    for target in list(_retopo_debug_followup_targets.values()):
+        try:
+            obj = bpy.data.objects.get(target.get("object_name", ""))
+            result.append({
+                "object": _retopo_debug_object_identity(obj),
+                "object_name_match": bool(obj is not None and obj.name == target.get("object_name")),
+                "mesh_name_match": bool(
+                    obj is not None
+                    and obj.type == "MESH"
+                    and obj.data is not None
+                    and obj.data.name == target.get("mesh_name")
+                ),
+                "layer_summary": _retopo_debug_layer_summary(
+                    obj,
+                    target.get("layer_names"),
+                    target.get("session_id"),
+                ),
+                "markers": _retopo_debug_marker_summary(obj),
+            })
+        except Exception as error:
+            result.append({"error": _retopo_debug_exception(error)})
+    return result
+
+
+def _retopo_debug_active_states():
+    result = []
+    for area_key, state in list(_active_states.items()):
+        try:
+            info = state.retopo_isolation or {}
+            result.append({
+                "area_key": str(area_key),
+                "session_id": int(getattr(state, "session_id", 0)),
+                "active": bool(getattr(state, "active", False)),
+                "proxy_object_name": getattr(state, "proxy_object_name", None),
+                "retopo_object_name": info.get("object_name"),
+                "retopo_session_id": info.get("session_id"),
+            })
+        except Exception as error:
+            result.append({"area_key": str(area_key), "error": _retopo_debug_exception(error)})
+    return result
+
+
+def _retopo_debug_tombstones():
+    result = []
+    for key, tombstone in list(_retopo_undo_tombstones.items()):
+        try:
+            object_name = str(tombstone.get("object_name", ""))
+            obj = bpy.data.objects.get(object_name)
+            result.append({
+                "key": [str(value) for value in key],
+                "object_name": object_name,
+                "mesh_name": str(tombstone.get("mesh_name", "")),
+                "session_id": tombstone.get("session_id"),
+                "retry_pending": bool(tombstone.get("retry_pending", False)),
+                "guard_mode": str(tombstone.get("guard_mode", "armed")),
+                "successful_restore_count": int(
+                    tombstone.get("successful_restore_count", 0)
+                ),
+                "last_restore_method": tombstone.get("last_restore_method"),
+                "object": _retopo_debug_object_identity(obj),
+            })
+        except Exception as error:
+            result.append({"key": [str(value) for value in key], "error": _retopo_debug_exception(error)})
+    return result
+
+
+def _retopo_debug_probe_tombstone(tombstone):
+    try:
+        object_name = str(tombstone.get("object_name", "")) if tombstone else ""
+        try:
+            obj = bpy.data.objects.get(object_name) if object_name else None
+        except Exception:
+            obj = None
+        layer_names = (tombstone or {}).get("layer_names") or {}
+        object_identity = _retopo_debug_object_identity(obj)
+        mesh_identity_match = False
+        if obj is not None:
+            try:
+                mesh_identity_match = str(obj.data.name) == str(tombstone.get("mesh_name", ""))
+            except Exception:
+                mesh_identity_match = False
+        try:
+            layer_status = _retopo_tombstone_session_layer_status(obj, tombstone)
+        except Exception as error:
+            layer_status = "probe_exception"
+            layer_error = _retopo_debug_exception(error)
+        else:
+            layer_error = None
+        try:
+            visibility_status = _retopo_visibility_match_status(
+                obj,
+                (tombstone or {}).get("undo_visibility"),
+            )
+        except Exception as error:
+            visibility_status = "probe_exception"
+            visibility_error = _retopo_debug_exception(error)
+        else:
+            visibility_error = None
+        result = {
+            "object_lookup": object_identity,
+            "object_name_match": bool(obj is not None and object_identity.get("name") == object_name),
+            "mesh_name_match": mesh_identity_match,
+            "mode": object_identity.get("mode"),
+            "guard_mode": str((tombstone or {}).get("guard_mode", "armed")),
+            "successful_restore_count": int(
+                (tombstone or {}).get("successful_restore_count", 0)
+            ),
+            "layer_status": layer_status,
+            "visibility_status": visibility_status,
+            "layer_summary": _retopo_debug_layer_summary(
+                obj,
+                layer_names,
+                (tombstone or {}).get("session_id"),
+            ),
+            "markers": _retopo_debug_marker_summary(obj),
+        }
+        if layer_error is not None:
+            result["layer_error"] = layer_error
+        if visibility_error is not None:
+            result["visibility_error"] = visibility_error
+        return result
+    except Exception as error:
+        return {"probe_error": _retopo_debug_exception(error)}
+
+
+def _retopo_debug_diagnostic(event, payload=None, session_id=None):
+    """Write diagnostics through the existing bounded JSONL infrastructure."""
+    if not _retopo_debug_enabled():
+        return False
+    try:
+        candidate = session_id
+        if not _retopo_debug_valid_session_id(candidate):
+            candidate = _retopo_debug_last_session_id
+        if not _retopo_debug_valid_session_id(candidate):
+            return False
+        candidate = int(candidate)
+        state = _retopo_debug_sessions.get(candidate)
+        if state is None:
+            state = _retopo_debug_retired_sessions.get(candidate)
+        if state is None:
+            return False
+        if candidate not in _retopo_debug_sessions:
+            _retopo_debug_retired_sessions[candidate] = state
+        return _retopo_debug_write(
+            candidate,
+            event,
+            payload or {},
+            bucket="diagnostic",
+            allow_inactive=True,
+        )
+    except Exception:
+        return False
+
+
+def _retopo_debug_emit(event, payload=None, session_id=None):
+    if not _retopo_debug_enabled():
+        return False
+    session_ids = []
+    if _retopo_debug_valid_session_id(session_id):
+        session_ids.append(int(session_id))
+    # Keep the hot path independent from diagnostic BMesh/object scans.  The
+    # session map is already the ownership source of truth for the bounded
+    # JSONL logger, so iterating its keys is sufficient here.
+    for value in tuple(_retopo_debug_sessions.keys()):
+        if _retopo_debug_valid_session_id(value) and int(value) not in session_ids:
+            session_ids.append(int(value))
+    if not session_ids and _retopo_debug_valid_session_id(_retopo_debug_last_session_id):
+        session_ids.append(int(_retopo_debug_last_session_id))
+    written = False
+    for value in session_ids:
+        written = _retopo_debug_diagnostic(event, payload, session_id=value) or written
+    return written
 
 
 def _retopo_debug_predicate(
@@ -4606,15 +5593,29 @@ def _finish_face_set_states():
     _session_cleanup_areas.difference_update(face_set_area_keys)
 
 
-def _cleanup_orphan_face_set_proxies():
+def _cleanup_orphan_face_set_proxies(reconcile_undo_tombstones=False):
     """Remove Face Set MFO scene remnants whose modal state no longer exists.
 
     Blender's Undo and file/window lifecycle can invalidate Python operator
     instances without running their ``__del__`` method.  This function is
     deliberately limited to tagged/generated proxy objects and the Reference
-    visibility marker owned by those proxies.  It never changes mesh data,
-    selection, active object, or mode.
+    visibility marker owned by those proxies.  The optional tombstone
+    reconciliation is the only path that may restore owned Retopo mesh data;
+    generic proxy cleanup never changes selection, active object, or mode.
     """
+    _retopo_debug_emit(
+        "generic_cleanup_before",
+        {
+            "reconcile_undo_tombstones": bool(reconcile_undo_tombstones),
+            "tombstone_count": len(_retopo_undo_tombstones),
+            "active_state_count": len(_active_states),
+        },
+    )
+    if reconcile_undo_tombstones:
+        _retopo_reconcile_undo_tombstones()
+    # Reconcile the runtime tombstone before the generic tagged cleanup.  On
+    # native Undo the Object markers and BMesh layers may return together; the
+    # tombstone must consume that ON state before the generic path removes it.
     _cleanup_orphan_retopo_isolations()
 
     active_proxy_pointers = set()
@@ -4695,6 +5696,18 @@ def _cleanup_orphan_face_set_proxies():
                 for area in screen.areas:
                     _tag_redraw(area)
 
+    _retopo_debug_emit(
+        "generic_cleanup_after",
+        {
+            "reconcile_undo_tombstones": bool(reconcile_undo_tombstones),
+            "removed_proxy_names": [str(name) for name in removed_proxy_names],
+            "removed_proxy_meshes": [str(name) for name in removed_proxy_meshes],
+            "removed_proxy_count": len(removed_proxy_names),
+            "removed_mesh_count": len(removed_proxy_meshes),
+            "tombstone_count": len(_retopo_undo_tombstones),
+            "active_state_count": len(_active_states),
+        },
+    )
     return removed_proxy_names, removed_proxy_meshes
 
 
@@ -4706,6 +5719,57 @@ def _is_live_face_set_proxy(proxy):
         return bpy.data.objects.get(proxy.name) is proxy
     except (AttributeError, ReferenceError, RuntimeError, TypeError):
         return False
+
+
+def _has_reclaimable_orphan_artifacts():
+    """Return whether tagged, non-active FSMFO artifacts still need cleanup."""
+    active_proxy_names = set()
+    active_retopo_names = set()
+    for state in list(_active_states.values()):
+        if not isinstance(state, _FaceSetOrbitState) or not state.active:
+            continue
+        try:
+            if state.proxy_object_name:
+                active_proxy_names.add(str(state.proxy_object_name))
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            pass
+        try:
+            info = state.retopo_isolation
+            if info and info.get("object_name"):
+                active_retopo_names.add(str(info["object_name"]))
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            pass
+
+    for tombstone in _retopo_undo_tombstones.values():
+        if (
+            tombstone.get("object_name") not in active_retopo_names
+            and tombstone.get("retry_pending", False)
+        ):
+            return True
+
+    for obj in list(bpy.data.objects):
+        try:
+            if _is_face_set_proxy_object(obj) and obj.name not in active_proxy_names:
+                return True
+            if (
+                obj.get(_FACE_SET_REFERENCE_TAG, False)
+                and not _remaining_face_set_proxies(obj.name)
+            ):
+                return True
+            if (
+                obj.get(_RETOPO_ISOLATION_TAG, False)
+                and obj.name not in active_retopo_names
+            ):
+                return True
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            continue
+    for mesh in list(bpy.data.meshes):
+        try:
+            if mesh.users == 0 and _is_face_set_proxy_mesh(mesh):
+                return True
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            continue
+    return False
 
 
 def _deferred_orphan_cleanup():
@@ -4727,11 +5791,183 @@ def _schedule_orphan_cleanup():
         pass
 
 
+def _deferred_undo_orphan_cleanup():
+    """Reconcile tagged FSMFO remnants after Blender finishes an Undo step.
+
+    ``undo_post`` can run while Edit BMesh data is still being rebuilt.  Keep
+    the handler lightweight and perform the ownership-tagged cleanup from a
+    short timer instead.  Active sessions remain protected by the existing
+    session/generation checks in the orphan cleanup functions.
+    """
+    global _undo_orphan_cleanup_pending, _undo_orphan_cleanup_retries
+    global _last_undo_post_perf
+    global _retopo_undo_retry_pending
+    deferred_started = time.perf_counter()
+    undo_post_to_callback_ms = None
+    if _last_undo_post_perf is not None:
+        undo_post_to_callback_ms = round(
+            (deferred_started - _last_undo_post_perf) * 1000.0,
+            3,
+        )
+    _last_undo_post_perf = None
+    _undo_orphan_cleanup_pending = False
+    _retopo_debug_emit(
+        "deferred_start",
+        {
+            "retries": int(_undo_orphan_cleanup_retries),
+            "undo_post_to_callback_ms": undo_post_to_callback_ms,
+            "tombstone_count": len(_retopo_undo_tombstones),
+            "active_state_count": len(_active_states),
+        },
+    )
+    if not _is_registered:
+        _retopo_debug_emit(
+            "deferred_end",
+            {
+                "decision": "skip_unregistered",
+                "tombstone_count": len(_retopo_undo_tombstones),
+                "duration_ms": round(
+                    (time.perf_counter() - deferred_started) * 1000.0,
+                    3,
+                ),
+            },
+        )
+        return None
+    try:
+        _cleanup_orphan_face_set_proxies(reconcile_undo_tombstones=True)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        # BMesh may still be temporarily unavailable after undo_post.
+        if _undo_orphan_cleanup_retries < 3:
+            _undo_orphan_cleanup_retries += 1
+            _undo_orphan_cleanup_pending = True
+            _retopo_debug_emit(
+                "deferred_end",
+                {
+                    "decision": "retry",
+                    "reason": "cleanup_exception",
+                    "retries": int(_undo_orphan_cleanup_retries),
+                    "tombstone_count": len(_retopo_undo_tombstones),
+                    "duration_ms": round(
+                        (time.perf_counter() - deferred_started) * 1000.0,
+                        3,
+                    ),
+                },
+            )
+            return 0.1
+        _retopo_undo_retry_pending = False
+        for tombstone in _retopo_undo_tombstones.values():
+            tombstone["retry_pending"] = False
+        _undo_orphan_cleanup_retries = 0
+        _retopo_debug_emit(
+            "deferred_end",
+            {
+                "decision": "stop_retries_retain_tombstones",
+                "reason": "cleanup_exception_retry_limit",
+                "tombstone_count": len(_retopo_undo_tombstones),
+                "duration_ms": round(
+                    (time.perf_counter() - deferred_started) * 1000.0,
+                    3,
+                ),
+            },
+        )
+        return None
+    if _has_reclaimable_orphan_artifacts() and _undo_orphan_cleanup_retries < 3:
+        _undo_orphan_cleanup_retries += 1
+        _undo_orphan_cleanup_pending = True
+        _retopo_debug_emit(
+            "deferred_end",
+            {
+                "decision": "retry",
+                "reason": "reclaimable_transient_artifact",
+                "retries": int(_undo_orphan_cleanup_retries),
+                "tombstone_count": len(_retopo_undo_tombstones),
+                "duration_ms": round(
+                    (time.perf_counter() - deferred_started) * 1000.0,
+                    3,
+                ),
+            },
+        )
+        return 0.1
+    if _has_reclaimable_orphan_artifacts():
+        # Stop retrying this undo event, but retain dormant tombstones.  A
+        # later undo_post must get another chance to reach the native ON
+        # state.  Only identity/session/load lifecycle boundaries discard
+        # tombstones.
+        _retopo_undo_retry_pending = False
+        for tombstone in _retopo_undo_tombstones.values():
+            tombstone["retry_pending"] = False
+    _undo_orphan_cleanup_retries = 0
+    _retopo_debug_emit(
+        "deferred_end",
+        {
+            "decision": "complete",
+            "tombstone_count": len(_retopo_undo_tombstones),
+            "active_state_count": len(_active_states),
+            "duration_ms": round(
+                (time.perf_counter() - deferred_started) * 1000.0,
+                3,
+            ),
+        },
+    )
+    return None
+
+
+def _schedule_undo_orphan_cleanup():
+    """Schedule at most one post-Undo reconciliation for this module."""
+    global _undo_orphan_cleanup_pending, _undo_orphan_cleanup_retries
+    global _retopo_undo_retry_pending
+    if not _is_registered or _undo_orphan_cleanup_pending:
+        return
+    try:
+        bpy.app.timers.register(_deferred_undo_orphan_cleanup, first_interval=0.1)
+        _undo_orphan_cleanup_pending = True
+        _undo_orphan_cleanup_retries = 0
+        _retopo_undo_retry_pending = False
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        pass
+
+
+def _cancel_undo_orphan_cleanup():
+    """Remove a queued callback during unregister/reload lifecycle cleanup."""
+    global _undo_orphan_cleanup_pending, _undo_orphan_cleanup_retries
+    global _last_undo_post_perf
+    global _retopo_undo_retry_pending
+    try:
+        if bpy.app.timers.is_registered(_deferred_undo_orphan_cleanup):
+            bpy.app.timers.unregister(_deferred_undo_orphan_cleanup)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        pass
+    _undo_orphan_cleanup_pending = False
+    _undo_orphan_cleanup_retries = 0
+    _last_undo_post_perf = None
+    _retopo_undo_retry_pending = False
+    for tombstone in _retopo_undo_tombstones.values():
+        tombstone["retry_pending"] = False
+
+
+@persistent
+def _on_undo_post(_dummy):
+    """Queue ownership-safe cleanup after native Undo has rebuilt the scene."""
+    global _last_undo_post_perf
+    if not _undo_orphan_cleanup_pending:
+        _last_undo_post_perf = time.perf_counter()
+    _retopo_debug_emit(
+        "undo_post",
+        {
+            "tombstone_count": len(_retopo_undo_tombstones),
+            "active_state_count": len(_active_states),
+            "cleanup_timer_pending": bool(_undo_orphan_cleanup_pending),
+        },
+    )
+    _schedule_undo_orphan_cleanup()
+
+
 @persistent
 def _on_load_pre(_dummy):
     """Clear viewport-bound state before Blender replaces the current file."""
     _finish_all_states()
     _cleanup_orphan_face_set_proxies()
+    _retopo_undo_tombstones.clear()
     _local_face_set_adjacency_cache.clear()
 
 
@@ -5797,21 +7033,35 @@ def register():
         bpy.app.handlers.load_pre.append(_on_load_pre)
     if _on_load_post not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_on_load_post)
+    if _on_undo_post not in bpy.app.handlers.undo_post:
+        bpy.app.handlers.undo_post.append(_on_undo_post)
     _rebuild_keymaps()
 
 
 def unregister():
     global _is_registered
     if not _is_registered:
+        _cancel_undo_orphan_cleanup()
+        _retopo_undo_tombstones.clear()
+        _retopo_debug_sessions.clear()
+        _retopo_debug_retired_sessions.clear()
+        if _on_undo_post in bpy.app.handlers.undo_post:
+            bpy.app.handlers.undo_post.remove(_on_undo_post)
         _restore_retopoflow_hooks()
         return
     _finish_all_states()
+    _cancel_undo_orphan_cleanup()
     _cleanup_orphan_face_set_proxies()
+    _retopo_undo_tombstones.clear()
+    _retopo_debug_sessions.clear()
+    _retopo_debug_retired_sessions.clear()
     _restore_retopoflow_hooks()
     if _on_load_pre in bpy.app.handlers.load_pre:
         bpy.app.handlers.load_pre.remove(_on_load_pre)
     if _on_load_post in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_on_load_post)
+    if _on_undo_post in bpy.app.handlers.undo_post:
+        bpy.app.handlers.undo_post.remove(_on_undo_post)
     _remove_keymaps()
     _local_face_set_adjacency_cache.clear()
     _is_registered = False
