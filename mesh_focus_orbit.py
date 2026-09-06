@@ -9,7 +9,7 @@ rotating the view.
 bl_info = {
     "name": "Mesh Focus Orbit",
     "author": "OpenAI",
-    "version": (3, 1, 6),
+    "version": (3, 2, 3),
     "blender": (5, 2, 0),
     "location": "3D View",
     "description": "Temporary mesh-centered orbit and one-click Smart Face Set Fill",
@@ -205,36 +205,6 @@ _RETOPO_ISOLATION_VERT_SELECT_LAYER = "mesh_focus_orbit.retopo_vert_select_layer
 _RETOPO_ISOLATION_EDGE_MARKER_LAYER = "mesh_focus_orbit.retopo_edge_marker_layer"
 _RETOPO_ISOLATION_EDGE_HIDE_LAYER = "mesh_focus_orbit.retopo_edge_hide_layer"
 _RETOPO_ISOLATION_EDGE_SELECT_LAYER = "mesh_focus_orbit.retopo_edge_select_layer"
-
-
-SMART_FACE_SET_FILL_NORMAL_SMOOTH_RADIUS_FACTOR = 8.0
-SMART_FACE_SET_FILL_NORMAL_VARIATION_WEIGHT = 0.25
-SMART_FACE_SET_FILL_NORMAL_ANGLE_LIMIT = math.radians(75.0)
-SMART_FACE_SET_FILL_NORMAL_RAW_ANGLE_LIMIT = math.radians(85.0)
-SMART_FACE_SET_FILL_RAW_EDGE_WEIGHT = 0.65
-SMART_FACE_SET_FILL_RAW_EDGE_ANGLE_LIMIT = math.radians(30.0)
-SMART_FACE_SET_FILL_CONCAVITY_PENALTY = 2.5
-SMART_FACE_SET_FILL_ACCEPTANCE_THRESHOLD = 0.60
-SMART_FACE_SET_FILL_MAX_FACES = 100000
-SMART_FACE_SET_FILL_MAX_GEODESIC_SCALE = 350.0
-SMART_FACE_SET_FILL_MAX_GEODESIC_FACTOR = 0.45
-SMART_FACE_SET_FILL_MIN_GEODESIC_FACTOR = 0.03
-SMART_FACE_SET_FILL_NORMAL_SAMPLE_LIMIT = 8
-
-# Strict Smart Face Set Fill parameters. The normal E shortcut keeps the
-# values above; Shift+E uses these tighter local limits to stop at valleys
-# that normal mode is allowed to cross.
-SMART_FACE_SET_FILL_STRICT_NORMAL_SMOOTH_RADIUS_FACTOR = 4.0
-SMART_FACE_SET_FILL_STRICT_NORMAL_VARIATION_WEIGHT = 0.35
-SMART_FACE_SET_FILL_STRICT_NORMAL_ANGLE_LIMIT = math.radians(55.0)
-SMART_FACE_SET_FILL_STRICT_NORMAL_RAW_ANGLE_LIMIT = math.radians(70.0)
-SMART_FACE_SET_FILL_STRICT_RAW_EDGE_WEIGHT = 0.90
-SMART_FACE_SET_FILL_STRICT_RAW_EDGE_ANGLE_LIMIT = math.radians(20.0)
-SMART_FACE_SET_FILL_STRICT_CONCAVITY_PENALTY = 4.0
-SMART_FACE_SET_FILL_STRICT_ACCEPTANCE_THRESHOLD = 0.40
-SMART_FACE_SET_FILL_STRICT_MAX_GEODESIC_SCALE = 160.0
-SMART_FACE_SET_FILL_STRICT_MAX_GEODESIC_FACTOR = 0.12
-SMART_FACE_SET_FILL_STRICT_MIN_GEODESIC_FACTOR = 0.01
 
 
 # Automatic Retopo island classification thresholds and score parameters.
@@ -6374,393 +6344,363 @@ def _raycast_sculpt_face_set(context, coord):
         return None
 
 
-def _build_local_face_set_adjacency(mesh):
-    """Build compact edge-to-face incidence data for one mesh topology."""
-    face_count = len(mesh.polygons)
-    edge_count = len(mesh.edges)
-    loop_count = len(mesh.loops)
-
-    loop_edges = array("i", [0]) * loop_count
-    loop_vertices = array("i", [0]) * loop_count
-    face_loop_starts = array("i", [0]) * face_count
-    face_loop_totals = array("i", [0]) * face_count
-
-    if loop_count:
-        mesh.loops.foreach_get("edge_index", loop_edges)
-        mesh.loops.foreach_get("vertex_index", loop_vertices)
-    if face_count:
-        mesh.polygons.foreach_get("loop_start", face_loop_starts)
-        mesh.polygons.foreach_get("loop_total", face_loop_totals)
-
-    edge_face_a = array("i", [-1]) * edge_count
-    edge_face_b = array("i", [-1]) * edge_count
-    non_manifold_faces = {}
-
-    for face_index in range(face_count):
-        start = face_loop_starts[face_index]
-        end = start + face_loop_totals[face_index]
-        for loop_index in range(start, end):
-            edge_index = loop_edges[loop_index]
-            if edge_index < 0 or edge_index >= edge_count:
-                continue
-            if edge_face_a[edge_index] < 0:
-                edge_face_a[edge_index] = face_index
-            elif edge_face_b[edge_index] < 0:
-                edge_face_b[edge_index] = face_index
-            else:
-                non_manifold_faces.setdefault(
-                    edge_index,
-                    [edge_face_a[edge_index], edge_face_b[edge_index]],
-                ).append(face_index)
-
-    return {
-        "loop_edges": loop_edges,
-        "loop_vertices": loop_vertices,
-        "face_loop_starts": face_loop_starts,
-        "face_loop_totals": face_loop_totals,
-        "edge_face_a": edge_face_a,
-        "edge_face_b": edge_face_b,
-        "non_manifold_faces": non_manifold_faces,
-    }
+def _fill_average(values, first, second, count, iterations):
+    """Diffuse over manifold face adjacency, without changing mesh geometry."""
+    import numpy as np
+    degree = np.bincount(first, minlength=count) + np.bincount(second, minlength=count)
+    divisor = degree + 1
+    current = values.copy()
+    for _ in range(iterations):
+        if current.ndim == 1:
+            current = (current + np.bincount(first, weights=current[second], minlength=count)
+                       + np.bincount(second, weights=current[first], minlength=count)) / divisor
+        else:
+            current = np.column_stack([
+                (current[:, axis] + np.bincount(first, weights=current[second, axis], minlength=count)
+                 + np.bincount(second, weights=current[first, axis], minlength=count)) / divisor
+                for axis in range(current.shape[1])])
+    return current
 
 
-def _get_cached_local_face_set_adjacency(mesh):
-    """Reuse topology data while the mesh topology remains unchanged."""
-    key = (
-        mesh.as_pointer(),
-        len(mesh.vertices),
-        len(mesh.edges),
-        len(mesh.polygons),
-        len(mesh.loops),
-    )
+def _fill_geometry(obj):
+    """Bulk geometry; content-keyed so sculpting, Undo and rewiring invalidate it."""
+    import hashlib
+    import numpy as np
+    mesh = obj.data
+    count = len(mesh.polygons)
+    coordinates = np.empty((len(mesh.vertices), 3), dtype=np.float32)
+    loop_edges = np.empty(len(mesh.loops), dtype=np.int32)
+    loop_vertices = np.empty(len(mesh.loops), dtype=np.int32)
+    totals = np.empty(count, dtype=np.int32)
+    hidden = np.empty(count, dtype=bool)
+    mesh.vertices.foreach_get('co', coordinates.ravel())
+    mesh.loops.foreach_get('edge_index', loop_edges)
+    mesh.loops.foreach_get('vertex_index', loop_vertices)
+    mesh.polygons.foreach_get('loop_total', totals)
+    mesh.polygons.foreach_get('hide', hidden)
+    transform = np.asarray(obj.matrix_world.to_3x3(), dtype=np.float64)
+    digest = hashlib.blake2b(digest_size=16)
+    for value in (coordinates, loop_edges, loop_vertices, totals, hidden, transform):
+        digest.update(value.tobytes())
+    key = (mesh.as_pointer(), digest.digest())
     cached = _local_face_set_adjacency_cache.get(key)
-    if cached is None:
-        cached = _build_local_face_set_adjacency(mesh)
-        _local_face_set_adjacency_cache.clear()
-        _local_face_set_adjacency_cache[key] = cached
+    if cached is not None:
+        return cached
+
+    centers = np.empty((count, 3), dtype=np.float32)
+    normals = np.empty((count, 3), dtype=np.float32)
+    mesh.polygons.foreach_get('center', centers.ravel())
+    mesh.polygons.foreach_get('normal', normals.ravel())
+    centers = centers @ transform.T
+    normals = normals @ np.linalg.inv(transform)
+    normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1.e-20)
+    face_ids = np.repeat(np.arange(count, dtype=np.int32), totals)
+    order = np.argsort(loop_edges, kind='stable')
+    sorted_edges = loop_edges[order]
+    starts = np.r_[0, np.flatnonzero(np.diff(sorted_edges)) + 1]
+    lengths = np.diff(np.r_[starts, len(order)])
+    pairs = starts[lengths == 2]
+    first, second = face_ids[order[pairs]], face_ids[order[pairs + 1]]
+    face_starts = np.r_[0, np.cumsum(totals)[:-1]]
+    paired_loops = order[pairs]
+    paired_next = face_starts[first] + ((paired_loops - face_starts[first] + 1) % totals[first])
+    edge_vectors = (coordinates[loop_vertices[paired_next]].astype(np.float64)
+                    - coordinates[loop_vertices[paired_loops]]) @ transform.T
+    shared_lengths = np.linalg.norm(edge_vectors, axis=1)
+    # Imported meshes can have coincident but unwelded ring seams. Match only
+    # two open edges with both endpoints coincident, opposite winding, and
+    # compatible normals. This changes the search graph, never the mesh.
+    border_loops = order[starts[lengths == 1]]
+    seam_count = 0
+    if len(border_loops):
+        face_starts = np.r_[0, np.cumsum(totals)[:-1]]
+        border_faces = face_ids[border_loops]
+        next_loops = face_starts[border_faces] + (
+            (border_loops - face_starts[border_faces] + 1) % totals[border_faces])
+        points_a = coordinates[loop_vertices[border_loops]].astype(np.float64) @ transform.T
+        points_b = coordinates[loop_vertices[next_loops]].astype(np.float64) @ transform.T
+        edge_lengths = np.linalg.norm(points_b - points_a, axis=1)
+        tolerance = max(float(np.median(edge_lengths)) * 1.e-4, 1.e-12)
+        quantized = np.rint(np.vstack((points_a, points_b)) / tolerance).astype(np.int64)
+        _, point_ids = np.unique(quantized, axis=0, return_inverse=True)
+        pa, pb = np.split(point_ids, 2)
+        signatures = np.column_stack((np.minimum(pa, pb), np.maximum(pa, pb)))
+        _, inverse, counts = np.unique(signatures, axis=0, return_inverse=True, return_counts=True)
+        seam_order = np.argsort(inverse, kind='stable')
+        seam_starts = np.r_[0, np.cumsum(counts)[:-1]][counts == 2]
+        ia, ib = seam_order[seam_starts], seam_order[seam_starts + 1]
+        fa, fb = border_faces[ia], border_faces[ib]
+        match = ((pa[ia] == pb[ib]) & (pb[ia] == pa[ib]) & (pa[ia] != pb[ia])
+                 & (fa != fb) & (np.sum(normals[fa] * normals[fb], axis=1) > 0.5)
+                 & (np.linalg.norm(points_a[ia] - points_b[ib], axis=1) <= tolerance)
+                 & (np.linalg.norm(points_b[ia] - points_a[ib], axis=1) <= tolerance))
+        first, second = np.r_[first, fa[match]], np.r_[second, fb[match]]
+        shared_lengths = np.r_[shared_lengths, (edge_lengths[ia[match]] + edge_lengths[ib[match]]) * 0.5]
+        seam_count = int(np.count_nonzero(match))
+    valid = ~(hidden[first] | hidden[second]) & (first != second)
+    first, second = first[valid], second[valid]
+    shared_lengths = shared_lengths[valid]
+    # Open and non-manifold edges are never bridges to another sheet.
+    delta = centers[second] - centers[first]
+    distance = np.maximum(np.linalg.norm(delta, axis=1), 1.e-20)
+    degree = np.bincount(first, minlength=count) + np.bincount(second, minlength=count)
+    scale = (np.bincount(first, weights=distance, minlength=count)
+             + np.bincount(second, weights=distance, minlength=count)) / np.maximum(degree, 1)
+    smooth = _fill_average(normals, first, second, count, 2)
+    smooth /= np.maximum(np.linalg.norm(smooth, axis=1, keepdims=True), 1.e-20)
+    # Signed curvature per unit length, not raw dihedral per polygon: varying
+    # tessellation density must not create a ring-shaped stopping boundary.
+    curvature_edge = np.sum((smooth[second] - smooth[first]) * delta, axis=1)
+    # A ridge can curve outward along its length while its foot curves inward
+    # across it. A mean curvature would cancel these two directions and miss
+    # the foot. Preserve the strongest inward directional turn separately.
+    inward = np.maximum(-curvature_edge / distance, 0.0) * 3.0
+    directional_valley = np.zeros(count)
+    np.maximum.at(directional_valley, first, inward)
+    np.maximum.at(directional_valley, second, inward)
+    directional_valley = _fill_average(directional_valley, first, second, count, 3)
+    metric = (np.bincount(first, weights=distance**2, minlength=count)
+              + np.bincount(second, weights=distance**2, minlength=count))
+    curvature = (np.bincount(first, weights=curvature_edge, minlength=count)
+                 + np.bincount(second, weights=curvature_edge, minlength=count)) / np.maximum(metric, 1.e-30)
+    curvature = _fill_average(curvature, first, second, count, 3)
+    broad = _fill_average(curvature, first, second, count, 24)
+    # Positive curvature is a convex crest: it must remain traversable even
+    # when its radius changes abruptly. Only concave departures form barriers.
+    contrast = np.where(curvature < 0.0,
+                        np.maximum(broad - curvature, 0.0) * scale * 6.0, 0.0)
+    concavity = np.maximum(-curvature, 0.0) * scale * 6.0
+    # A stable approximation of the broad concave normal change that appears
+    # as a dark foot under studio lighting. Never sample screen brightness:
+    # the inferred line must not move with the camera, lights or Face Set color.
+    valley_line = _fill_average(np.maximum(concavity, directional_valley),
+                               first, second, count, 6)
+    edge_valley = (valley_line[first] + valley_line[second]) * 0.5
+    contour_cost = shared_lengths / (1.0 + (edge_valley / 0.10)**2)
+    raw_angle = np.arccos(np.clip(np.sum(normals[first] * normals[second], axis=1), -1, 1))
+    raw_turn = np.sum((normals[second] - normals[first]) * delta, axis=1)
+    raw_angle = np.where(raw_turn < -distance * 1.e-6, raw_angle, 0.0)
+    crease = np.zeros(count)
+    np.maximum.at(crease, first, raw_angle)
+    np.maximum.at(crease, second, raw_angle)
+    # CSR is compact for triangles and also supports arbitrary polygons.
+    sources = np.r_[first, second]
+    destinations = np.r_[second, first]
+    order = np.argsort(sources, kind='stable')
+    offsets = np.r_[0, np.cumsum(degree)].astype(np.int64)
+    cached = dict(first=first, second=second, offsets=offsets,
+                  centers=centers, normals=normals, scale=scale,
+                  neighbors=destinations[order], neighbor_lengths=np.r_[distance, distance][order],
+                  contour_cost=np.r_[contour_cost, contour_cost][order],
+                  hidden=hidden, contrast=contrast, concavity=concavity,
+                  crease=crease, directional_valley=directional_valley,
+                  count=count, seam_count=seam_count, partitions={})
+    _local_face_set_adjacency_cache.clear()
+    _local_face_set_adjacency_cache[key] = cached
     return cached
 
 
-def _local_face_geometry(state, face_index):
-    cached = state["geometry_cache"].get(face_index)
-    if cached is not None:
-        return cached
+def _fill_partition(geometry, strict_mode):
+    """Close short boundary gaps, then assign the band to its nearest core.
 
-    polygon = state["mesh"].polygons[face_index]
-    center = polygon.center.copy()
-    normal = polygon.normal.copy()
-    if normal.length_squared:
-        normal.normalize()
-    else:
-        normal = Vector((0.0, 0.0, 1.0))
-
-    geometry = {
-        "center": center,
-        "normal": normal,
-        "area": max(float(polygon.area), 1.0e-12),
-        "scale": max(math.sqrt(float(polygon.area)), 1.0e-8),
-    }
-    state["geometry_cache"][face_index] = geometry
-    return geometry
-
-
-def _local_face_neighbors(state, face_index):
-    """Yield (neighbor face, shared edge) pairs for edge-connected faces."""
-    adjacency = state["adjacency"]
-    loop_edges = adjacency["loop_edges"]
-    starts = adjacency["face_loop_starts"]
-    totals = adjacency["face_loop_totals"]
-    edge_face_a = adjacency["edge_face_a"]
-    edge_face_b = adjacency["edge_face_b"]
-    non_manifold_faces = adjacency["non_manifold_faces"]
-
-    start = starts[face_index]
-    end = start + totals[face_index]
-    yielded = set()
-
-    for loop_index in range(start, end):
-        edge_index = loop_edges[loop_index]
-        if edge_index < 0 or edge_index >= len(edge_face_a):
-            continue
-
-        neighbors = []
-        first = edge_face_a[edge_index]
-        second = edge_face_b[edge_index]
-        if first == face_index:
-            neighbors.append(second)
-        elif second == face_index:
-            neighbors.append(first)
-
-        for neighbor in non_manifold_faces.get(edge_index, ()):
-            neighbors.append(neighbor)
-
-        for neighbor in neighbors:
-            if neighbor >= 0 and neighbor != face_index and neighbor not in yielded:
-                yielded.add(neighbor)
-                yield neighbor, edge_index
-
-
-def _local_face_edge_direction(state, face_index, edge_index):
-    """Return the current face's oriented direction along a shared edge."""
-    adjacency = state["adjacency"]
-    starts = adjacency["face_loop_starts"]
-    totals = adjacency["face_loop_totals"]
-    loop_edges = adjacency["loop_edges"]
-    loop_vertices = adjacency["loop_vertices"]
-    start = starts[face_index]
-    total = totals[face_index]
-
-    if total <= 0:
-        return None
-
-    mesh = state["mesh"]
-    for offset in range(total):
-        loop_index = start + offset
-        if loop_edges[loop_index] != edge_index:
-            continue
-        next_loop_index = start + ((offset + 1) % total)
-        vertex_a = loop_vertices[loop_index]
-        vertex_b = loop_vertices[next_loop_index]
-        try:
-            direction = mesh.vertices[vertex_b].co - mesh.vertices[vertex_a].co
-        except (IndexError, ReferenceError, RuntimeError):
-            return None
-        if direction.length_squared == 0.0:
-            return None
-        direction.normalize()
-        return direction
-    return None
-
-
-def _local_face_smoothed_normal(state, face_index):
-    """Fast area-weighted, spatially limited smoothing around one face.
-
-    A one-ring edge neighborhood is intentional here.  On an AI-generated
-    high-density mesh, recursively collecting many rings for every traversed
-    face becomes the dominant cost and smooths across the very valleys that
-    are supposed to stop the fill.  The radius still rejects neighbors from a
-    wildly different local scale, while the area weighting suppresses tiny
-    triangle-normal noise.
+    Owners propagate only through the boundary band. They cannot use that
+    band to merge separate smooth cores. Equal-distance ties use face index,
+    independent of the clicked seed or previously painted Face Set values.
     """
-    cached = state["smoothed_normals"].get(face_index)
+    import numpy as np
+    cached = geometry['partitions'].get(bool(strict_mode))
     if cached is not None:
         return cached
+    first, second = geometry['first'], geometry['second']
+    count, hidden = geometry['count'], geometry['hidden']
+    barrier = ((geometry['contrast'] > (0.09 if strict_mode else 0.10))
+               | (geometry['concavity'] > (0.09 if strict_mode else 0.10))
+               | (geometry['directional_valley'] > (0.09 if strict_mode else 0.10))
+               | (geometry['crease'] > math.radians(50 if strict_mode else 65))) & ~hidden
+    band = barrier.copy()
+    # Close passages only near detected shape boundaries; an isolated smooth
+    # narrow strip has no barrier and is therefore not cut just for being thin.
+    for _ in range(1):
+        expanded = band.copy()
+        np.logical_or.at(expanded, first, band[second])
+        np.logical_or.at(expanded, second, band[first])
+        band = expanded
+    core = ~band & ~hidden
+    owner = np.full(count, count, dtype=np.int32)
+    owner[core] = np.flatnonzero(core)
+    # Use physical surface distance instead of polygon-step count. This
+    # reduces tessellation-shaped zigzags without moving any mesh vertices.
+    import heapq
+    offsets, neighbors = geometry['offsets'], geometry['neighbors']
+    lengths = geometry['neighbor_lengths']
+    # Reserve tangent-continuous extensions of each core before sharing the
+    # ambiguous valley band. In particular, a flat base must keep its own
+    # continuation up to the foot; nearest-core distance alone can give that
+    # flat strip to the raised part. Anchoring both normal AND tangent-plane
+    # height to the source prevents walking across a rounded foot in tiny steps.
+    centers, normals = geometry['centers'], geometry['normals']
+    protected = core.copy()
+    extension_distance = np.full(count, np.inf)
+    extension_distance[core] = 0.0
+    extension_owner = owner.copy()
+    normal_limit = math.cos(math.radians(6.0))
 
-    center_geometry = _local_face_geometry(state, face_index)
-    center = center_geometry["center"]
-    base_normal = center_geometry["normal"]
-    radius = max(
-        state["normal_smoothing_radius"],
-        center_geometry["scale"] * 3.0,
-    )
-    radius_squared = radius * radius
-    raw_angle_limit = math.cos(state["normal_raw_angle_limit"])
+    def offer_extension(face, source, distance):
+        if core[face] or hidden[face]:
+            return
+        if float(np.dot(normals[face], normals[source])) < normal_limit:
+            return
+        tolerance = max(float(geometry['scale'][source]) * 0.10, 1.e-12)
+        if abs(float(np.dot(centers[face] - centers[source], normals[source]))) > tolerance:
+            return
+        if (distance < extension_distance[face]
+                or (distance == extension_distance[face] and source < extension_owner[face])):
+            extension_distance[face], extension_owner[face] = distance, source
+            heapq.heappush(extension_heap, (distance, source, face))
 
-    weighted_normal = base_normal * center_geometry["area"]
-    sample_count = 1
-    for neighbor, _edge_index in _local_face_neighbors(state, face_index):
-        if sample_count >= state["normal_sample_limit"]:
+    extension_heap = []
+    rim = np.zeros(count, dtype=bool)
+    rim[first[band[first] & core[second]]] = True
+    rim[second[band[second] & core[first]]] = True
+    for face in np.flatnonzero(rim):
+        for edge in range(offsets[face], offsets[face + 1]):
+            source = int(neighbors[edge])
+            if core[source]:
+                offer_extension(int(face), source, float(lengths[edge]))
+    while extension_heap:
+        distance, source, face = heapq.heappop(extension_heap)
+        if distance != extension_distance[face] or source != extension_owner[face]:
+            continue
+        protected[face] = True
+        for edge in range(offsets[face], offsets[face + 1]):
+            neighbor = int(neighbors[edge])
+            if band[neighbor]:
+                offer_extension(neighbor, source, distance + float(lengths[edge]))
+    owner[protected] = extension_owner[protected]
+    best = np.full(count, np.inf)
+    best[protected] = 0.0
+    fringe = np.zeros(count, dtype=bool)
+    fringe[first[~protected[first] & protected[second]]] = True
+    fringe[second[~protected[second] & protected[first]]] = True
+    heap = []
+    for face in np.flatnonzero(fringe):
+        start, end = offsets[face], offsets[face + 1]
+        for edge in range(start, end):
+            neighbor = int(neighbors[edge])
+            if not protected[neighbor]:
+                continue
+            candidate = float(lengths[edge])
+            source = int(owner[neighbor])
+            if candidate < best[face] or (candidate == best[face] and source < owner[face]):
+                best[face], owner[face] = candidate, source
+        heap.append((float(best[face]), int(owner[face]), int(face)))
+    heapq.heapify(heap)
+    while heap:
+        distance, source, face = heapq.heappop(heap)
+        if distance != best[face] or source != owner[face]:
+            continue
+        for edge in range(offsets[face], offsets[face + 1]):
+            neighbor = int(neighbors[edge])
+            if protected[neighbor] or hidden[neighbor]:
+                continue
+            candidate = distance + float(lengths[edge])
+            if candidate < best[neighbor] or (candidate == best[neighbor] and source < owner[neighbor]):
+                best[neighbor], owner[neighbor] = candidate, source
+                heapq.heappush(heap, (candidate, source, neighbor))
+    cached = dict(core=core, owner=owner, barrier=barrier, band=band, protected=protected)
+    geometry['partitions'][bool(strict_mode)] = cached
+    return cached
+
+
+def _smart_face_set_region(obj, seed_face, strict_mode=False):
+    """Return a complete smooth core and its owned valley/step boundary band."""
+    import numpy as np
+    geometry = _fill_geometry(obj)
+    count = geometry['count']
+    if seed_face < 0 or seed_face >= count or geometry['hidden'][seed_face]:
+        return np.empty(0, dtype=np.int32)
+    partition = _fill_partition(geometry, strict_mode)
+    core, owner = partition['core'], partition['owner']
+    root = int(owner[seed_face])
+    if root == count:
+        # A component consisting entirely of sharp boundary has no smooth
+        # core. Do not guess and fill the whole component.
+        return np.asarray([seed_face], dtype=np.int32)
+    selected = np.zeros(count + 1, dtype=bool)
+    selected[root] = True
+    pending = deque([root])
+    neighbors, offsets = geometry['neighbors'], geometry['offsets']
+    while pending:
+        face = pending.popleft()
+        for neighbor in neighbors[offsets[face]:offsets[face + 1]]:
+            if core[neighbor] and not selected[neighbor]:
+                selected[neighbor] = True
+                pending.append(int(neighbor))
+    region = selected[owner]
+    # Minimize a valley-weighted physical boundary length inside the band.
+    # Strong, broadly supported concave normal changes attract the contour;
+    # length penalizes mesh-scale zigzags. Every sequential flip must lower
+    # that energy. This is a bounded local relaxation, not a global graph cut.
+    # Cores stay fixed, so another part's interior cannot be absorbed.
+    first, second = geometry['first'], geometry['second']
+    relaxed = region.copy()
+    editable = partition['band'] & ~partition['protected'] & (owner < count)
+    weights = geometry['contour_cost']
+    for iteration in range(6):
+        crossing = relaxed[first] != relaxed[second]
+        fringe = np.unique(np.r_[first[crossing], second[crossing]])
+        fringe = fringe[editable[fringe]]
+        if iteration % 2:
+            fringe = fringe[::-1]
+        changed = False
+        for face in fringe:
+            if face == seed_face:
+                continue
+            start, end = offsets[face], offsets[face + 1]
+            linked = neighbors[start:end]
+            costs = weights[start:end]
+            old_cost = float(costs[relaxed[linked] != relaxed[face]].sum())
+            new_cost = float(costs[relaxed[linked] == relaxed[face]].sum())
+            if new_cost < old_cost - max(old_cost, new_cost, 1.e-20) * 1.e-8:
+                relaxed[face] = not relaxed[face]
+                changed = True
+        if not changed:
             break
-        geometry = _local_face_geometry(state, neighbor)
-        offset = geometry["center"] - center
-        if offset.length_squared > radius_squared:
-            continue
-        if base_normal.dot(geometry["normal"]) < raw_angle_limit:
-            continue
-        distance = math.sqrt(max(offset.length_squared, 0.0))
-        falloff = 1.0 / (1.0 + distance / max(radius, 1.0e-8))
-        weighted_normal += geometry["normal"] * max(
-            geometry["area"] * falloff,
-            1.0e-12,
-        )
-        sample_count += 1
-
-    if weighted_normal.length_squared == 0.0:
-        weighted_normal = base_normal.copy()
-    else:
-        weighted_normal.normalize()
-
-    state["smoothed_normals"][face_index] = weighted_normal
-    return weighted_normal
-
-
-def _local_face_transition_cost(state, face_index, neighbor, edge_index):
-    """Return a local shape transition cost for bottleneck region growing."""
-    cache_key = (face_index, neighbor, edge_index)
-    cached = state["transition_cache"].get(cache_key)
-    if cached is not None:
-        return cached
-
-    current_geometry = _local_face_geometry(state, face_index)
-    neighbor_geometry = _local_face_geometry(state, neighbor)
-    current_normal = _local_face_smoothed_normal(state, face_index)
-    neighbor_normal = _local_face_smoothed_normal(state, neighbor)
-    dot_normal = max(-1.0, min(1.0, current_normal.dot(neighbor_normal)))
-    normal_angle = math.acos(dot_normal)
-    normal_cost = min(
-        normal_angle / state["normal_angle_limit"],
-        2.0,
-    ) * state["normal_variation_weight"]
-
-    raw_dot = max(
-        -1.0,
-        min(1.0, current_geometry["normal"].dot(neighbor_geometry["normal"])),
-    )
-    raw_angle = math.acos(raw_dot)
-    raw_edge_cost = min(
-        raw_angle / state["raw_edge_angle_limit"],
-        2.0,
-    ) * state["raw_edge_weight"]
-
-    concavity = 0.0
-    edge_direction = _local_face_edge_direction(state, face_index, edge_index)
-    if edge_direction is not None:
-        # Use raw normals for the sign so a smoothed normal cannot erase the
-        # narrow concave valley that should separate adjacent hair bundles.
-        turn = current_geometry["normal"].cross(
-            neighbor_geometry["normal"]
-        ).dot(edge_direction)
-        concavity = max(0.0, min(1.0, (-turn - 0.15) / 0.65))
-
-    cost = normal_cost + raw_edge_cost + (
-        concavity * state["concavity_penalty"]
-    )
-    state["transition_cache"][cache_key] = cost
-    return cost
+    if relaxed[seed_face]:
+        # Discard detached tips created by the contour relaxation. If it
+        # would disconnect the clicked face, retain the unsmoothed region.
+        connected = np.zeros(count, dtype=bool)
+        connected[root] = True
+        pending = deque([root])
+        while pending:
+            face = pending.popleft()
+            for neighbor in neighbors[offsets[face]:offsets[face + 1]]:
+                if relaxed[neighbor] and not connected[neighbor]:
+                    connected[neighbor] = True
+                    pending.append(int(neighbor))
+        if connected[seed_face]:
+            region = connected
+    return np.flatnonzero(region).astype(np.int32)
 
 
 def _smart_face_set_fill(context, coord, strict_mode=False):
-    """Find and apply one geometry-aware Face Set region."""
+    """Find the region before making one undoable Face Set write."""
+    import numpy as np
     hit = _raycast_sculpt_face_set(context, coord)
     if hit is None:
         return None
-
     obj, seed_face, seed_face_set, _seed_location, _screen_position = hit
-    mesh = obj.data
-    face_set_attr = mesh.attributes.get(".sculpt_face_set")
-    if face_set_attr is None or face_set_attr.domain != "FACE":
-        return None
+    attr = obj.data.attributes.get('.sculpt_face_set')
+    candidates = _smart_face_set_region(obj, seed_face, strict_mode)
+    values = np.empty(len(attr.data), dtype=np.int32)
+    attr.data.foreach_get('value', values)
+    changed = int(np.count_nonzero(values[candidates] != seed_face_set))
+    if changed:
+        values[candidates] = seed_face_set
+        attr.data.foreach_set('value', values)
+        obj.data.update()
+    return len(candidates), changed
 
-    if strict_mode:
-        parameters = {
-            "normal_smoothing_radius_factor": SMART_FACE_SET_FILL_STRICT_NORMAL_SMOOTH_RADIUS_FACTOR,
-            "normal_variation_weight": SMART_FACE_SET_FILL_STRICT_NORMAL_VARIATION_WEIGHT,
-            "normal_angle_limit": SMART_FACE_SET_FILL_STRICT_NORMAL_ANGLE_LIMIT,
-            "normal_raw_angle_limit": SMART_FACE_SET_FILL_STRICT_NORMAL_RAW_ANGLE_LIMIT,
-            "normal_sample_limit": SMART_FACE_SET_FILL_NORMAL_SAMPLE_LIMIT,
-            "raw_edge_weight": SMART_FACE_SET_FILL_STRICT_RAW_EDGE_WEIGHT,
-            "raw_edge_angle_limit": SMART_FACE_SET_FILL_STRICT_RAW_EDGE_ANGLE_LIMIT,
-            "concavity_penalty": SMART_FACE_SET_FILL_STRICT_CONCAVITY_PENALTY,
-            "acceptance_threshold": SMART_FACE_SET_FILL_STRICT_ACCEPTANCE_THRESHOLD,
-            "max_faces": SMART_FACE_SET_FILL_MAX_FACES,
-            "max_geodesic_scale": SMART_FACE_SET_FILL_STRICT_MAX_GEODESIC_SCALE,
-            "max_geodesic_factor": SMART_FACE_SET_FILL_STRICT_MAX_GEODESIC_FACTOR,
-            "min_geodesic_factor": SMART_FACE_SET_FILL_STRICT_MIN_GEODESIC_FACTOR,
-        }
-    else:
-        parameters = {
-            "normal_smoothing_radius_factor": SMART_FACE_SET_FILL_NORMAL_SMOOTH_RADIUS_FACTOR,
-            "normal_variation_weight": SMART_FACE_SET_FILL_NORMAL_VARIATION_WEIGHT,
-            "normal_angle_limit": SMART_FACE_SET_FILL_NORMAL_ANGLE_LIMIT,
-            "normal_raw_angle_limit": SMART_FACE_SET_FILL_NORMAL_RAW_ANGLE_LIMIT,
-            "normal_sample_limit": SMART_FACE_SET_FILL_NORMAL_SAMPLE_LIMIT,
-            "raw_edge_weight": SMART_FACE_SET_FILL_RAW_EDGE_WEIGHT,
-            "raw_edge_angle_limit": SMART_FACE_SET_FILL_RAW_EDGE_ANGLE_LIMIT,
-            "concavity_penalty": SMART_FACE_SET_FILL_CONCAVITY_PENALTY,
-            "acceptance_threshold": SMART_FACE_SET_FILL_ACCEPTANCE_THRESHOLD,
-            "max_faces": SMART_FACE_SET_FILL_MAX_FACES,
-            "max_geodesic_scale": SMART_FACE_SET_FILL_MAX_GEODESIC_SCALE,
-            "max_geodesic_factor": SMART_FACE_SET_FILL_MAX_GEODESIC_FACTOR,
-            "min_geodesic_factor": SMART_FACE_SET_FILL_MIN_GEODESIC_FACTOR,
-        }
-
-    state = {
-        "object": obj,
-        "mesh": mesh,
-        "adjacency": _get_cached_local_face_set_adjacency(mesh),
-        "geometry_cache": {},
-        "smoothed_normals": {},
-        "transition_cache": {},
-        "strict_mode": bool(strict_mode),
-        **parameters,
-    }
-
-    seed_geometry = _local_face_geometry(state, seed_face)
-    seed_scale = seed_geometry["scale"]
-    state["normal_smoothing_radius"] = max(
-        seed_scale * state["normal_smoothing_radius_factor"],
-        1.0e-8,
-    )
-    object_diagonal = max(Vector(obj.dimensions).length, 1.0e-8)
-    state["max_geodesic_distance"] = max(
-        object_diagonal * state["min_geodesic_factor"],
-        min(
-            seed_scale * state["max_geodesic_scale"],
-            object_diagonal * state["max_geodesic_factor"],
-        ),
-    )
-
-    best_cost = {seed_face: 0.0}
-    best_distance = {seed_face: 0.0}
-    heap = [(0.0, 0.0, seed_face)]
-    candidates = set()
-
-    while heap and len(candidates) < state["max_faces"]:
-        path_cost, path_distance, face_index = heapq.heappop(heap)
-        known_cost = best_cost.get(face_index, float("inf"))
-        known_distance = best_distance.get(face_index, float("inf"))
-        if path_cost > known_cost + 1.0e-9:
-            continue
-        if (
-            abs(path_cost - known_cost) <= 1.0e-9
-            and path_distance > known_distance + 1.0e-9
-        ):
-            continue
-
-        candidates.add(face_index)
-        current_geometry = _local_face_geometry(state, face_index)
-
-        for neighbor, edge_index in _local_face_neighbors(state, face_index):
-            neighbor_geometry = _local_face_geometry(state, neighbor)
-            step_distance = (
-                neighbor_geometry["center"] - current_geometry["center"]
-            ).length
-            next_distance = path_distance + step_distance
-            if next_distance > state["max_geodesic_distance"]:
-                continue
-
-            transition_cost = _local_face_transition_cost(
-                state,
-                face_index,
-                neighbor,
-                edge_index,
-            )
-            next_cost = max(path_cost, transition_cost)
-            if next_cost > state["acceptance_threshold"]:
-                continue
-
-            previous_cost = best_cost.get(neighbor, float("inf"))
-            previous_distance = best_distance.get(neighbor, float("inf"))
-            if (
-                next_cost < previous_cost - 1.0e-9
-                or (
-                    abs(next_cost - previous_cost) <= 1.0e-9
-                    and next_distance < previous_distance
-                )
-            ):
-                best_cost[neighbor] = next_cost
-                best_distance[neighbor] = next_distance
-                heapq.heappush(heap, (next_cost, next_distance, neighbor))
-
-    changed_faces = 0
-    for face_index in candidates:
-        if face_set_attr.data[face_index].value != seed_face_set:
-            face_set_attr.data[face_index].value = seed_face_set
-            changed_faces += 1
-
-    if changed_faces:
-        mesh.update()
-    return len(candidates), changed_faces
 
 
 class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
@@ -6802,7 +6742,7 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
         self.mouse_region_x = int(mouse_x)
         self.mouse_region_y = int(mouse_y)
         self.strict_mode = bool(
-            self.strict_mode or getattr(event, "shift", False)
+            self.strict_mode or getattr(event, "ctrl", False)
         )
         return self.execute(context)
 
@@ -6921,7 +6861,7 @@ def _rebuild_keymaps():
             LOCAL_FACE_SET_GROW_OPERATOR_ID,
             LOCAL_FACE_SET_GROW_KEY,
             "PRESS",
-            shift=True,
+            ctrl=True,
         )
         strict_grow_item.properties.strict_mode = True
         _addon_keymaps.append((keymap, strict_grow_item))

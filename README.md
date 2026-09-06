@@ -28,7 +28,7 @@ Reference Object は、リトポロジー対象のハイポリメッシュです
 | 通常 MFO ON/OFF | 設定キーを短時間に2回押す |
 | Face Set MFO ON/OFF | `Ctrl` を押しながら設定キーを短時間に2回押す |
 | Smart Face Set Fill | Sculpt Mode で `E` |
-| Smart Face Set Fill 厳格モード | Sculpt Mode で `Shift + E` |
+| Smart Face Set Fill 厳格モード | Sculpt Mode で `Ctrl + E` |
 
 通常 MFO と FSMFO は別の KeyMap Item から直接起動します。FSMFO は外側の非 Undo Trigger を経由せず、Undo 対象の Activation Operator が直接起動し、その中から非 Undo Watcher を開始します。
 
@@ -99,13 +99,16 @@ Sculpt Mode でカーソルを Face Set 上へ置き、`E` を押すと一発適
 
 - カーソル直下の Face を seed にする
 - seed と同じ既存 Face Set ID を使用する
-- 共有 Edge だけを辿る
-- 面積重み付きの平滑化法線で細かい normal ノイズを抑える
-- raw dihedral と凹面ペナルティで髪束間の谷を越えにくくする
-- bottleneck 型の遷移コストで、長く滑らかな髪束を優先する
+- 共有 Edge と、両端点・向きが一致する未結合の継ぎ目を辿る（メッシュは結合しない）
+- 平滑化した法線と複数の範囲の曲率から、段差・谷の境界を検出する
+- 凸の頂上は通過し、方向別の凹み判定で付け根の谷を検出する。境界は1近傍分広げる
+- 滑らかな領域を取得し、境界の帯は近い領域へ割り当てる。帯から別領域へ再拡張しない
+- 非表示面・非多様体エッジは横断しない。距離・10万面による打ち切りは行わない
 - 対象 Face に既存の seed Face Set ID を直接書き込む
 
-`Shift + E` は厳格モードです。通常モードより短い探索範囲と厳しい境界判定を使います。結果が気に入らない場合は、通常の `Ctrl + Z` で操作全体を1ステップ戻してください。
+`Ctrl + E` は厳格モードです。探索範囲は通常モードと同じで、境界判定だけを厳しくします。結果が気に入らない場合は、通常の `Ctrl + Z` で操作全体を1ステップ戻してください。
+
+Blender同梱のNumPyを使用します。大規模メッシュでは初回の形状解析に時間がかかります。形状が同じ間は解析結果を再利用し、Sculpt・Undo・接続変更・非表示変更後は再計算します。まず面の向きと接平面からの高さが連続する部分を元の領域へ確保し、盛り上がりが平面側へ侵食するのを抑えます。残る境界帯の所属は面に沿った実距離で決め、その帯の中だけで、広く平滑化した谷の強さと境界の実際の長さを使って線を整えます。画面の明るさは参照せず、視点や照明を変えても同じ境界を使います。メッシュの座標は変更しません。広い途切れや形状上区別できない境界は越える可能性があり、滑らかな領域が全くない部分はクリック面だけを対象にします。
 
 この機能は Sculpt Mode 専用です。`bpy.ops.sculpt.expand()`、Sculpt Mask、GPU Preview、Timer、Face Set の新規 ID 生成は使用しません。
 
@@ -164,7 +167,7 @@ The default Activation Key is `Right Shift`.
 | Normal MFO ON/OFF | Double-tap the configured key |
 | Face Set MFO ON/OFF | Hold `Ctrl` and double-tap the configured key |
 | Smart Face Set Fill | `E` in Sculpt Mode |
-| Strict Smart Face Set Fill | `Shift + E` in Sculpt Mode |
+| Strict Smart Face Set Fill | `Ctrl + E` in Sculpt Mode |
 
 Normal MFO and FSMFO use separate KeyMap Items. FSMFO is started directly by its Undo-enabled Activation Operator; it does not pass through an outer non-Undo trigger. The Activation Operator starts the non-Undo Watcher and then finishes.
 
@@ -235,13 +238,16 @@ The algorithm:
 
 - Uses the face under the cursor as the seed
 - Reuses the seed's existing Face Set ID
-- Traverses only edge-connected faces
-- Smooths local normals with area weighting to reduce dense-mesh noise
-- Uses raw dihedral and concavity penalties to resist valleys between hair bundles
-- Uses a bottleneck-style transition cost to favor long, smooth bundles
+- Traverses shared edges and matching unwelded seams without modifying topology
+- Detects steps and valleys using smoothed normals and curvature at multiple scales
+- Traverses convex crests, detects concave feet with directional curvature, and expands the boundary by one adjacency step
+- Finds the smooth core, then assigns boundary faces to the nearest core without merging cores
+- Respects hidden faces and non-manifold boundaries, with no distance or 100,000-face cutoff
 - Writes the existing seed Face Set ID directly to the accepted faces
 
-`Shift + E` enables Strict Mode with a shorter search range and stricter boundary decisions. Use normal Blender `Ctrl + Z` to undo the complete operation in one step.
+`Ctrl + E` enables Strict Mode with the same search extent and stricter boundary decisions. Use normal Blender `Ctrl + Z` to undo the complete operation in one step.
+
+Uses Blender's bundled NumPy. Initial analysis of large meshes can take several seconds; geometry results are reused until coordinates, topology, transforms or visibility change. Tangent-continuous core extensions are reserved first, using both source-anchored normal and plane-height tolerances; these extensions cannot be reassigned by contour smoothing. This keeps the flat base beyond a raised foot on the base side. Remaining boundary ownership uses physical surface distance, followed by up to six local contour-relaxation sweeps restricted to the boundary band. The energy combines physical boundary length with broadly smoothed concave normal changes; it does not sample screen brightness and is independent of view and lighting. Mesh coordinates are unchanged. Wide gaps or geometrically indistinguishable boundaries can still leak. Components with no smooth core fall back to the clicked face.
 
 This feature is Sculpt Mode only. It does not use `bpy.ops.sculpt.expand()`, Sculpt Mask, GPU preview, Timer-driven interaction, or newly generated Face Set IDs.
 
