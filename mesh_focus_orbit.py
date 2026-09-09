@@ -9,10 +9,10 @@ rotating the view.
 bl_info = {
     "name": "Mesh Focus Orbit",
     "author": "OpenAI",
-    "version": (3, 2, 3),
+    "version": (3, 2, 12),
     "blender": (5, 2, 0),
     "location": "3D View",
-    "description": "Temporary mesh-centered orbit and one-click Smart Face Set Fill",
+    "description": "Temporary mesh-centered orbit and local Smart Face Set Fill preview",
     "category": "3D View",
 }
 
@@ -46,6 +46,17 @@ WATCHER_OPERATOR_ID = "view3d.mesh_focus_orbit_watcher"
 RECOVER_FACE_SET_STATE_OPERATOR_ID = "view3d.mesh_focus_orbit_recover_face_set_state"
 LOCAL_FACE_SET_GROW_OPERATOR_ID = "view3d.mesh_focus_local_face_set_grow_v2"
 LOCAL_FACE_SET_GROW_KEY = "E"
+TOPOLOGY_COLOR_ASSIGN_OPERATOR_ID = "view3d.mesh_focus_topology_color_assign"
+TOPOLOGY_COLOR_ATTRIBUTE_NAME = "mfo_topology_color"
+TOPOLOGY_COLOR_PANEL_CATEGORY = "MFO"
+TOPOLOGY_COLOR_PALETTE = (
+    (0.93, 0.20, 0.20),
+    (0.98, 0.57, 0.12),
+    (0.95, 0.88, 0.10),
+    (0.22, 0.80, 0.34),
+    (0.16, 0.65, 0.96),
+    (0.65, 0.32, 0.94),
+)
 
 _addon_keymaps = []
 _active_states = {}
@@ -58,6 +69,12 @@ _last_undo_post_perf = None
 _retopo_undo_retry_pending = False
 _retopo_undo_tombstones = {}
 _local_face_set_adjacency_cache = {}
+_fill_preview_adjacency_cache = {}
+_fill_preview_cursor_cache = {}
+_fill_preview_state = None
+_fill_preview_draw_handler = None
+_fill_preview_text_draw_handler = None
+_fill_preview_shader = None
 _is_registered = False
 _polyquilt_qsnap_class = None
 _polyquilt_qsnap_original_snap_objects = None
@@ -89,6 +106,63 @@ _retopoflow_translate_preview_filter = None
 _retopoflow_translate_preview_session_id = None
 _retopoflow_translate_preview_retopo_session_id = None
 _retopo_isolation_serial = 0
+
+# Topology-color drawing owns no BMesh elements.  Cache entries contain only
+# copied world-space coordinates, so Undo, file load, and mode changes can
+# invalidate them without retaining a stale Edit BMesh.
+_topology_color_draw_handler = None
+_topology_color_cache = {}
+_topology_color_cache_dirty = set()
+_topology_color_depth_shader_cache = None
+_topology_color_fallback_shader = None
+
+_TOPOLOGY_COLOR_DEPTH_VERTEX_SOURCE = """
+void main()
+{
+    vec4 clip = ModelViewProjectionMatrix * vec4(pos, 1.0);
+    clip.z -= depth_bias * clip.w;
+    gl_Position = clip;
+}
+"""
+
+_TOPOLOGY_COLOR_DEPTH_FRAGMENT_SOURCE = """
+void main()
+{
+    fragColor = color;
+}
+"""
+
+# ``importlib.reload`` replaces these functions while Blender keeps handler
+# objects from the previous module instance.  Remove only our old handlers so
+# reload never doubles the draw/update callbacks.
+_TOPOLOGY_COLOR_HANDLER_NAMES = {
+    "_on_topology_color_depsgraph_update",
+    "_on_topology_color_undo_post",
+    "_on_topology_color_redo_post",
+    "_on_topology_color_load_pre",
+    "_on_topology_color_load_post",
+}
+_FILL_PREVIEW_HANDLER_NAMES = {
+    "_on_fill_preview_depsgraph_update",
+}
+for _handler_list_name in (
+    "depsgraph_update_post",
+    "undo_post",
+    "redo_post",
+    "load_pre",
+    "load_post",
+):
+    try:
+        _handler_list = getattr(bpy.app.handlers, _handler_list_name)
+        for _old_handler in list(_handler_list):
+            if (
+                getattr(_old_handler, "__name__", "") in _TOPOLOGY_COLOR_HANDLER_NAMES
+                or getattr(_old_handler, "__name__", "") in _FILL_PREVIEW_HANDLER_NAMES
+            ):
+                _handler_list.remove(_old_handler)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        pass
+del _handler_list_name
 _RETOPO_DEBUG_LOG_PATH = os.path.join(
     tempfile.gettempdir(),
     "mesh_focus_orbit_debug.jsonl",
@@ -260,6 +334,52 @@ def _tag_redraw(area):
             area.tag_redraw()
     except (ReferenceError, AttributeError, TypeError):
         pass
+
+
+def _topology_color_tag_redraw_all():
+    """Redraw every visible 3D View without requiring a context override."""
+    try:
+        for window in bpy.context.window_manager.windows:
+            screen = window.screen
+            for area in screen.areas:
+                if area.type == "VIEW_3D":
+                    area.tag_redraw()
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        pass
+
+
+def _invalidate_topology_color_cache(obj=None):
+    """Invalidate copied overlay geometry, never retaining BMesh elements."""
+    if obj is None:
+        # Clearing is both cheaper and safer than a process-wide dirty marker:
+        # the next viewport rebuilds only the active Edit Mesh.
+        _topology_color_cache.clear()
+        _topology_color_cache_dirty.clear()
+    else:
+        try:
+            _topology_color_cache_dirty.add(int(obj.as_pointer()))
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            _topology_color_cache.clear()
+            _topology_color_cache_dirty.clear()
+    _topology_color_tag_redraw_all()
+
+
+def _topology_color_object(context):
+    """Return the active edit mesh used by the overlay and operators."""
+    try:
+        obj = context.edit_object
+    except (AttributeError, ReferenceError, RuntimeError):
+        obj = None
+    if obj is None:
+        try:
+            obj = context.active_object
+        except (AttributeError, ReferenceError, RuntimeError):
+            obj = None
+    if obj is None or getattr(obj, "type", None) != "MESH":
+        return None
+    if getattr(context, "mode", None) != "EDIT_MESH":
+        return None
+    return obj
 
 
 def _next_session_id():
@@ -5158,6 +5278,383 @@ def _is_live_active_state(state):
         return False
 
 
+def _topology_color_matrix_key(obj):
+    try:
+        return tuple(
+            float(value)
+            for row in obj.matrix_world
+            for value in row
+        )
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _topology_color_overlay_offset():
+    """Return the current RetopoFlow depth setting without moving vertices."""
+    try:
+        overlay = getattr(bpy.context.space_data, "overlay", None)
+        if overlay is None or not bool(
+            getattr(overlay, "show_retopology", False)
+        ):
+            return 0.0
+        return max(
+            0.0,
+            float(getattr(overlay, "retopology_offset", 0.0)),
+        )
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return 0.0
+
+
+def _topology_color_depth_bias(overlay_offset):
+    """Map Blender's overlay setting to a small clip-space depth bias."""
+    try:
+        configured = max(0.0, float(overlay_offset))
+    except (TypeError, ValueError):
+        configured = 0.0
+    # Keep the same shared vertex positions for every face.  The configured
+    # retopology offset is a display-depth hint, so apply it in clip space and
+    # preserve clip X/Y/W rather than translating each face along its normal.
+    return max(1.0e-5, min(2.0e-2, configured + 1.0e-3))
+
+
+def _topology_color_depth_shader():
+    """Create one cached shader that biases only clip-space Z."""
+    global _topology_color_depth_shader_cache
+    if _topology_color_depth_shader_cache is not None:
+        return _topology_color_depth_shader_cache
+    try:
+        from gpu.types import GPUShaderCreateInfo
+
+        info = GPUShaderCreateInfo()
+        info.push_constant("MAT4", "ModelViewProjectionMatrix")
+        info.push_constant("FLOAT", "depth_bias")
+        info.push_constant("VEC4", "color")
+        info.vertex_in(0, "VEC3", "pos")
+        info.fragment_out(0, "VEC4", "fragColor")
+        info.vertex_source(_TOPOLOGY_COLOR_DEPTH_VERTEX_SOURCE)
+        info.fragment_source(_TOPOLOGY_COLOR_DEPTH_FRAGMENT_SOURCE)
+        _topology_color_depth_shader_cache = gpu.shader.create_from_info(info)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        _topology_color_depth_shader_cache = None
+    return _topology_color_depth_shader_cache
+
+
+def _topology_color_draw_shader():
+    """Return the clip-depth shader, with a cached built-in fallback."""
+    global _topology_color_fallback_shader
+    depth_shader = _topology_color_depth_shader()
+    if depth_shader is not None:
+        return depth_shader, True
+    try:
+        if _topology_color_fallback_shader is None:
+            _topology_color_fallback_shader = gpu.shader.from_builtin(
+                "UNIFORM_COLOR"
+            )
+        return _topology_color_fallback_shader, False
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None, False
+
+
+def _topology_color_batch(shader, primitive, vertices, custom_shader):
+    """Build a batch for either the custom or built-in shader path."""
+    if not custom_shader:
+        return batch_for_shader(shader, primitive, {"pos": vertices})
+    fmt = gpu.types.GPUVertFormat()
+    fmt.attr_add(
+        id="pos",
+        comp_type="F32",
+        len=3,
+        fetch_mode="FLOAT",
+    )
+    vertex_buffer = gpu.types.GPUVertBuf(
+        len=len(vertices),
+        format=fmt,
+    )
+    vertex_buffer.attr_fill(id="pos", data=vertices)
+    return gpu.types.GPUBatch(type=primitive, buf=vertex_buffer)
+
+
+def _build_topology_color_cache(obj, overlay_offset=None):
+    """Copy only visible colored Edit BMesh faces into draw-ready buffers."""
+    cache = {
+        "object_pointer": 0,
+        "mesh_pointer": 0,
+        "matrix_key": None,
+        "overlay_offset": 0.0,
+        "face_count": 0,
+        "vert_count": 0,
+        "triangles": {index: [] for index in range(1, 7)},
+        "wire": [],
+        "gpu_batches": None,
+        "gpu_wire_batch": None,
+        "gpu_shader": None,
+    }
+    try:
+        bm = bmesh.from_edit_mesh(obj.data)
+        layer = bm.faces.layers.int.get(TOPOLOGY_COLOR_ATTRIBUTE_NAME)
+        cache["object_pointer"] = int(obj.as_pointer())
+        cache["mesh_pointer"] = int(obj.data.as_pointer())
+        cache["matrix_key"] = _topology_color_matrix_key(obj)
+        cache["overlay_offset"] = (
+            _topology_color_overlay_offset()
+            if overlay_offset is None
+            else float(overlay_offset)
+        )
+        cache["face_count"] = len(bm.faces)
+        cache["vert_count"] = len(bm.verts)
+        if layer is None:
+            return cache
+
+        matrix = obj.matrix_world
+        seen_edges = set()
+        for face in bm.faces:
+            if face.hide:
+                continue
+            try:
+                color_index = int(face[layer])
+            except (ReferenceError, RuntimeError, TypeError, ValueError):
+                continue
+            if color_index < 1 or color_index > 6:
+                continue
+
+            # ``BMFace.calc_tessellation`` returns BMVerts on Blender 5.2.
+            # Keep a fallback for polygon APIs that return plain Vectors.
+            try:
+                tessellation = face.calc_tessellation()
+                tessellation_vertices = None
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                tessellation_vertices = [
+                    vertex.co.copy()
+                    for vertex in face.verts
+                ]
+                tessellation = tessellate_polygon(
+                    [tessellation_vertices]
+                )
+            for triangle in tessellation:
+                if len(triangle) != 3:
+                    continue
+                triangle_points = []
+                for vertex in triangle:
+                    if (
+                        tessellation_vertices is not None
+                        and isinstance(vertex, int)
+                    ):
+                        coordinate = tessellation_vertices[vertex]
+                    else:
+                        coordinate = getattr(vertex, "co", vertex)
+                    triangle_points.append(tuple(matrix @ coordinate))
+                cache["triangles"][color_index].extend(triangle_points)
+
+            for edge in face.edges:
+                try:
+                    edge_index = int(edge.index)
+                except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+                    edge_index = -1
+                if edge_index >= 0:
+                    edge_key = ("index", edge_index)
+                else:
+                    fallback_vertices = []
+                    for vertex in edge.verts:
+                        try:
+                            vertex_index = int(vertex.index)
+                        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+                            vertex_index = -1
+                        if vertex_index >= 0:
+                            fallback_vertices.append(("index", vertex_index))
+                        else:
+                            # ``id(BMVert)`` is stable for this one build and
+                            # avoids collapsing every unindexed edge together.
+                            fallback_vertices.append(("identity", id(vertex)))
+                    edge_key = (
+                        "verts",
+                        tuple(sorted(fallback_vertices, key=repr)),
+                    )
+                if edge_key in seen_edges:
+                    continue
+                seen_edges.add(edge_key)
+                first, second = edge.verts
+                line = (
+                    tuple(matrix @ first.co),
+                    tuple(matrix @ second.co),
+                )
+                cache["wire"].extend(line)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        # A mode switch or Undo can invalidate the Edit BMesh between the draw
+        # callback and this read.  The next redraw will retry from scratch.
+        return cache
+    return cache
+
+
+def _topology_color_cache_for(obj):
+    try:
+        object_pointer = int(obj.as_pointer())
+        mesh_pointer = int(obj.data.as_pointer())
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+    cache = _topology_color_cache.get(object_pointer)
+    matrix_key = _topology_color_matrix_key(obj)
+    overlay_offset = _topology_color_overlay_offset()
+    stale = (
+        cache is None
+        or object_pointer in _topology_color_cache_dirty
+        or cache.get("mesh_pointer") != mesh_pointer
+        or cache.get("matrix_key") != matrix_key
+        or cache.get("overlay_offset") != overlay_offset
+    )
+    if stale:
+        cache = _build_topology_color_cache(obj, overlay_offset)
+        _topology_color_cache[object_pointer] = cache
+        _topology_color_cache_dirty.discard(object_pointer)
+    return cache
+
+
+def _draw_topology_colors():
+    """Draw translucent face colors for the active Edit Mesh only."""
+    prefs = _addon_preferences()
+    if prefs is not None:
+        if not prefs.enabled or not prefs.topology_colors_enabled:
+            return
+    try:
+        context = bpy.context
+        if (
+            context.area is None
+            or context.area.type != "VIEW_3D"
+            or context.region is None
+            or context.region.type != "WINDOW"
+        ):
+            return
+        overlay = getattr(context.space_data, "overlay", None)
+        if overlay is not None and not bool(
+            getattr(overlay, "show_overlays", True)
+        ):
+            return
+        obj = _topology_color_object(context)
+        if obj is None:
+            return
+        cache = _topology_color_cache_for(obj)
+        if cache is None:
+            return
+        opacity = float(prefs.topology_color_opacity) if prefs else 0.35
+        opacity = max(0.0, min(1.0, opacity))
+        shader, uses_depth_bias = _topology_color_draw_shader()
+        if shader is None:
+            return
+        depth_bias = _topology_color_depth_bias(cache.get("overlay_offset", 0.0))
+        depth_set = False
+        depth_mask_changed = False
+        gpu.state.blend_set("ALPHA")
+        try:
+            try:
+                gpu.state.depth_test_set("LESS_EQUAL")
+                depth_set = True
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                pass
+            try:
+                gpu.state.depth_mask_set(False)
+                depth_mask_changed = True
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                pass
+            if uses_depth_bias:
+                shader.bind()
+                shader.uniform_float(
+                    "ModelViewProjectionMatrix",
+                    gpu.matrix.get_projection_matrix()
+                    @ gpu.matrix.get_model_view_matrix(),
+                )
+                shader.uniform_float("depth_bias", depth_bias)
+            gpu_batches = cache.get("gpu_batches")
+            if cache.get("gpu_shader") is not shader:
+                gpu_batches = None
+                cache["gpu_wire_batch"] = None
+                cache["gpu_shader"] = shader
+            if gpu_batches is None:
+                gpu_batches = {
+                    color_index: _topology_color_batch(
+                        shader,
+                        "TRIS",
+                        vertices,
+                        uses_depth_bias,
+                    )
+                    for color_index, vertices in cache["triangles"].items()
+                    if vertices
+                }
+                cache["gpu_batches"] = gpu_batches
+            for color_index, vertices in cache["triangles"].items():
+                if not vertices:
+                    continue
+                batch = gpu_batches[color_index]
+                shader.bind()
+                shader.uniform_float(
+                    "color",
+                    (*TOPOLOGY_COLOR_PALETTE[color_index - 1], opacity),
+                )
+                batch.draw(shader)
+
+            if cache["wire"]:
+                wire_batch = cache.get("gpu_wire_batch")
+                if wire_batch is None:
+                    wire_batch = _topology_color_batch(
+                        shader,
+                        "LINES",
+                        cache["wire"],
+                        uses_depth_bias,
+                    )
+                    cache["gpu_wire_batch"] = wire_batch
+                shader.bind()
+                shader.uniform_float("color", (0.01, 0.01, 0.01, 0.45))
+                wire_batch.draw(shader)
+        finally:
+            if depth_mask_changed:
+                try:
+                    gpu.state.depth_mask_set(True)
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    pass
+            if depth_set:
+                try:
+                    gpu.state.depth_test_set("NONE")
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    pass
+            try:
+                gpu.state.line_width_set(1.0)
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                pass
+            gpu.state.blend_set("NONE")
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        # Drawing is optional and must never interrupt RF4 or viewport input.
+        pass
+
+
+def _start_topology_color_draw():
+    global _topology_color_draw_handler
+    if _topology_color_draw_handler is not None:
+        return
+    try:
+        _topology_color_draw_handler = bpy.types.SpaceView3D.draw_handler_add(
+            _draw_topology_colors,
+            (),
+            "WINDOW",
+            "POST_VIEW",
+        )
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        _topology_color_draw_handler = None
+
+
+def _stop_topology_color_draw():
+    global _topology_color_draw_handler
+    if _topology_color_draw_handler is None:
+        return
+    try:
+        bpy.types.SpaceView3D.draw_handler_remove(
+            _topology_color_draw_handler,
+            "WINDOW",
+        )
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        pass
+    _topology_color_draw_handler = None
+    _topology_color_cache.clear()
+    _topology_color_cache_dirty.clear()
+
+
 def _draw_debug_point(state):
     if not _is_live_active_state(state):
         return
@@ -5543,6 +6040,7 @@ def _finish_state(state, restore_retopo=True):
 
 
 def _finish_all_states():
+    _fill_preview_cancel(reason="finish-all")
     for key, state in list(_active_states.items()):
         _finish_state(state)
         _active_states.pop(key, None)
@@ -5919,6 +6417,7 @@ def _cancel_undo_orphan_cleanup():
 def _on_undo_post(_dummy):
     """Queue ownership-safe cleanup after native Undo has rebuilt the scene."""
     global _last_undo_post_perf
+    _fill_preview_cancel(reason="undo")
     if not _undo_orphan_cleanup_pending:
         _last_undo_post_perf = time.perf_counter()
     _retopo_debug_emit(
@@ -5935,16 +6434,64 @@ def _on_undo_post(_dummy):
 @persistent
 def _on_load_pre(_dummy):
     """Clear viewport-bound state before Blender replaces the current file."""
+    _fill_preview_cancel(reason="load")
     _finish_all_states()
     _cleanup_orphan_face_set_proxies()
     _retopo_undo_tombstones.clear()
     _local_face_set_adjacency_cache.clear()
+    _fill_preview_adjacency_cache.clear()
+    _fill_preview_cursor_cache.clear()
 
 
 @persistent
 def _on_load_post(_dummy):
     """Recover remnants loaded from a file saved during Face Set MFO."""
+    _fill_preview_cancel(reason="load-post")
     _cleanup_orphan_face_set_proxies()
+
+
+def _clear_topology_color_draw_cache():
+    """Drop copied coordinates at every history/file lifetime boundary."""
+    _topology_color_cache.clear()
+    _topology_color_cache_dirty.clear()
+    _topology_color_tag_redraw_all()
+
+
+@persistent
+def _on_topology_color_depsgraph_update(_scene, depsgraph):
+    """Invalidate only meshes/objects changed by the dependency graph."""
+    try:
+        for update in depsgraph.updates:
+            data = update.id
+            if isinstance(data, bpy.types.Mesh):
+                data_pointer = int(data.as_pointer())
+                for object_pointer, cache in _topology_color_cache.items():
+                    if cache.get("mesh_pointer") == data_pointer:
+                        _topology_color_cache_dirty.add(object_pointer)
+            elif isinstance(data, bpy.types.Object) and data.type == "MESH":
+                _topology_color_cache_dirty.add(int(data.as_pointer()))
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        pass
+
+
+@persistent
+def _on_topology_color_undo_post(_dummy):
+    _clear_topology_color_draw_cache()
+
+
+@persistent
+def _on_topology_color_redo_post(_dummy):
+    _clear_topology_color_draw_cache()
+
+
+@persistent
+def _on_topology_color_load_pre(_dummy):
+    _clear_topology_color_draw_cache()
+
+
+@persistent
+def _on_topology_color_load_post(_dummy):
+    _clear_topology_color_draw_cache()
 
 
 def _operator_key(operator):
@@ -6300,7 +6847,13 @@ class VIEW3D_OT_mesh_focus_orbit(bpy.types.Operator):
 
 
 def _raycast_sculpt_face_set(context, coord):
-    """Return the active mesh, seed face, Face Set ID and cursor position."""
+    """Return the first visible active-mesh face under the cursor.
+
+    Object.ray_cast does not honor Sculpt face hiding.  When it returns a
+    hidden face, advance the local ray past that hit and continue until a
+    visible face is found.  The returned polygon index remains the original
+    mesh index used by the Face Set attribute and preview adjacency graph.
+    """
     obj = context.active_object
     if obj is None or obj.type != "MESH":
         return None
@@ -6326,22 +6879,1188 @@ def _raycast_sculpt_face_set(context, coord):
             return None
         local_direction.normalize()
 
-        hit, location, _normal, face_index = obj.ray_cast(
-            local_origin,
-            local_direction,
-        )
-        if not hit or face_index < 0 or face_index >= len(face_set_attr.data):
-            return None
-
-        return (
-            obj,
-            int(face_index),
-            int(face_set_attr.data[face_index].value),
-            obj.matrix_world @ location,
-            coord,
-        )
+        for _attempt in range(256):
+            hit, location, _normal, face_index = obj.ray_cast(
+                local_origin,
+                local_direction,
+            )
+            if not hit or face_index < 0 or face_index >= len(face_set_attr.data):
+                return None
+            polygon = obj.data.polygons[int(face_index)]
+            if not bool(polygon.hide):
+                return (
+                    obj,
+                    int(face_index),
+                    int(face_set_attr.data[face_index].value),
+                    obj.matrix_world @ location,
+                    coord,
+                )
+            # Blender's object ray cast includes hidden Sculpt faces.  Move
+            # past this surface in local space before retrying, otherwise the
+            # same hidden polygon would be returned indefinitely.  Keep the
+            # step small relative to the hit distance and cap it so large
+            # models do not skip a nearby visible layer.
+            hit_distance = max((location - local_origin).length, 1.0e-7)
+            advance = min(max(hit_distance * 1.0e-6, 1.0e-7), 1.0e-3)
+            local_origin = location + local_direction * advance
+        return None
     except (AttributeError, RuntimeError, TypeError, ValueError):
         return None
+
+
+def _fill_preview_signature(obj):
+    """Return a cheap identity signature for one preview target.
+
+    Geometry changes are invalidated by the dependency-graph callback below;
+    this signature is deliberately limited to ownership, topology counts and
+    transform so that a wheel event never performs a full mesh digest.
+    """
+    try:
+        mesh = obj.data
+        matrix = tuple(
+            round(float(value), 12)
+            for row in obj.matrix_world
+            for value in row
+        )
+        return (
+            int(obj.as_pointer()),
+            int(mesh.as_pointer()),
+            int(len(mesh.vertices)),
+            int(len(mesh.edges)),
+            int(len(mesh.polygons)),
+            matrix,
+        )
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _fill_preview_adjacency_steps(obj):
+    """Yield between large mesh reads used by a modal preview preparation."""
+    import numpy as np
+
+    mesh = obj.data
+    signature = _fill_preview_signature(obj)
+    if signature is None:
+        raise RuntimeError("preview target is unavailable")
+    vertex_count = len(mesh.vertices)
+    face_count = len(mesh.polygons)
+    coordinates = np.empty((vertex_count, 3), dtype=np.float32)
+    loop_edges = np.empty(len(mesh.loops), dtype=np.int32)
+    loop_vertices = np.empty(len(mesh.loops), dtype=np.int32)
+    totals = np.empty(face_count, dtype=np.int32)
+    hidden = np.empty(face_count, dtype=bool)
+    yield "allocate"
+    mesh.vertices.foreach_get("co", coordinates.ravel())
+    yield "vertices"
+    mesh.loops.foreach_get("edge_index", loop_edges)
+    yield "loop_edges"
+    mesh.loops.foreach_get("vertex_index", loop_vertices)
+    yield "loop_vertices"
+    mesh.polygons.foreach_get("loop_total", totals)
+    yield "totals"
+    mesh.polygons.foreach_get("hide", hidden)
+    yield "hidden"
+    centers = np.empty((face_count, 3), dtype=np.float32)
+    normals = np.empty((face_count, 3), dtype=np.float32)
+    mesh.polygons.foreach_get("center", centers.ravel())
+    yield "centers"
+    mesh.polygons.foreach_get("normal", normals.ravel())
+    yield "normals"
+    return {
+        "signature": signature,
+        "coordinates": coordinates,
+        "loop_edges": loop_edges,
+        "loop_vertices": loop_vertices,
+        "totals": totals,
+        "hidden": hidden,
+        "centers": centers,
+        "normals": normals,
+    }
+
+
+def _fill_preview_cursor_initial_radius(obj, cache, seed_face, geometry=None):
+    """Choose the existing model-scaled radius without a full graph.
+
+    A provisional edge-length estimate is used only to select the first crop.
+    Once that compact graph exists, the exact value uses the seed's adjacent
+    face-center distances, matching the previous full-graph path.
+    """
+    import numpy as np
+
+    mesh = obj.data
+    seed_face = int(seed_face)
+    matrix = obj.matrix_world
+    edge_lengths = []
+    if geometry is not None:
+        edge_lengths = list(geometry.get("seed_neighbor_lengths", ()))
+    if not edge_lengths:
+        polygon = mesh.polygons[seed_face]
+        world_points = [matrix @ mesh.vertices[int(vertex)].co for vertex in polygon.vertices]
+        edge_lengths = [
+            (world_points[index] - world_points[(index + 1) % len(world_points)]).length
+            for index in range(len(world_points))
+        ]
+    local_scale = float(np.median(edge_lengths)) if edge_lengths else 0.0
+    extent = np.ptp(cache["world_centers"], axis=0)
+    diagonal = float(np.linalg.norm(extent))
+    if not diagonal:
+        diagonal = max(local_scale, 1.0e-3)
+    return max(
+        min(max(local_scale * 8.0, diagonal * 0.01), diagonal * 0.20),
+        diagonal * 1.0e-4,
+        1.0e-8,
+    )
+
+
+def _fill_preview_cursor_build_geometry(obj, cache, spatial_radius):
+    """Build a compact graph from a cursor-centered spatial crop.
+
+    The full center and global edge-degree arrays are the only full-mesh reads.
+    Polygon RNA is read only for faces inside the crop.  A crop boundary is
+    never treated as an open seam: seam bridges are considered only for edges
+    whose global degree is one and whose two open counterparts are both in the
+    crop.
+    """
+    import numpy as np
+
+    mesh = obj.data
+    centers_all = cache["world_centers"]
+    seed_face = int(cache["seed_face"])
+    seed_center = centers_all[seed_face]
+    spatial_ids = np.flatnonzero(
+        np.linalg.norm(centers_all - seed_center, axis=1)
+        <= float(spatial_radius)
+    ).astype(np.int32)
+    visible_ids = [
+        int(face_id)
+        for face_id in spatial_ids
+        if not bool(mesh.polygons[int(face_id)].hide)
+    ]
+    if seed_face not in visible_ids:
+        raise RuntimeError("preview seed is hidden")
+    face_ids = np.asarray(visible_ids, dtype=np.int32)
+    local_index = {int(face_id): index for index, face_id in enumerate(face_ids)}
+    matrix = obj.matrix_world
+    transform = np.asarray(matrix.to_3x3(), dtype=np.float64)
+    inverse_transform = np.linalg.inv(transform)
+    centers = centers_all[face_ids].astype(np.float64, copy=True)
+    normals = np.empty((len(face_ids), 3), dtype=np.float64)
+    vertex_index = {}
+    vertex_world = []
+    edge_records = {}
+    boundary_records = []
+    edge_degree = cache["edge_degree"]
+
+    def local_vertex(global_vertex):
+        global_vertex = int(global_vertex)
+        local = vertex_index.get(global_vertex)
+        if local is None:
+            local = len(vertex_world)
+            vertex_index[global_vertex] = local
+            vertex_world.append(
+                tuple(float(value) for value in (matrix @ mesh.vertices[global_vertex].co))
+            )
+        return local
+
+    for local_face, global_face in enumerate(face_ids):
+        polygon = mesh.polygons[int(global_face)]
+        raw_normal = np.asarray(polygon.normal, dtype=np.float64)
+        world_normal = raw_normal @ inverse_transform
+        normals[local_face] = world_normal / max(
+            float(np.linalg.norm(world_normal)), 1.0e-20
+        )
+        loop_indices = tuple(polygon.loop_indices)
+        for loop_position, loop_index in enumerate(loop_indices):
+            edge_index = int(mesh.loops[int(loop_index)].edge_index)
+            v0_global = int(mesh.loops[int(loop_index)].vertex_index)
+            v1_global = int(
+                mesh.loops[int(loop_indices[(loop_position + 1) % len(loop_indices)])].vertex_index
+            )
+            v0 = local_vertex(v0_global)
+            v1 = local_vertex(v1_global)
+            record = (local_face, v0, v1, (v0_global, v1_global))
+            if int(edge_degree[edge_index]) == 2:
+                edge_records.setdefault(edge_index, []).append(record)
+            elif int(edge_degree[edge_index]) == 1:
+                boundary_records.append(record)
+
+    pair_records = []
+    pair_seen = set()
+    for edge_index, records in edge_records.items():
+        if len(records) != 2:
+            continue
+        first_record, second_record = records
+        first_face, first_v0, first_v1, _first_key = first_record
+        second_face, second_v0, second_v1, _second_key = second_record
+        if first_face == second_face:
+            continue
+        pair_key = (int(edge_index), min(first_face, second_face), max(first_face, second_face))
+        if pair_key in pair_seen:
+            continue
+        pair_seen.add(pair_key)
+        pair_records.append((first_face, second_face, first_v0, first_v1))
+
+    seam_count = 0
+    if boundary_records:
+        lengths = [
+            float(
+                np.linalg.norm(
+                    np.asarray(vertex_world[v1]) - np.asarray(vertex_world[v0])
+                )
+            )
+            for _face, v0, v1, _key in boundary_records
+        ]
+        tolerance = max(float(np.median(lengths)) * 1.0e-4, 1.0e-12)
+        buckets = {}
+        for record in boundary_records:
+            face, v0, v1, _key = record
+            point_a = np.asarray(vertex_world[v0], dtype=np.float64)
+            point_b = np.asarray(vertex_world[v1], dtype=np.float64)
+            qa = tuple(np.rint(point_a / tolerance).astype(np.int64))
+            qb = tuple(np.rint(point_b / tolerance).astype(np.int64))
+            buckets.setdefault(tuple(sorted((qa, qb))), []).append(record)
+        for records in buckets.values():
+            if len(records) != 2:
+                continue
+            first_record, second_record = records
+            first_face, first_v0, first_v1, _first_key = first_record
+            second_face, second_v0, second_v1, _second_key = second_record
+            if first_face == second_face:
+                continue
+            first_a = np.asarray(vertex_world[first_v0], dtype=np.float64)
+            first_b = np.asarray(vertex_world[first_v1], dtype=np.float64)
+            second_a = np.asarray(vertex_world[second_v0], dtype=np.float64)
+            second_b = np.asarray(vertex_world[second_v1], dtype=np.float64)
+            if (
+                np.linalg.norm(first_a - second_b) > tolerance
+                or np.linalg.norm(first_b - second_a) > tolerance
+                or float(np.dot(normals[first_face], normals[second_face])) <= 0.5
+            ):
+                continue
+            pair_key = ("seam", min(first_face, second_face), max(first_face, second_face), first_v0, first_v1)
+            if pair_key in pair_seen:
+                continue
+            pair_seen.add(pair_key)
+            pair_records.append((first_face, second_face, first_v0, first_v1))
+            seam_count += 1
+
+    if pair_records:
+        first = np.asarray([record[0] for record in pair_records], dtype=np.int32)
+        second = np.asarray([record[1] for record in pair_records], dtype=np.int32)
+        pair_v0 = np.asarray([record[2] for record in pair_records], dtype=np.int32)
+        pair_v1 = np.asarray([record[3] for record in pair_records], dtype=np.int32)
+    else:
+        first = second = pair_v0 = pair_v1 = np.empty(0, dtype=np.int32)
+    delta = centers[second] - centers[first]
+    pair_lengths = np.maximum(np.linalg.norm(delta, axis=1), 1.0e-20)
+    sources = np.r_[first, second]
+    destinations = np.r_[second, first]
+    directed_lengths = np.r_[pair_lengths, pair_lengths]
+    directed_v0 = np.r_[pair_v0, pair_v0]
+    directed_v1 = np.r_[pair_v1, pair_v1]
+    order = np.argsort(sources, kind="stable")
+    degree = np.bincount(sources, minlength=len(face_ids))
+    offsets = np.r_[0, np.cumsum(degree)].astype(np.int64)
+    seed_local = local_index[seed_face]
+    seed_neighbor_lengths = pair_lengths[
+        (first == seed_local) | (second == seed_local)
+    ]
+    return {
+        "signature": cache["signature"],
+        "count": int(len(face_ids)),
+        "centers": centers,
+        "normals": normals,
+        "hidden": np.zeros(len(face_ids), dtype=bool),
+        "world_vertices": np.asarray(vertex_world, dtype=np.float64),
+        "offsets": offsets,
+        "neighbors": destinations[order].astype(np.int32, copy=False),
+        "neighbor_lengths": directed_lengths[order],
+        "edge_v0": directed_v0[order].astype(np.int32, copy=False),
+        "edge_v1": directed_v1[order].astype(np.int32, copy=False),
+        "first": first,
+        "second": second,
+        "pair_lengths": pair_lengths,
+        "pair_v0": pair_v0,
+        "pair_v1": pair_v1,
+        "seam_count": int(seam_count),
+        "face_ids": face_ids,
+        "spatial_radius": float(spatial_radius),
+        "spatial_faces": int(len(spatial_ids)),
+        "seed_neighbor_lengths": seed_neighbor_lengths,
+        "cursor_local": True,
+    }
+
+
+def _fill_preview_cursor_prepare_steps(obj, seed_face):
+    """Yield cursor-first reads before returning one compact adjacency graph."""
+    import numpy as np
+
+    global _fill_preview_cursor_cache
+    mesh = obj.data
+    signature = _fill_preview_signature(obj)
+    if signature is None:
+        raise RuntimeError("preview target is unavailable")
+    cache = _fill_preview_cursor_cache.get(signature)
+    if cache is None:
+        face_count = len(mesh.polygons)
+        centers_local = np.empty((face_count, 3), dtype=np.float32)
+        loop_edges = np.empty(len(mesh.loops), dtype=np.int32)
+        yield "cursor-allocate"
+        mesh.polygons.foreach_get("center", centers_local.ravel())
+        matrix = np.asarray(obj.matrix_world, dtype=np.float64)
+        world_centers = centers_local.astype(np.float64) @ matrix[:3, :3].T + matrix[:3, 3]
+        yield "cursor-centers"
+        mesh.loops.foreach_get("edge_index", loop_edges)
+        edge_degree = np.bincount(loop_edges, minlength=len(mesh.edges)).astype(np.int32, copy=False)
+        cache = {
+            "signature": signature,
+            "world_centers": world_centers,
+            "edge_degree": edge_degree,
+        }
+        _fill_preview_cursor_cache[signature] = cache
+        yield "cursor-edge-degree"
+    else:
+        yield "cursor-cache"
+    cache["seed_face"] = int(seed_face)
+    provisional_radius = _fill_preview_cursor_initial_radius(obj, cache, seed_face)
+    spatial_radius = provisional_radius + max(provisional_radius * 0.5, provisional_radius * 0.5)
+    geometry = _fill_preview_cursor_build_geometry(obj, cache, spatial_radius)
+    initial_radius = _fill_preview_cursor_initial_radius(
+        obj, cache, seed_face, geometry=geometry
+    )
+    required_radius = initial_radius + max(initial_radius * 0.5, initial_radius * 0.5)
+    if required_radius > spatial_radius * (1.0 + 1.0e-9):
+        geometry = _fill_preview_cursor_build_geometry(
+            obj, cache, required_radius
+        )
+    geometry["cursor_cache"] = cache
+    geometry["initial_radius"] = float(initial_radius)
+    yield "cursor-local-graph"
+    return geometry
+
+
+def _fill_preview_build_adjacency(obj, prepared=None):
+    """Build only the reusable surface graph needed by preview sessions.
+
+    This preparation reads all loops once, but intentionally does not compute
+    curvature, valley bands, partition ownership, or contour relaxation.  All
+    geometry features are recomputed on the session's candidate+halo patch.
+    """
+    import numpy as np
+
+    mesh = obj.data
+    signature = _fill_preview_signature(obj)
+    if signature is None:
+        raise RuntimeError("preview target is unavailable")
+    cached = _fill_preview_adjacency_cache.get(signature)
+    if cached is not None:
+        return cached
+
+    if prepared is None:
+        vertex_count = len(mesh.vertices)
+        face_count = len(mesh.polygons)
+        coordinates = np.empty((vertex_count, 3), dtype=np.float32)
+        loop_edges = np.empty(len(mesh.loops), dtype=np.int32)
+        loop_vertices = np.empty(len(mesh.loops), dtype=np.int32)
+        totals = np.empty(face_count, dtype=np.int32)
+        hidden = np.empty(face_count, dtype=bool)
+        mesh.vertices.foreach_get("co", coordinates.ravel())
+        mesh.loops.foreach_get("edge_index", loop_edges)
+        mesh.loops.foreach_get("vertex_index", loop_vertices)
+        mesh.polygons.foreach_get("loop_total", totals)
+        mesh.polygons.foreach_get("hide", hidden)
+        centers = np.empty((face_count, 3), dtype=np.float32)
+        normals = np.empty((face_count, 3), dtype=np.float32)
+        mesh.polygons.foreach_get("center", centers.ravel())
+        mesh.polygons.foreach_get("normal", normals.ravel())
+    else:
+        coordinates = prepared["coordinates"]
+        loop_edges = prepared["loop_edges"]
+        loop_vertices = prepared["loop_vertices"]
+        totals = prepared["totals"]
+        hidden = prepared["hidden"]
+        centers = prepared["centers"]
+        normals = prepared["normals"]
+        vertex_count = len(coordinates)
+        face_count = len(totals)
+
+    transform = np.asarray(obj.matrix_world.to_3x3(), dtype=np.float64)
+    world_matrix = np.asarray(obj.matrix_world, dtype=np.float64)
+    translation = world_matrix[:3, 3]
+    world_vertices = coordinates.astype(np.float64) @ transform.T + translation
+    centers = centers.astype(np.float64) @ transform.T + translation
+    normals = normals.astype(np.float64) @ np.linalg.inv(transform)
+    normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1.0e-20)
+
+    face_ids = np.repeat(np.arange(face_count, dtype=np.int32), totals)
+    order = np.argsort(loop_edges, kind="stable")
+    sorted_edges = loop_edges[order]
+    starts = np.r_[0, np.flatnonzero(np.diff(sorted_edges)) + 1]
+    lengths = np.diff(np.r_[starts, len(order)])
+    pair_starts = starts[lengths == 2]
+    paired_loops = order[pair_starts]
+    first = face_ids[paired_loops]
+    second = face_ids[order[pair_starts + 1]]
+    face_starts = np.r_[0, np.cumsum(totals)[:-1]]
+    paired_next = face_starts[first] + (
+        (paired_loops - face_starts[first] + 1) % totals[first]
+    )
+    edge_v0 = loop_vertices[paired_loops]
+    edge_v1 = loop_vertices[paired_next]
+
+    # Preserve the existing unwelded-seam behavior.  Only coincident open
+    # edges with opposite winding and compatible normals become bridges.
+    border_loops = order[starts[lengths == 1]]
+    seam_count = 0
+    if len(border_loops):
+        border_faces = face_ids[border_loops]
+        next_loops = face_starts[border_faces] + (
+            (border_loops - face_starts[border_faces] + 1) % totals[border_faces]
+        )
+        points_a = world_vertices[loop_vertices[border_loops]]
+        points_b = world_vertices[loop_vertices[next_loops]]
+        edge_lengths = np.linalg.norm(points_b - points_a, axis=1)
+        tolerance = max(float(np.median(edge_lengths)) * 1.0e-4, 1.0e-12)
+        quantized = np.rint(np.vstack((points_a, points_b)) / tolerance).astype(np.int64)
+        _, point_ids = np.unique(quantized, axis=0, return_inverse=True)
+        pa, pb = np.split(point_ids, 2)
+        signatures = np.column_stack((np.minimum(pa, pb), np.maximum(pa, pb)))
+        _, inverse, counts = np.unique(
+            signatures, axis=0, return_inverse=True, return_counts=True
+        )
+        seam_order = np.argsort(inverse, kind="stable")
+        seam_starts = np.r_[0, np.cumsum(counts)[:-1]][counts == 2]
+        ia, ib = seam_order[seam_starts], seam_order[seam_starts + 1]
+        fa, fb = border_faces[ia], border_faces[ib]
+        match = (
+            (pa[ia] == pb[ib])
+            & (pb[ia] == pa[ib])
+            & (pa[ia] != pb[ia])
+            & (fa != fb)
+            & (np.sum(normals[fa] * normals[fb], axis=1) > 0.5)
+            & (np.linalg.norm(points_a[ia] - points_b[ib], axis=1) <= tolerance)
+            & (np.linalg.norm(points_b[ia] - points_a[ib], axis=1) <= tolerance)
+        )
+        first = np.r_[first, fa[match]]
+        second = np.r_[second, fb[match]]
+        edge_v0 = np.r_[edge_v0, loop_vertices[border_loops[ia[match]]]]
+        edge_v1 = np.r_[edge_v1, loop_vertices[next_loops[ia[match]]]]
+        seam_count = int(np.count_nonzero(match))
+
+    valid = ~(hidden[first] | hidden[second]) & (first != second)
+    first, second = first[valid], second[valid]
+    edge_v0, edge_v1 = edge_v0[valid], edge_v1[valid]
+    delta = centers[second] - centers[first]
+    distance = np.maximum(np.linalg.norm(delta, axis=1), 1.0e-20)
+    sources = np.r_[first, second]
+    destinations = np.r_[second, first]
+    source_edges = np.r_[np.arange(len(first)), np.arange(len(first))]
+    edge_v0_directed = np.r_[edge_v0, edge_v0]
+    edge_v1_directed = np.r_[edge_v1, edge_v1]
+    order = np.argsort(sources, kind="stable")
+    degree = np.bincount(sources, minlength=face_count)
+    offsets = np.r_[0, np.cumsum(degree)].astype(np.int64)
+    cached = {
+        "signature": signature,
+        "count": int(face_count),
+        "centers": centers,
+        "normals": normals,
+        "hidden": hidden,
+        "world_vertices": world_vertices,
+        "offsets": offsets,
+        "neighbors": destinations[order].astype(np.int32, copy=False),
+        "neighbor_lengths": np.r_[distance, distance][order],
+        "edge_v0": edge_v0_directed[order].astype(np.int32, copy=False),
+        "edge_v1": edge_v1_directed[order].astype(np.int32, copy=False),
+        "first": first,
+        "second": second,
+        "pair_lengths": distance,
+        "pair_v0": edge_v0,
+        "pair_v1": edge_v1,
+        "seam_count": seam_count,
+    }
+    # Drop obsolete revisions for this mesh while retaining unrelated meshes.
+    mesh_pointer = signature[1]
+    for key in list(_fill_preview_adjacency_cache):
+        if key[1] == mesh_pointer and key != signature:
+            _fill_preview_adjacency_cache.pop(key, None)
+    _fill_preview_adjacency_cache[signature] = cached
+    return cached
+
+
+def _fill_preview_dijkstra(geometry, seed_face, max_distance):
+    """Return surface distances and ids within one candidate+halo radius."""
+    import heapq
+    import numpy as np
+
+    count = int(geometry["count"])
+    distances = np.full(count, np.inf, dtype=np.float64)
+    seed_face = int(seed_face)
+    distances[seed_face] = 0.0
+    heap = [(0.0, seed_face)]
+    offsets = geometry["offsets"]
+    neighbors = geometry["neighbors"]
+    lengths = geometry["neighbor_lengths"]
+    popped = 0
+    while heap:
+        current, face = heapq.heappop(heap)
+        if current > float(distances[face]) + 1.0e-15:
+            continue
+        if current > float(max_distance):
+            break
+        popped += 1
+        for edge in range(int(offsets[face]), int(offsets[face + 1])):
+            other = int(neighbors[edge])
+            candidate = current + float(lengths[edge])
+            if candidate < distances[other] and candidate <= float(max_distance):
+                distances[other] = candidate
+                heapq.heappush(heap, (candidate, other))
+    return distances, np.flatnonzero(np.isfinite(distances)).astype(np.int32), popped
+
+
+def _fill_preview_dijkstra_incremental(geometry, seed_face, max_distance, state):
+    """Extend one Dijkstra frontier and reuse it for shrink/revisit events."""
+    import heapq
+    import numpy as np
+
+    if state is None:
+        count = int(geometry["count"])
+        distances = np.full(count, np.inf, dtype=np.float64)
+        distances[int(seed_face)] = 0.0
+        state = {
+            "distances": distances,
+            "heap": [(0.0, int(seed_face))],
+            "max_distance": -1.0,
+            "popped": 0,
+        }
+    if float(max_distance) > float(state["max_distance"]):
+        offsets = geometry["offsets"]
+        neighbors = geometry["neighbors"]
+        lengths = geometry["neighbor_lengths"]
+        distances = state["distances"]
+        heap = state["heap"]
+        while heap:
+            current, face = heapq.heappop(heap)
+            if current > float(distances[face]) + 1.0e-15:
+                continue
+            if current > float(max_distance):
+                heapq.heappush(heap, (current, face))
+                break
+            state["popped"] += 1
+            for edge in range(int(offsets[face]), int(offsets[face + 1])):
+                other = int(neighbors[edge])
+                candidate = current + float(lengths[edge])
+                # Keep the first frontier beyond the current radius so an
+                # expanded wheel distance can continue without restarting.
+                if candidate < distances[other]:
+                    distances[other] = candidate
+                    heapq.heappush(heap, (candidate, other))
+        state["max_distance"] = float(max_distance)
+    distances = state["distances"]
+    ids = np.flatnonzero(distances <= float(max_distance)).astype(np.int32)
+    return distances, ids, int(state["popped"]), state
+
+
+def _fill_preview_local_geometry(geometry, face_ids):
+    """Slice adjacency and recompute all scalar features on the local patch."""
+    import numpy as np
+
+    face_ids = np.asarray(face_ids, dtype=np.int32)
+    count = int(geometry["count"])
+    local_id = np.full(count, -1, dtype=np.int32)
+    local_id[face_ids] = np.arange(len(face_ids), dtype=np.int32)
+    offsets_global = geometry["offsets"]
+    degree = offsets_global[face_ids + 1] - offsets_global[face_ids]
+    total = int(np.sum(degree))
+    if total:
+        starts = np.repeat(offsets_global[face_ids], degree)
+        segment_starts = np.repeat(np.r_[0, np.cumsum(degree)[:-1]], degree)
+        edge_ids = (
+            starts + np.arange(total, dtype=np.int64) - segment_starts
+        )
+        source_global = np.repeat(face_ids, degree)
+        destination_global = geometry["neighbors"][edge_ids]
+        keep = (
+            (local_id[destination_global] >= 0)
+            & (source_global < destination_global)
+        )
+        first = local_id[source_global[keep]]
+        second = local_id[destination_global[keep]]
+        pair_lengths = geometry["neighbor_lengths"][edge_ids][keep]
+        pair_v0 = geometry["edge_v0"][edge_ids][keep]
+        pair_v1 = geometry["edge_v1"][edge_ids][keep]
+    else:
+        first = second = np.empty(0, dtype=np.int32)
+        pair_lengths = np.empty(0, dtype=np.float64)
+        pair_v0 = pair_v1 = np.empty(0, dtype=np.int32)
+
+    sources = np.r_[first, second]
+    destinations = np.r_[second, first]
+    directed_lengths = np.r_[pair_lengths, pair_lengths]
+    directed_v0 = np.r_[pair_v0, pair_v0]
+    directed_v1 = np.r_[pair_v1, pair_v1]
+    degree = np.bincount(sources, minlength=len(face_ids))
+    order = np.argsort(sources, kind="stable")
+    offsets = np.r_[0, np.cumsum(degree)].astype(np.int64)
+    local = {
+        "first": first,
+        "second": second,
+        "offsets": offsets,
+        "centers": geometry["centers"][face_ids],
+        "normals": geometry["normals"][face_ids],
+        "hidden": geometry["hidden"][face_ids],
+        "world_vertices": geometry["world_vertices"],
+        "neighbors": destinations[order].astype(np.int32, copy=False),
+        "neighbor_lengths": directed_lengths[order],
+        "edge_v0": directed_v0[order].astype(np.int32, copy=False),
+        "edge_v1": directed_v1[order].astype(np.int32, copy=False),
+        "pair_v0": pair_v0.astype(np.int32, copy=False),
+        "pair_v1": pair_v1.astype(np.int32, copy=False),
+        "count": int(len(face_ids)),
+        "seam_count": int(geometry.get("seam_count", 0)),
+        "partitions": {},
+        "_global_face_ids": face_ids,
+    }
+    count = local["count"]
+    local["scale"] = (
+        np.bincount(first, weights=pair_lengths, minlength=count)
+        + np.bincount(second, weights=pair_lengths, minlength=count)
+    ) / np.maximum(
+        np.bincount(first, minlength=count) + np.bincount(second, minlength=count),
+        1,
+    )
+    normals = local["normals"]
+    smooth = _fill_average(normals, first, second, count, 2)
+    smooth /= np.maximum(np.linalg.norm(smooth, axis=1, keepdims=True), 1.0e-20)
+    delta = local["centers"][second] - local["centers"][first]
+    distance = np.maximum(np.linalg.norm(delta, axis=1), 1.0e-20)
+    curvature_edge = np.sum((smooth[second] - smooth[first]) * delta, axis=1)
+    inward = np.maximum(-curvature_edge / distance, 0.0) * 3.0
+    directional_valley = np.zeros(count)
+    np.maximum.at(directional_valley, first, inward)
+    np.maximum.at(directional_valley, second, inward)
+    directional_valley = _fill_average(
+        directional_valley, first, second, count, 3
+    )
+    metric = (
+        np.bincount(first, weights=distance**2, minlength=count)
+        + np.bincount(second, weights=distance**2, minlength=count)
+    )
+    curvature = (
+        np.bincount(first, weights=curvature_edge, minlength=count)
+        + np.bincount(second, weights=curvature_edge, minlength=count)
+    ) / np.maximum(metric, 1.0e-30)
+    curvature = _fill_average(curvature, first, second, count, 3)
+    broad = _fill_average(curvature, first, second, count, 24)
+    contrast = np.where(
+        curvature < 0.0,
+        np.maximum(broad - curvature, 0.0) * local["scale"] * 6.0,
+        0.0,
+    )
+    concavity = np.maximum(-curvature, 0.0) * local["scale"] * 6.0
+    valley_line = _fill_average(
+        np.maximum(concavity, directional_valley), first, second, count, 6
+    )
+    edge_valley = (valley_line[first] + valley_line[second]) * 0.5
+    contour_cost = pair_lengths / (1.0 + (edge_valley / 0.10) ** 2)
+    raw_angle = np.arccos(
+        np.clip(np.sum(normals[first] * normals[second], axis=1), -1, 1)
+    )
+    raw_turn = np.sum((normals[second] - normals[first]) * delta, axis=1)
+    raw_angle = np.where(raw_turn < -distance * 1.0e-6, raw_angle, 0.0)
+    crease = np.zeros(count)
+    np.maximum.at(crease, first, raw_angle)
+    np.maximum.at(crease, second, raw_angle)
+    local["contrast"] = contrast
+    local["concavity"] = concavity
+    local["directional_valley"] = directional_valley
+    local["crease"] = crease
+    local["contour_cost"] = np.r_[contour_cost, contour_cost][order]
+    return local
+
+
+def _fill_preview_region(local, seed_local, strict_mode):
+    """Run the production partition semantics on one local patch."""
+    import numpy as np
+
+    partition = _fill_partition(local, strict_mode)
+    core, owner = partition["core"], partition["owner"]
+    seed_local = int(seed_local)
+    root = int(owner[seed_local])
+    if root == int(local["count"]):
+        return np.asarray([seed_local], dtype=np.int32), partition
+    selected = np.zeros(int(local["count"]) + 1, dtype=bool)
+    selected[root] = True
+    pending = deque([root])
+    offsets, neighbors = local["offsets"], local["neighbors"]
+    while pending:
+        face = pending.popleft()
+        for neighbor in neighbors[offsets[face] : offsets[face + 1]]:
+            neighbor = int(neighbor)
+            if core[neighbor] and not selected[neighbor]:
+                selected[neighbor] = True
+                pending.append(neighbor)
+    region = selected[owner]
+    first, second = local["first"], local["second"]
+    relaxed = region.copy()
+    editable = partition["band"] & ~partition["protected"] & (
+        owner < local["count"]
+    )
+    weights = local["contour_cost"]
+    for iteration in range(6):
+        crossing = relaxed[first] != relaxed[second]
+        fringe = np.unique(np.r_[first[crossing], second[crossing]])
+        fringe = fringe[editable[fringe]]
+        if iteration % 2:
+            fringe = fringe[::-1]
+        changed = False
+        for face in fringe:
+            if int(face) == seed_local:
+                continue
+            start, end = offsets[face], offsets[face + 1]
+            linked = neighbors[start:end]
+            costs = weights[start:end]
+            old_cost = float(costs[relaxed[linked] != relaxed[face]].sum())
+            new_cost = float(costs[relaxed[linked] == relaxed[face]].sum())
+            if new_cost < old_cost - max(old_cost, new_cost, 1.0e-20) * 1.0e-8:
+                relaxed[face] = not relaxed[face]
+                changed = True
+        if not changed:
+            break
+    if relaxed[seed_local]:
+        connected = np.zeros(local["count"], dtype=bool)
+        connected[root] = True
+        pending = deque([root])
+        while pending:
+            face = pending.popleft()
+            for neighbor in neighbors[offsets[face] : offsets[face + 1]]:
+                neighbor = int(neighbor)
+                if relaxed[neighbor] and not connected[neighbor]:
+                    connected[neighbor] = True
+                    pending.append(neighbor)
+        if connected[seed_local]:
+            region = connected
+    return np.flatnonzero(region).astype(np.int32), partition
+
+
+def _fill_preview_initial_radius(geometry, seed_face):
+    """Choose a model-scaled starting distance without a fixed world radius."""
+    import numpy as np
+
+    seed_face = int(seed_face)
+    start, end = geometry["offsets"][seed_face : seed_face + 2]
+    if end > start:
+        local_scale = float(np.median(geometry["neighbor_lengths"][start:end]))
+    else:
+        local_scale = 0.0
+    extent = np.ptp(geometry["centers"], axis=0)
+    diagonal = float(np.linalg.norm(extent))
+    if not diagonal:
+        diagonal = max(local_scale, 1.0e-3)
+    return max(
+        min(max(local_scale * 8.0, diagonal * 0.01), diagonal * 0.20),
+        diagonal * 1.0e-4,
+        1.0e-8,
+    )
+
+
+def _fill_preview_cursor_expand(state, radius):
+    """Extend a cursor graph only when the requested radius needs more halo."""
+    import numpy as np
+
+    geometry = state["adjacency"]
+    if not geometry.get("cursor_local"):
+        return False
+    halo = max(float(radius) * 0.5, float(state["initial_radius"]) * 0.5)
+    required = float(radius) + halo
+    if required <= float(geometry.get("spatial_radius", 0.0)) * (1.0 + 1.0e-9):
+        return False
+    cache = geometry.get("cursor_cache")
+    if cache is None:
+        raise RuntimeError("preview cursor cache is unavailable")
+    cache["seed_face"] = int(state["seed_face"])
+    expanded = _fill_preview_cursor_build_geometry(
+        state["obj"], cache, required
+    )
+    expanded["cursor_cache"] = cache
+    expanded["initial_radius"] = float(state["initial_radius"])
+    state["adjacency"] = expanded
+    state["seed_local"] = int(
+        np.flatnonzero(expanded["face_ids"] == int(state["seed_face"]))[0]
+    )
+    state["distance_state"] = None
+    state["results"] = {}
+    state["expansion_count"] = int(state.get("expansion_count", 0)) + 1
+    return True
+
+
+def _fill_preview_make_result(state, radius):
+    """Compute one immutable candidate result for the current wheel distance."""
+    import numpy as np
+
+    geometry = state["adjacency"]
+    if state.get("cursor_local"):
+        _fill_preview_cursor_expand(state, radius)
+        geometry = state["adjacency"]
+    seed_face = int(state.get("seed_local", state["seed_face"]))
+    if seed_face < 0 or seed_face >= len(geometry["hidden"]):
+        raise RuntimeError("preview seed is outside the prepared mesh")
+    if bool(geometry["hidden"][seed_face]):
+        raise RuntimeError("preview seed is hidden")
+    halo = max(float(radius) * 0.5, float(state["initial_radius"]) * 0.5)
+    patch_radius = float(radius) + halo
+    started = time.perf_counter()
+    distances, patch_ids, popped, distance_state = _fill_preview_dijkstra_incremental(
+        geometry, seed_face, patch_radius, state.get("distance_state")
+    )
+    state["distance_state"] = distance_state
+    if len(patch_ids) == 0 or not np.isfinite(distances[seed_face]):
+        raise RuntimeError("preview seed is outside the prepared patch")
+    local = _fill_preview_local_geometry(geometry, patch_ids)
+    seed_local = int(np.flatnonzero(patch_ids == seed_face)[0])
+    local_region, partition = _fill_preview_region(
+        local, seed_local, bool(state["strict_mode"])
+    )
+    local_global = patch_ids[local_region]
+    candidate_mask = (
+        (distances[local_global] <= float(radius) + max(radius * 1.e-8, 1.e-9))
+        & ~geometry["hidden"][local_global]
+    )
+    preview_faces = local_global[candidate_mask].astype(np.int32, copy=False)
+    face_ids = geometry.get("face_ids")
+    if face_ids is not None:
+        preview_faces = face_ids[preview_faces].astype(np.int32, copy=False)
+    if len(preview_faces) == 0:
+        raise RuntimeError("preview produced no visible candidate faces")
+    preview_set = np.zeros(int(local["count"]), dtype=bool)
+    preview_set[local_region[candidate_mask]] = True
+    first, second = local["first"], local["second"]
+    shape_segments = []
+    distance_segments = []
+    boundary = preview_set[first] != preview_set[second]
+    for edge in np.flatnonzero(boundary):
+        left, right = int(first[edge]), int(second[edge])
+        inside = left if preview_set[left] else right
+        outside = right if preview_set[left] else left
+        v0 = int(local["pair_v0"][edge])
+        v1 = int(local["pair_v1"][edge])
+        segment = (
+            tuple(float(value) for value in geometry["world_vertices"][v0]),
+            tuple(float(value) for value in geometry["world_vertices"][v1]),
+        )
+        outside_distance = float(distances[patch_ids[outside]])
+        shape_boundary = (
+            np.isfinite(outside_distance)
+            and outside_distance < float(radius) - max(radius * 0.01, 1.e-8)
+            and bool(
+                partition["barrier"][inside] or partition["barrier"][outside]
+            )
+        )
+        (shape_segments if shape_boundary else distance_segments).append(segment)
+    patch_edge_reached = bool(
+        len(patch_ids)
+        and np.any(distances[patch_ids] >= patch_radius - max(patch_radius * 0.01, 1.e-8))
+    )
+    elapsed = time.perf_counter() - started
+    return {
+        "radius": float(radius),
+        "faces": preview_faces,
+        "candidate_count": int(len(preview_faces)),
+        "analysis_faces": int(len(patch_ids)),
+        "popped_faces": int(popped),
+        "shape_segments": shape_segments,
+        "distance_segments": distance_segments,
+        "patch_edge_reached": patch_edge_reached,
+        "compute_seconds": float(elapsed),
+        "geometry": local,
+        "partition": partition,
+        "created_generation": int(state["generation"]),
+    }
+
+
+def _fill_preview_build_draw_batches(state, result):
+    """Create copied world-space GPU vertices from the current candidate."""
+    import numpy as np
+
+    if result.get("triangles") is not None:
+        return
+    obj = state["obj"]
+    mesh = obj.data
+    matrix = obj.matrix_world
+    triangles = []
+    try:
+        for face_index in result["faces"]:
+            polygon = mesh.polygons[int(face_index)]
+            points = [
+                Vector(matrix @ mesh.vertices[int(vertex)].co)
+                for vertex in polygon.vertices
+            ]
+            if len(points) < 3:
+                continue
+            for triangle in tessellate_polygon([points]):
+                if len(triangle) == 3:
+                    triangle_vertices = []
+                    for vertex in triangle:
+                        # Blender 5.2 returns polygon-local integer indices;
+                        # older builds returned Vector objects.
+                        if isinstance(vertex, (int, np.integer)):
+                            vertex = points[int(vertex)]
+                        triangle_vertices.append(
+                            tuple(float(value) for value in vertex)
+                        )
+                    # Some Sculpt viewport configurations cull the back side
+                    # of a face.  Keep the original coordinates and depth,
+                    # but submit the same triangle with both winding orders;
+                    # this makes an inside-view preview visible without
+                    # moving vertices along normals or changing GPU state.
+                    triangles.extend(triangle_vertices)
+                    triangles.extend(reversed(triangle_vertices))
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError, IndexError):
+        triangles = []
+    result["triangles"] = triangles
+    result["shape_lines"] = [value for segment in result["shape_segments"] for value in segment]
+    result["distance_lines"] = [value for segment in result["distance_segments"] for value in segment]
+    result["triangles_np"] = np.asarray(triangles, dtype=np.float32) if triangles else np.empty((0, 3), dtype=np.float32)
+    result["shape_lines_np"] = np.asarray(result["shape_lines"], dtype=np.float32) if result["shape_lines"] else np.empty((0, 3), dtype=np.float32)
+    result["distance_lines_np"] = np.asarray(result["distance_lines"], dtype=np.float32) if result["distance_lines"] else np.empty((0, 3), dtype=np.float32)
+
+
+def _fill_preview_draw_text(state, result):
+    """Draw short, ASCII-safe status text in the owning viewport."""
+    try:
+        font_id = 0
+        blf.size(font_id, 13)
+        region = state["region"]
+        width = int(getattr(region, "width", 0))
+        height = int(getattr(region, "height", 0))
+        # Keep the status HUD in the unobstructed viewport corner.  In
+        # Blender's POST_PIXEL space the lower shelf occupies the last rows.
+        x, y = max(18, width - 520), max(120, height - 100)
+        if state["phase"] in {"prepare", "prepare_finalize"}:
+            cancel_line = (
+                "Esc queued; waiting for current processing step"
+                if state["phase"] == "prepare_finalize"
+                else "Esc cancel"
+            )
+            lines = [
+                "Smart Fill Preview - preparing surface data...",
+                f"Prep {float(state.get('prepare_seconds', 0.0)):.2f}s",
+                f"{cancel_line}; E again/Enter apply",
+            ]
+        elif state["phase"] == "compute":
+            lines = [
+                "Smart Fill Preview - computing local patch...",
+                f"Distance {float(state['desired_radius']):.4g} m",
+                "E again/Enter apply when ready; Esc cancel",
+            ]
+        else:
+            edge = "shape boundary" if result.get("shape_segments") else "distance boundary"
+            if result.get("patch_edge_reached"):
+                edge += " / analysis limit"
+            lines = [
+                "Smart Fill Preview",
+                f"Distance {float(result['radius']):.4g} m  Candidates {int(result['candidate_count'])}",
+                f"Ready - {edge}  Prep {float(state.get('prepare_seconds', 0.0)):.2f}s",
+                "E again: apply   Enter: apply   Esc: cancel",
+            ]
+        for index, line in enumerate(lines):
+            blf.position(font_id, x, y - index * 18, 0)
+            blf.color(font_id, 0.92, 0.96, 1.0, 1.0)
+            blf.draw(font_id, line)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        pass
+
+
+def _fill_preview_draw():
+    """Draw one session's copied candidate overlay and boundary lines."""
+    state = _fill_preview_state
+    if state is None or not state.get("active"):
+        return
+    try:
+        context = bpy.context
+        if context.area is None or int(context.area.as_pointer()) != int(state["area_key"]):
+            return
+        result = state.get("result")
+        shader = _fill_preview_shader
+        if shader is None:
+            return
+        if result is not None:
+            _fill_preview_build_draw_batches(state, result)
+            gpu.state.blend_set("ALPHA")
+            depth_set = False
+            depth_mask = False
+            try:
+                try:
+                    gpu.state.depth_test_set("LESS_EQUAL")
+                    depth_set = True
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    pass
+                try:
+                    gpu.state.depth_mask_set(False)
+                    depth_mask = True
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    pass
+                if len(result["triangles_np"]):
+                    shader.bind()
+                    shader.uniform_float("color", (0.16, 0.72, 0.96, 0.20))
+                    batch_for_shader(shader, "TRIS", {"pos": result["triangles_np"]}).draw(shader)
+                for key, color in (
+                    ("distance_lines_np", (0.20, 0.86, 1.0, 0.95)),
+                    ("shape_lines_np", (1.0, 0.38, 0.08, 0.95)),
+                ):
+                    if len(result[key]):
+                        shader.bind()
+                        shader.uniform_float("color", color)
+                        gpu.state.line_width_set(2.0)
+                        batch_for_shader(shader, "LINES", {"pos": result[key]}).draw(shader)
+            finally:
+                if depth_mask:
+                    try:
+                        gpu.state.depth_mask_set(True)
+                    except (AttributeError, RuntimeError, TypeError, ValueError):
+                        pass
+                if depth_set:
+                    try:
+                        gpu.state.depth_test_set("NONE")
+                    except (AttributeError, RuntimeError, TypeError, ValueError):
+                        pass
+                try:
+                    gpu.state.line_width_set(1.0)
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    pass
+                gpu.state.blend_set("NONE")
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        try:
+            gpu.state.blend_set("NONE")
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            pass
+
+
+def _fill_preview_draw_text_handler():
+    """Draw the 2D status HUD in POST_PIXEL, after the 3D overlay pass."""
+    state = _fill_preview_state
+    if state is None or not state.get("active"):
+        return
+    try:
+        context = bpy.context
+        if context.area is None or int(context.area.as_pointer()) != int(state["area_key"]):
+            return
+        _fill_preview_draw_text(state, state.get("result") or {})
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        pass
+
+
+def _fill_preview_tag_redraw(state=None):
+    if state is not None:
+        _tag_redraw(state.get("area"))
+    _topology_color_tag_redraw_all()
+
+
+def _fill_preview_stop_draw():
+    global _fill_preview_draw_handler, _fill_preview_text_draw_handler
+    for handler in (_fill_preview_draw_handler, _fill_preview_text_draw_handler):
+        if handler is None:
+            continue
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(handler, "WINDOW")
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            pass
+    _fill_preview_draw_handler = None
+    _fill_preview_text_draw_handler = None
+
+
+def _fill_preview_cancel(state=None, reason="cancel"):
+    global _fill_preview_state
+    current = _fill_preview_state
+    if state is not None and current is not state:
+        return
+    if current is None:
+        return
+    current["active"] = False
+    timer = current.get("timer")
+    if timer is not None:
+        try:
+            bpy.context.window_manager.event_timer_remove(timer)
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            pass
+    current["timer"] = None
+    _fill_preview_stop_draw()
+    _fill_preview_state = None
+    _fill_preview_tag_redraw(current)
+
+
+def _fill_preview_valid(state, context):
+    if state is None or not state.get("active"):
+        return False
+    try:
+        obj = state["obj"]
+        window = getattr(context, "window", None)
+        window_key = int(state.get("window_key", 0) or 0)
+        return (
+            context.area is not None
+            and int(context.area.as_pointer()) == int(state["area_key"])
+            and (
+                not window_key
+                or (window is not None and int(window.as_pointer()) == window_key)
+            )
+            and context.mode == "SCULPT"
+            and context.active_object is obj
+            and _fill_preview_signature(obj) == state["signature"]
+        )
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def _fill_preview_shader_get():
+    global _fill_preview_shader
+    if _fill_preview_shader is None:
+        try:
+            _fill_preview_shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            _fill_preview_shader = None
+    return _fill_preview_shader
+
+
+def _on_fill_preview_depsgraph_update(_scene, depsgraph):
+    """Invalidate cached graph data for updated objects/meshes.
+
+    Cache ownership is independent of an active preview session: a geometry or
+    visibility update while idle must not leave a reusable graph from the old
+    revision.  Blender exposes many Face Set writes as mesh updates too, so
+    those updates conservatively drop the cache; this costs a rebuild but never
+    permits stale geometry to reach a later E invocation.
+    """
+    state = _fill_preview_state
+    try:
+        updated_pointers = set()
+        for update in depsgraph.updates:
+            data = update.id
+            updated_pointers.add(int(data.as_pointer()))
+            # depsgraph updates commonly expose evaluated Object/Mesh copies;
+            # cache keys are owned by the original datablocks.
+            original = getattr(data, "original", None)
+            if original is not None:
+                updated_pointers.add(int(original.as_pointer()))
+        if not updated_pointers:
+            return
+        affected_session = False
+        if state is not None and state.get("active"):
+            obj = state["obj"]
+            affected_session = bool(
+                int(obj.as_pointer()) in updated_pointers
+                or int(obj.data.as_pointer()) in updated_pointers
+            )
+        for key in list(_fill_preview_adjacency_cache):
+            if key[0] in updated_pointers or key[1] in updated_pointers:
+                _fill_preview_adjacency_cache.pop(key, None)
+        for key in list(_fill_preview_cursor_cache):
+            if key[0] in updated_pointers or key[1] in updated_pointers:
+                _fill_preview_cursor_cache.pop(key, None)
+        if affected_session:
+            _fill_preview_cancel(state, "stale")
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        if state is not None and state.get("active"):
+            _fill_preview_cancel(state, "stale")
 
 
 def _fill_average(values, first, second, count, iterations):
@@ -6704,7 +8423,7 @@ def _smart_face_set_fill(context, coord, strict_mode=False):
 
 
 class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
-    """Apply the seed Face Set to one geometry-aware connected region."""
+    """Preview and apply one geometry-aware local Face Set region."""
 
     bl_idname = LOCAL_FACE_SET_GROW_OPERATOR_ID
     bl_label = "Mesh Focus: Smart Face Set Fill"
@@ -6731,6 +8450,7 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
         )
 
     def invoke(self, context, event):
+        global _fill_preview_state, _fill_preview_draw_handler, _fill_preview_text_draw_handler
         if not self.poll(context):
             return {"PASS_THROUGH"}
 
@@ -6744,38 +8464,465 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
         self.strict_mode = bool(
             self.strict_mode or getattr(event, "ctrl", False)
         )
-        return self.execute(context)
+        hit = _raycast_sculpt_face_set(
+            context, Vector((self.mouse_region_x, self.mouse_region_y))
+        )
+        if hit is None:
+            self.report({"WARNING"}, "Smart Face Set Fill: no visible face under cursor")
+            return {"CANCELLED"}
+        if _fill_preview_state is not None:
+            _fill_preview_cancel(_fill_preview_state, "replaced")
+        obj, seed_face, seed_face_set, _location, _screen = hit
+        signature = _fill_preview_signature(obj)
+        if signature is None:
+            return {"CANCELLED"}
+        self._preview_id = _next_session_id()
+        state = {
+            "active": True,
+            "phase": "prepare",
+            "operator": self,
+            "session_id": int(self._preview_id),
+            "area": context.area,
+            "area_key": int(context.area.as_pointer()),
+            "window_key": int(context.window.as_pointer()) if context.window else 0,
+            "region": context.region,
+            "obj": obj,
+            "obj_pointer": int(obj.as_pointer()),
+            "mesh_pointer": int(obj.data.as_pointer()),
+            "signature": signature,
+            "mode": str(context.mode),
+            "seed_face": int(seed_face),
+            "seed_face_set": int(seed_face_set),
+            "strict_mode": bool(self.strict_mode),
+            "cursor_prepare": True,
+            "cursor_local": True,
+            "seed_local": None,
+            "start_key": str(getattr(event, "type", "E") or "E"),
+            "start_key_released": False,
+            "adjacency": None,
+            "prepare_job": None,
+            "prepare_finalize_job": None,
+            "prepare_raw": None,
+            "prepare_stage": "queued",
+            "prepare_tick_times": [],
+            "distance_state": None,
+            "initial_radius": None,
+            "desired_radius": None,
+            "processed_radius": None,
+            "pending": True,
+            "result": None,
+            "results": {},
+            "generation": 0,
+            "prepare_seconds": 0.0,
+            "last_tick_seconds": 0.0,
+            "max_tick_seconds": 0.0,
+            "timer": None,
+            "last_timer_dispatch": 0.0,
+        }
+        _fill_preview_state = state
+        shader = _fill_preview_shader_get()
+        if shader is None:
+            _fill_preview_cancel(state, "shader")
+            return {"CANCELLED"}
+        try:
+            state["timer"] = context.window_manager.event_timer_add(
+                0.01, window=context.window
+            )
+            context.window_manager.modal_handler_add(self)
+            _fill_preview_draw_handler = bpy.types.SpaceView3D.draw_handler_add(
+                _fill_preview_draw, (), "WINDOW", "POST_VIEW"
+            )
+            _fill_preview_text_draw_handler = bpy.types.SpaceView3D.draw_handler_add(
+                _fill_preview_draw_text_handler, (), "WINDOW", "POST_PIXEL"
+            )
+            _fill_preview_tag_redraw(state)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            _fill_preview_cancel(state, "start")
+            return {"CANCELLED"}
+        return {"RUNNING_MODAL"}
+
+    def _process_timer(self, context, state):
+        import numpy as np
+
+        if not _fill_preview_valid(state, context):
+            _fill_preview_cancel(state, "stale")
+            return False
+        try:
+            if state["phase"] == "prepare":
+                started = time.perf_counter()
+                if state["prepare_job"] is None and state["prepare_raw"] is None:
+                    signature = state["signature"]
+                    cached = None if state.get("cursor_prepare") else _fill_preview_adjacency_cache.get(signature)
+                    if cached is not None:
+                        state["adjacency"] = cached
+                        state["initial_radius"] = _fill_preview_initial_radius(
+                            cached, state["seed_face"]
+                        )
+                        state["desired_radius"] = state["initial_radius"]
+                        state["phase"] = "compute"
+                        state["pending"] = True
+                        state["prepare_stage"] = "cache"
+                        return True
+                    if state.get("cursor_prepare"):
+                        state["prepare_job"] = _fill_preview_cursor_prepare_steps(
+                            state["obj"], state["seed_face"]
+                        )
+                    else:
+                        state["prepare_job"] = _fill_preview_adjacency_steps(state["obj"])
+                try:
+                    state["prepare_stage"] = next(state["prepare_job"])
+                    state["prepare_job_tick"] = time.perf_counter() - started
+                    state["prepare_tick_times"].append(
+                        {"stage": state["prepare_stage"], "seconds": state["prepare_job_tick"]}
+                    )
+                except StopIteration as complete:
+                    state["prepare_job"] = None
+                    if state.get("cursor_prepare"):
+                        adjacency = complete.value
+                        state["adjacency"] = adjacency
+                        state["initial_radius"] = float(adjacency["initial_radius"])
+                        state["desired_radius"] = state["initial_radius"]
+                        state["processed_radius"] = None
+                        state["seed_local"] = int(
+                            np.flatnonzero(
+                                adjacency["face_ids"] == int(state["seed_face"])
+                            )[0]
+                        )
+                        state["prepare_stage"] = "cursor-ready"
+                        state["phase"] = "compute"
+                        state["pending"] = True
+                    else:
+                        state["prepare_raw"] = complete.value
+                        state["prepare_stage"] = "arrays-ready"
+                        state["phase"] = "prepare_finalize"
+                elapsed = time.perf_counter() - started
+                state["last_tick_seconds"] = elapsed
+                state["max_tick_seconds"] = max(
+                    float(state["max_tick_seconds"]), elapsed
+                )
+                state["prepare_seconds"] += elapsed
+                _fill_preview_tag_redraw(state)
+                return True
+            if state["phase"] == "prepare_finalize":
+                started = time.perf_counter()
+                if state["prepare_finalize_job"] is None:
+                    state["prepare_finalize_job"] = _fill_preview_build_adjacency_cooperative(
+                        state["obj"], prepared=state["prepare_raw"]
+                    )
+                try:
+                    state["prepare_stage"] = next(state["prepare_finalize_job"])
+                    state["prepare_finalize_tick"] = time.perf_counter() - started
+                except StopIteration as complete:
+                    state["prepare_finalize_job"] = None
+                    adjacency = complete.value
+                    state["adjacency"] = adjacency
+                    state["prepare_raw"] = None
+                    state["initial_radius"] = _fill_preview_initial_radius(
+                        adjacency, state["seed_face"]
+                    )
+                    state["desired_radius"] = state["initial_radius"]
+                    state["prepare_stage"] = "adjacency-ready"
+                elapsed = time.perf_counter() - started
+                state["prepare_tick_times"].append(
+                    {"stage": state["prepare_stage"], "seconds": elapsed}
+                )
+                state["last_tick_seconds"] = elapsed
+                state["max_tick_seconds"] = max(
+                    float(state["max_tick_seconds"]), elapsed
+                )
+                state["prepare_seconds"] += elapsed
+                if state["prepare_finalize_job"] is not None:
+                    _fill_preview_tag_redraw(state)
+                    return True
+                state["phase"] = "compute"
+                state["pending"] = True
+                _fill_preview_tag_redraw(state)
+                return True
+            if state["phase"] == "compute" and state["pending"]:
+                radius = float(state["desired_radius"])
+                state["result"] = None
+                state["generation"] += 1
+                key = round(radius, 10)
+                cached = state["results"].get(key)
+                if cached is None:
+                    cached = _fill_preview_make_result(state, radius)
+                    state["results"][key] = cached
+                if int(cached.get("created_generation", -1)) != int(state["generation"]):
+                    cached = dict(cached)
+                    cached["created_generation"] = int(state["generation"])
+                state["last_tick_seconds"] = float(cached.get("compute_seconds", 0.0))
+                state["max_tick_seconds"] = max(
+                    float(state["max_tick_seconds"]),
+                    float(state["last_tick_seconds"]),
+                )
+                state["result"] = cached
+                state["processed_radius"] = radius
+                state["pending"] = False
+                state["phase"] = "ready"
+                _fill_preview_tag_redraw(state)
+                return True
+        except (
+            AttributeError,
+            IndexError,
+            MemoryError,
+            ReferenceError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as error:
+            try:
+                message = str(error).strip() or "preview calculation failed"
+                self.report({"WARNING"}, f"Smart Face Set Fill: {message}")
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                pass
+            _fill_preview_cancel(state, "compute-error")
+            return False
+        return True
+
+    def _finish_confirm(self, context, state):
+        import numpy as np
+
+        result = state.get("result")
+        if state.get("phase") != "ready" or result is None or state.get("pending"):
+            return {"RUNNING_MODAL"}
+        if not _fill_preview_valid(state, context):
+            _fill_preview_cancel(state, "stale")
+            return {"CANCELLED"}
+        if int(result.get("created_generation", -1)) != int(state["generation"]):
+            _fill_preview_cancel(state, "stale-result")
+            return {"CANCELLED"}
+        obj = state["obj"]
+        attr = obj.data.attributes.get(".sculpt_face_set")
+        if attr is None or attr.domain != "FACE":
+            _fill_preview_cancel(state, "face-set-layer")
+            return {"CANCELLED"}
+        try:
+            values = np.empty(len(attr.data), dtype=np.int32)
+            attr.data.foreach_get("value", values)
+            faces = np.asarray(result["faces"], dtype=np.int32)
+            changed = int(np.count_nonzero(values[faces] != int(state["seed_face_set"])))
+            if changed:
+                values[faces] = int(state["seed_face_set"])
+                attr.data.foreach_set("value", values)
+                obj.data.update()
+        except (
+            AttributeError,
+            IndexError,
+            MemoryError,
+            ReferenceError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ):
+            _fill_preview_cancel(state, "write-error")
+            return {"CANCELLED"}
+        candidate_count = int(result.get("candidate_count", len(faces)))
+        _fill_preview_cancel(state, "confirm")
+        self.report(
+            {"INFO"},
+            f"Smart Face Set Fill: {changed} faces changed ({candidate_count} candidates)",
+        )
+        return {"FINISHED"}
+
+    def modal(self, context, event):
+        state = _fill_preview_state
+        if state is None or state.get("operator") is not self:
+            return {"CANCELLED"}
+        event_type = getattr(event, "type", "")
+        event_value = getattr(event, "value", None)
+        if event_type == "ESC" and event_value in {None, "PRESS"}:
+            _fill_preview_cancel(state, "escape")
+            return {"CANCELLED"}
+        if event_type == state.get("start_key", "E"):
+            if event_value == "RELEASE":
+                state["start_key_released"] = True
+                return {"RUNNING_MODAL"}
+            if (
+                event_value == "PRESS"
+                and state.get("start_key_released")
+                and not bool(getattr(event, "is_repeat", False))
+            ):
+                return self._finish_confirm(context, state)
+            # The initial press, auto-repeat, and a press held through the
+            # preparation phase must never confirm the old/partial result.
+            return {"RUNNING_MODAL"}
+        if event.type in {"WHEELUPMOUSE", "WHEELDOWNMOUSE"}:
+            if state["initial_radius"] is not None:
+                factor = 1.25 if event.type == "WHEELUPMOUSE" else 1.0 / 1.25
+                base = float(state["desired_radius"] or state["initial_radius"])
+                state["desired_radius"] = max(
+                    float(state["initial_radius"]) * 0.125,
+                    min(float(state["initial_radius"]) * 16.0, base * factor),
+                )
+                state["pending"] = True
+                state["phase"] = "compute"
+                state["result"] = None
+                _fill_preview_tag_redraw(state)
+            return {"RUNNING_MODAL"}
+        if event.type in {"RET", "NUMPAD_ENTER", "ENTER"}:
+            return self._finish_confirm(context, state)
+        if event_type in {"LEFTMOUSE", "RIGHTMOUSE"}:
+            # Consume selection/stroke clicks while the preview owns the
+            # modal handler.  Neither button confirms nor cancels this tool.
+            return {"RUNNING_MODAL"}
+        if event.type == "TIMER":
+            # Blender 5.2.1 emits Event(type='TIMER', value='NOTHING') without
+            # an Event.timer property.  Newer builds may expose the timer and
+            # must still be identity-checked.  For the timer-less event, the
+            # modal's owning area/window and a short cadence guard provide the
+            # available ownership boundary and avoid duplicate foreign ticks.
+            event_timer = getattr(event, "timer", None)
+            expected_timer = state.get("timer")
+            if event_timer is not None and event_timer is not expected_timer:
+                return {"RUNNING_MODAL"}
+            now = time.perf_counter()
+            if (
+                event_timer is None
+                and now - float(state.get("last_timer_dispatch", 0.0)) < 0.005
+            ):
+                return {"RUNNING_MODAL"}
+            state["last_timer_dispatch"] = now
+            if not self._process_timer(context, state):
+                return {"CANCELLED"}
+            return {"RUNNING_MODAL"}
+        if not _fill_preview_valid(state, context):
+            _fill_preview_cancel(state, "stale")
+            return {"CANCELLED"}
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        # Blender can call execute from a scripted invocation. Route it through
+        # the same non-destructive modal entry point using the current cursor.
+        if not self.poll(context):
+            return {"CANCELLED"}
+        return self.invoke(
+            context,
+            type(
+                "_PreviewEvent",
+                (),
+                {
+                    "mouse_region_x": self.mouse_region_x,
+                    "mouse_region_y": self.mouse_region_y,
+                    "ctrl": bool(self.strict_mode),
+                },
+            )(),
+        )
+
+
+class VIEW3D_OT_mesh_focus_topology_color_assign(bpy.types.Operator):
+    """Assign or clear one topology guide color on selected visible faces."""
+
+    bl_idname = TOPOLOGY_COLOR_ASSIGN_OPERATOR_ID
+    bl_label = "Mesh Focus: Assign Topology Color"
+    bl_description = (
+        "Assign the selected visible faces a topology guide color; zero clears it"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    color_index: IntProperty(
+        name="Color",
+        description="Stored topology guide color number (0 clears the color)",
+        min=0,
+        max=6,
+        default=0,
+        options={"SKIP_SAVE"},
+    )
+
+    @classmethod
+    def poll(cls, context):
+        obj = _topology_color_object(context)
+        return (
+            context.area is not None
+            and context.area.type == "VIEW_3D"
+            and obj is not None
+        )
 
     def execute(self, context):
         if not self.poll(context):
             return {"CANCELLED"}
-
+        obj = _topology_color_object(context)
         try:
-            result = _smart_face_set_fill(
-                context,
-                Vector((self.mouse_region_x, self.mouse_region_y)),
-                strict_mode=bool(self.strict_mode),
-            )
+            bm = bmesh.from_edit_mesh(obj.data)
+            selected_faces = [
+                face
+                for face in bm.faces
+                if face.select and not face.hide
+            ]
+            # A no-selection keypress is intentionally a no-op and does not
+            # create the attribute or an unnecessary Undo step.
+            if not selected_faces:
+                return {"FINISHED"}
+            layer = bm.faces.layers.int.get(TOPOLOGY_COLOR_ATTRIBUTE_NAME)
+            if layer is None:
+                if int(self.color_index) == 0:
+                    return {"FINISHED"}
+                layer = bm.faces.layers.int.new(TOPOLOGY_COLOR_ATTRIBUTE_NAME)
+                # Creating the first custom-data layer can rebuild the
+                # BMFace wrappers.  Re-read the selected faces so the write
+                # never retains invalid elements across that boundary.
+                selected_faces = [
+                    face
+                    for face in bm.faces
+                    if face.select and not face.hide
+                ]
+            value = int(self.color_index)
+            changed = 0
+            for face in selected_faces:
+                if int(face[layer]) != value:
+                    face[layer] = value
+                    changed += 1
+            if changed:
+                bmesh.update_edit_mesh(
+                    obj.data,
+                    loop_triangles=False,
+                    destructive=False,
+                )
+                obj.data.update_tag()
+                _invalidate_topology_color_cache(obj)
+            return {"FINISHED"}
         except (
             AttributeError,
             ReferenceError,
             RuntimeError,
             TypeError,
             ValueError,
-            MemoryError,
         ):
-            result = None
-
-        if result is None:
             return {"CANCELLED"}
 
-        candidate_count, changed_faces = result
-        self.report(
-            {"INFO"},
-            f"Smart Face Set Fill: {changed_faces} faces changed "
-            f"({candidate_count} candidates)",
+
+class VIEW3D_PT_mesh_focus_topology_colors(bpy.types.Panel):
+    """N-panel controls for the six stored topology guide colors."""
+
+    bl_idname = "VIEW3D_PT_mesh_focus_topology_colors"
+    bl_label = "Topology Colors"
+    bl_category = TOPOLOGY_COLOR_PANEL_CATEGORY
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+
+    @classmethod
+    def poll(cls, context):
+        return _topology_color_object(context) is not None
+
+    def draw(self, context):
+        layout = self.layout
+        prefs = _addon_preferences()
+        if prefs is not None:
+            layout.prop(prefs, "topology_colors_enabled", text="表示")
+            layout.prop(prefs, "topology_color_opacity", text="透明度")
+        layout.label(text="選択面へ割り当て")
+        for row_start in (1, 4):
+            row = layout.row(align=True)
+            for color_index in range(row_start, row_start + 3):
+                operator = row.operator(
+                    TOPOLOGY_COLOR_ASSIGN_OPERATOR_ID,
+                    text=str(color_index),
+                )
+                operator.color_index = color_index
+        clear_operator = layout.operator(
+            TOPOLOGY_COLOR_ASSIGN_OPERATOR_ID,
+            text="0 解除",
         )
-        return {"FINISHED"}
+        clear_operator.color_index = 0
 
 
 def _remove_keymaps():
@@ -6797,6 +8944,7 @@ def _remove_keymaps():
             OPERATOR_ID,
             FACE_SET_ACTIVATION_OPERATOR_ID,
             LOCAL_FACE_SET_GROW_OPERATOR_ID,
+            TOPOLOGY_COLOR_ASSIGN_OPERATOR_ID,
         }
         for keymap in keyconfig.keymaps:
             for keymap_item in list(keymap.keymap_items):
@@ -6865,6 +9013,21 @@ def _rebuild_keymaps():
         )
         strict_grow_item.properties.strict_mode = True
         _addon_keymaps.append((keymap, strict_grow_item))
+
+        for color_index, key in enumerate(
+            ("ONE", "TWO", "THREE", "FOUR", "FIVE", "SIX", "ZERO"),
+            start=1,
+        ):
+            color_item = keymap.keymap_items.new(
+                TOPOLOGY_COLOR_ASSIGN_OPERATOR_ID,
+                key,
+                "PRESS",
+                any=False,
+                ctrl=True,
+                alt=True,
+            )
+            color_item.properties.color_index = 0 if key == "ZERO" else color_index
+            _addon_keymaps.append((keymap, color_item))
     except (AttributeError, RuntimeError, TypeError, ValueError):
         _remove_keymaps()
 
@@ -6872,6 +9035,7 @@ def _rebuild_keymaps():
 def _preferences_changed(_self, _context):
     if _is_registered:
         _rebuild_keymaps()
+        _invalidate_topology_color_cache()
 
 
 class MESH_FOCUS_ORBIT_AddonPreferences(bpy.types.AddonPreferences):
@@ -6922,6 +9086,22 @@ class MESH_FOCUS_ORBIT_AddonPreferences(bpy.types.AddonPreferences):
         ),
         default=False,
     )
+    topology_colors_enabled: BoolProperty(
+        name="Topology Colors",
+        description="Show the stored six-color topology guide overlay",
+        default=True,
+        update=_preferences_changed,
+    )
+    topology_color_opacity: FloatProperty(
+        name="Topology Color Opacity",
+        description="Opacity of the topology guide face overlay",
+        default=0.35,
+        min=0.05,
+        max=1.0,
+        precision=2,
+        subtype="FACTOR",
+        update=_preferences_changed,
+    )
 
     def draw(self, context):
         layout = self.layout
@@ -6932,11 +9112,14 @@ class MESH_FOCUS_ORBIT_AddonPreferences(bpy.types.AddonPreferences):
         layout.prop(self, "debug_display")
         layout.prop(self, "show_indicator")
         layout.prop(self, "retopoflow_target_island_filter")
+        layout.prop(self, "topology_colors_enabled")
+        layout.prop(self, "topology_color_opacity")
         layout.prop(self, "double_tap_window")
         layout.separator()
         layout.label(text="Double-tap the activation key in a 3D Viewport.")
         layout.label(text="Ctrl + double-tap uses Face Set MFO on the Reference Object.")
         layout.label(text="The viewport center is ray-cast once on activation.")
+        layout.label(text="Ctrl + Alt + 1..6 assigns selected faces; 0 clears.")
 
 
 CLASSES = (
@@ -6945,6 +9128,8 @@ CLASSES = (
     VIEW3D_OT_mesh_focus_face_set_activate,
     VIEW3D_OT_mesh_focus_orbit,
     VIEW3D_OT_mesh_focus_local_face_set_grow,
+    VIEW3D_OT_mesh_focus_topology_color_assign,
+    VIEW3D_PT_mesh_focus_topology_colors,
     MESH_FOCUS_ORBIT_AddonPreferences,
 )
 
@@ -6969,27 +9154,57 @@ def register():
     # though the previous module no longer has Python state for it.
     _restore_retopoflow_hooks()
     _schedule_orphan_cleanup()
+    _start_topology_color_draw()
     if _on_load_pre not in bpy.app.handlers.load_pre:
         bpy.app.handlers.load_pre.append(_on_load_pre)
     if _on_load_post not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_on_load_post)
     if _on_undo_post not in bpy.app.handlers.undo_post:
         bpy.app.handlers.undo_post.append(_on_undo_post)
+    if _on_topology_color_depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(
+            _on_topology_color_depsgraph_update
+        )
+    if _on_topology_color_undo_post not in bpy.app.handlers.undo_post:
+        bpy.app.handlers.undo_post.append(_on_topology_color_undo_post)
+    if _on_topology_color_redo_post not in bpy.app.handlers.redo_post:
+        bpy.app.handlers.redo_post.append(_on_topology_color_redo_post)
+    if _on_topology_color_load_pre not in bpy.app.handlers.load_pre:
+        bpy.app.handlers.load_pre.append(_on_topology_color_load_pre)
+    if _on_topology_color_load_post not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_on_topology_color_load_post)
+    if _on_fill_preview_depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(_on_fill_preview_depsgraph_update)
     _rebuild_keymaps()
 
 
 def unregister():
     global _is_registered
     if not _is_registered:
+        _fill_preview_cancel(reason="unregister")
         _cancel_undo_orphan_cleanup()
         _retopo_undo_tombstones.clear()
         _retopo_debug_sessions.clear()
         _retopo_debug_retired_sessions.clear()
         if _on_undo_post in bpy.app.handlers.undo_post:
             bpy.app.handlers.undo_post.remove(_on_undo_post)
+        for _handler_list_name, _handler in (
+            ("depsgraph_update_post", _on_topology_color_depsgraph_update),
+            ("undo_post", _on_topology_color_undo_post),
+            ("redo_post", _on_topology_color_redo_post),
+            ("load_pre", _on_topology_color_load_pre),
+            ("load_post", _on_topology_color_load_post),
+        ):
+            _handler_list = getattr(bpy.app.handlers, _handler_list_name)
+            if _handler in _handler_list:
+                _handler_list.remove(_handler)
+        if _on_fill_preview_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
+            bpy.app.handlers.depsgraph_update_post.remove(_on_fill_preview_depsgraph_update)
         _restore_retopoflow_hooks()
+        _stop_topology_color_draw()
         return
     _finish_all_states()
+    _fill_preview_cancel(reason="unregister")
     _cancel_undo_orphan_cleanup()
     _cleanup_orphan_face_set_proxies()
     _retopo_undo_tombstones.clear()
@@ -7002,8 +9217,23 @@ def unregister():
         bpy.app.handlers.load_post.remove(_on_load_post)
     if _on_undo_post in bpy.app.handlers.undo_post:
         bpy.app.handlers.undo_post.remove(_on_undo_post)
+    for _handler_list_name, _handler in (
+        ("depsgraph_update_post", _on_topology_color_depsgraph_update),
+        ("undo_post", _on_topology_color_undo_post),
+        ("redo_post", _on_topology_color_redo_post),
+        ("load_pre", _on_topology_color_load_pre),
+        ("load_post", _on_topology_color_load_post),
+    ):
+        _handler_list = getattr(bpy.app.handlers, _handler_list_name)
+        if _handler in _handler_list:
+            _handler_list.remove(_handler)
+    if _on_fill_preview_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(_on_fill_preview_depsgraph_update)
+    _stop_topology_color_draw()
     _remove_keymaps()
     _local_face_set_adjacency_cache.clear()
+    _fill_preview_adjacency_cache.clear()
+    _fill_preview_cursor_cache.clear()
     _is_registered = False
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)
@@ -7013,3 +9243,156 @@ def unregister():
 
 if __name__ == "__main__":
     register()
+def _fill_preview_build_adjacency_cooperative(obj, prepared=None):
+    """Build only the reusable surface graph needed by preview sessions.
+
+    This preparation reads all loops once, but intentionally does not compute
+    curvature, valley bands, partition ownership, or contour relaxation.  All
+    geometry features are recomputed on the session's candidate+halo patch.
+    """
+    import numpy as np
+
+    mesh = obj.data
+    signature = _fill_preview_signature(obj)
+    if signature is None:
+        raise RuntimeError("preview target is unavailable")
+    cached = _fill_preview_adjacency_cache.get(signature)
+    if cached is not None:
+        return cached
+
+    if prepared is None:
+        vertex_count = len(mesh.vertices)
+        face_count = len(mesh.polygons)
+        coordinates = np.empty((vertex_count, 3), dtype=np.float32)
+        loop_edges = np.empty(len(mesh.loops), dtype=np.int32)
+        loop_vertices = np.empty(len(mesh.loops), dtype=np.int32)
+        totals = np.empty(face_count, dtype=np.int32)
+        hidden = np.empty(face_count, dtype=bool)
+        mesh.vertices.foreach_get("co", coordinates.ravel())
+        mesh.loops.foreach_get("edge_index", loop_edges)
+        mesh.loops.foreach_get("vertex_index", loop_vertices)
+        mesh.polygons.foreach_get("loop_total", totals)
+        mesh.polygons.foreach_get("hide", hidden)
+        centers = np.empty((face_count, 3), dtype=np.float32)
+        normals = np.empty((face_count, 3), dtype=np.float32)
+        mesh.polygons.foreach_get("center", centers.ravel())
+        mesh.polygons.foreach_get("normal", normals.ravel())
+    else:
+        coordinates = prepared["coordinates"]
+        loop_edges = prepared["loop_edges"]
+        loop_vertices = prepared["loop_vertices"]
+        totals = prepared["totals"]
+        hidden = prepared["hidden"]
+        centers = prepared["centers"]
+        normals = prepared["normals"]
+        vertex_count = len(coordinates)
+        face_count = len(totals)
+
+    transform = np.asarray(obj.matrix_world.to_3x3(), dtype=np.float64)
+    world_matrix = np.asarray(obj.matrix_world, dtype=np.float64)
+    translation = world_matrix[:3, 3]
+    world_vertices = coordinates.astype(np.float64) @ transform.T + translation
+    centers = centers.astype(np.float64) @ transform.T + translation
+    normals = normals.astype(np.float64) @ np.linalg.inv(transform)
+    normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1.0e-20)
+    yield "world-space"
+
+    face_ids = np.repeat(np.arange(face_count, dtype=np.int32), totals)
+    order = np.argsort(loop_edges, kind="stable")
+    sorted_edges = loop_edges[order]
+    starts = np.r_[0, np.flatnonzero(np.diff(sorted_edges)) + 1]
+    lengths = np.diff(np.r_[starts, len(order)])
+    pair_starts = starts[lengths == 2]
+    paired_loops = order[pair_starts]
+    first = face_ids[paired_loops]
+    second = face_ids[order[pair_starts + 1]]
+    face_starts = np.r_[0, np.cumsum(totals)[:-1]]
+    paired_next = face_starts[first] + (
+        (paired_loops - face_starts[first] + 1) % totals[first]
+    )
+    edge_v0 = loop_vertices[paired_loops]
+    edge_v1 = loop_vertices[paired_next]
+    yield "edge-pairs"
+
+    yield "seam-before"
+    # Preserve the existing unwelded-seam behavior.  Only coincident open
+    # edges with opposite winding and compatible normals become bridges.
+    border_loops = order[starts[lengths == 1]]
+    seam_count = 0
+    if len(border_loops):
+        border_faces = face_ids[border_loops]
+        next_loops = face_starts[border_faces] + (
+            (border_loops - face_starts[border_faces] + 1) % totals[border_faces]
+        )
+        points_a = world_vertices[loop_vertices[border_loops]]
+        points_b = world_vertices[loop_vertices[next_loops]]
+        edge_lengths = np.linalg.norm(points_b - points_a, axis=1)
+        tolerance = max(float(np.median(edge_lengths)) * 1.0e-4, 1.0e-12)
+        quantized = np.rint(np.vstack((points_a, points_b)) / tolerance).astype(np.int64)
+        _, point_ids = np.unique(quantized, axis=0, return_inverse=True)
+        pa, pb = np.split(point_ids, 2)
+        signatures = np.column_stack((np.minimum(pa, pb), np.maximum(pa, pb)))
+        _, inverse, counts = np.unique(
+            signatures, axis=0, return_inverse=True, return_counts=True
+        )
+        seam_order = np.argsort(inverse, kind="stable")
+        seam_starts = np.r_[0, np.cumsum(counts)[:-1]][counts == 2]
+        ia, ib = seam_order[seam_starts], seam_order[seam_starts + 1]
+        fa, fb = border_faces[ia], border_faces[ib]
+        match = (
+            (pa[ia] == pb[ib])
+            & (pb[ia] == pa[ib])
+            & (pa[ia] != pb[ia])
+            & (fa != fb)
+            & (np.sum(normals[fa] * normals[fb], axis=1) > 0.5)
+            & (np.linalg.norm(points_a[ia] - points_b[ib], axis=1) <= tolerance)
+            & (np.linalg.norm(points_b[ia] - points_a[ib], axis=1) <= tolerance)
+        )
+        first = np.r_[first, fa[match]]
+        second = np.r_[second, fb[match]]
+        edge_v0 = np.r_[edge_v0, loop_vertices[border_loops[ia[match]]]]
+        edge_v1 = np.r_[edge_v1, loop_vertices[next_loops[ia[match]]]]
+        seam_count = int(np.count_nonzero(match))
+        yield "seam-after"
+
+    valid = ~(hidden[first] | hidden[second]) & (first != second)
+    first, second = first[valid], second[valid]
+    edge_v0, edge_v1 = edge_v0[valid], edge_v1[valid]
+    delta = centers[second] - centers[first]
+    distance = np.maximum(np.linalg.norm(delta, axis=1), 1.0e-20)
+    sources = np.r_[first, second]
+    destinations = np.r_[second, first]
+    source_edges = np.r_[np.arange(len(first)), np.arange(len(first))]
+    edge_v0_directed = np.r_[edge_v0, edge_v0]
+    edge_v1_directed = np.r_[edge_v1, edge_v1]
+    order = np.argsort(sources, kind="stable")
+    yield "csr-before"
+    degree = np.bincount(sources, minlength=face_count)
+    offsets = np.r_[0, np.cumsum(degree)].astype(np.int64)
+    yield "csr-after"
+    cached = {
+        "signature": signature,
+        "count": int(face_count),
+        "centers": centers,
+        "normals": normals,
+        "hidden": hidden,
+        "world_vertices": world_vertices,
+        "offsets": offsets,
+        "neighbors": destinations[order].astype(np.int32, copy=False),
+        "neighbor_lengths": np.r_[distance, distance][order],
+        "edge_v0": edge_v0_directed[order].astype(np.int32, copy=False),
+        "edge_v1": edge_v1_directed[order].astype(np.int32, copy=False),
+        "first": first,
+        "second": second,
+        "pair_lengths": distance,
+        "pair_v0": edge_v0,
+        "pair_v1": edge_v1,
+        "seam_count": seam_count,
+    }
+    # Drop obsolete revisions for this mesh while retaining unrelated meshes.
+    mesh_pointer = signature[1]
+    for key in list(_fill_preview_adjacency_cache):
+        if key[1] == mesh_pointer and key != signature:
+            _fill_preview_adjacency_cache.pop(key, None)
+    _fill_preview_adjacency_cache[signature] = cached
+    return cached

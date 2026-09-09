@@ -2,13 +2,14 @@
 
 Blender 5.2 用のリトポロジー支援アドオンです。
 
-現在のアドオンバージョン: **3.0.1**
+現在のアドオンバージョン: **3.2.12**
 
 主な機能:
 
 - **通常 MFO**: 画面中央の Reference Object 表面を一時 Orbit 中心にする
 - **Face Set MFO (FSMFO)**: Reference Object の対象 Face Set と、対応する Retopo island だけを一時表示する
-- **Smart Face Set Fill**: Sculpt Mode でカーソル直下の髪束領域を一発で Face Set 化する
+- **Smart Face Set Fill**: Sculpt Mode でカーソル直下の局所候補をプレビューし、E再押下またはEnterで表示面だけを Face Set 化する
+- **Topology Colors**: 編集中の選択面へ6色の半透明ガイドを割り当てる
 
 ## インストール
 
@@ -27,8 +28,9 @@ Reference Object は、リトポロジー対象のハイポリメッシュです
 | --- | --- |
 | 通常 MFO ON/OFF | 設定キーを短時間に2回押す |
 | Face Set MFO ON/OFF | `Ctrl` を押しながら設定キーを短時間に2回押す |
-| Smart Face Set Fill | Sculpt Mode で `E` |
-| Smart Face Set Fill 厳格モード | Sculpt Mode で `Ctrl + E` |
+| Smart Face Set Fill プレビュー | Sculpt Mode で `E`、開始Eのrelease後に `E` を再押下（または `Enter`）で確定、ホイールで距離変更、`Esc` で取消 |
+| Smart Face Set Fill 厳格プレビュー | Sculpt Mode で `Ctrl + E`、開始Eのrelease後に `E` を再押下（または `Enter`）で確定、ホイールで距離変更、`Esc` で取消 |
+| Topology Colors | 編集モードで `Ctrl + Alt + 1..6`（`0`で解除） |
 
 通常 MFO と FSMFO は別の KeyMap Item から直接起動します。FSMFO は外側の非 Undo Trigger を経由せず、Undo 対象の Activation Operator が直接起動し、その中から非 Undo Watcher を開始します。
 
@@ -93,7 +95,7 @@ Blender 本体の Access Violation を避けるため、Undo の自動実行や�
 
 ## Smart Face Set Fill
 
-Sculpt Mode でカーソルを Face Set 上へ置き、`E` を押すと一発適用します。マウスドラッグによるプレビューや Timer は使用しません。
+Sculpt Mode でカーソルを Face Set 上へ置き、`E` を押すと局所プレビューを開始します。開始EをreleaseしてからEを再押下、または `Enter` で確定し、`Esc` で取消します。開始キーの押しっぱなしやrepeat、ready前のE/Enterでは確定しません。プレビュー中の左/右クリックは確定・取消に使わず、Sculptのstrokeや選択へ渡しません。
 
 処理は次のように動作します。
 
@@ -103,16 +105,26 @@ Sculpt Mode でカーソルを Face Set 上へ置き、`E` を押すと一発適
 - 平滑化した法線と複数の範囲の曲率から、段差・谷の境界を検出する
 - 凸の頂上は通過し、方向別の凹み判定で付け根の谷を検出する。境界は1近傍分広げる
 - 滑らかな領域を取得し、境界の帯は近い領域へ割り当てる。帯から別領域へ再拡張しない
-- 非表示面・非多様体エッジは横断しない。距離・10万面による打ち切りは行わない
+- 非表示面・非多様体エッジは横断しない。rayが非表示面に当たった場合はその面を越えて最初の可視面をseedにする。10万面の固定上限は設けず、探索距離は初期半径の16倍を上限にホイールで調整する
 - 対象 Face に既存の seed Face Set ID を直接書き込む
+
+初回準備では Edit Mode へ切り替えず、全 Face の center と全 loop の edge 次数だけを読み取ります。そこからカーソル seed の Euclidean 範囲と解析用 halo を切り出し、範囲内の polygon の edge、法線、非表示状態だけで局所 CSR、距離、谷・境界判定を作ります。全体の曲率や partition を先に作ってから切り出す処理は行いません。edge の全体次数が2の共有だけを通常接続とし、次数1の継ぎ目は両端点の一致と逆向き、法線の互換性を確認した場合だけ橋渡しします。局所切断境界や非多様体 edge は継ぎ目として扱いません。ホイールで範囲を広げた場合は不足した cursor 範囲だけを追加準備し、縮小と同じ半径への再訪では準備済みの局所データを再利用します。
 
 `Ctrl + E` は厳格モードです。探索範囲は通常モードと同じで、境界判定だけを厳しくします。結果が気に入らない場合は、通常の `Ctrl + Z` で操作全体を1ステップ戻してください。
 
 Blender同梱のNumPyを使用します。大規模メッシュでは初回の形状解析に時間がかかります。形状が同じ間は解析結果を再利用し、Sculpt・Undo・接続変更・非表示変更後は再計算します。まず面の向きと接平面からの高さが連続する部分を元の領域へ確保し、盛り上がりが平面側へ侵食するのを抑えます。残る境界帯の所属は面に沿った実距離で決め、その帯の中だけで、広く平滑化した谷の強さと境界の実際の長さを使って線を整えます。画面の明るさは参照せず、視点や照明を変えても同じ境界を使います。メッシュの座標は変更しません。広い途切れや形状上区別できない境界は越える可能性があり、滑らかな領域が全くない部分はクリック面だけを対象にします。
 
-この機能は Sculpt Mode 専用です。`bpy.ops.sculpt.expand()`、Sculpt Mask、GPU Preview、Timer、Face Set の新規 ID 生成は使用しません。
+大規模メッシュの初回準備では Edit Mode へ切り替えず、全 Face の center と全 loop の edge 次数だけを読み取ります。カーソル seed の Euclidean 範囲と解析用 halo を切り出し、範囲内の polygon の edge、法線、非表示状態だけで局所 CSR と形状判定を作ります。全体の曲率や partition を先に計算してから切り出す処理は行いません。edge の全体次数が2の共有だけを接続し、次数1の継ぎ目は両端点の一致、逆向き、法線の互換性を確認した場合だけ橋渡しします。局所切断境界と非多様体 edge は継ぎ目として扱いません。ホイール拡大時は不足した範囲だけを追加準備し、縮小と同じ半径への再訪では局所データを再利用します。
+
+この機能は Sculpt Mode 専用です。`bpy.ops.sculpt.expand()`、Sculpt Mask、画面の深度や表裏で候補を決める処理、Face Set の新規 ID 生成は使用しません。準備中の処理は内部timerで区切られ、ready前のE再押下やEnterは確定しません。
 
 ショートカットは Blender の `Preferences > Keymap` で `Mesh Focus: Local Face Set Grow` を検索して変更できます。
+
+## Topology Colors
+
+編集モードで面を選択し、上段の `Ctrl + Alt + 1`〜`6` を押すと、選択した表示中の面へ色番号を保存して半透明オーバーレイを表示します。`Ctrl + Alt + 0` は選択面の色を解除します。RetopoFlow 4 の PolyPen 待機中にもこの機能のキー割当が登録されます。選択を解除した後も色は残り、N パネルの `MFO > Topology Colors` から表示のON/OFF、透明度、割当、解除を操作できます。
+
+色番号はマテリアルを作らず、active Edit Mesh の `mfo_topology_color` FACE 整数属性（0=解除、1〜6=色）へ保存します。.blend、Undo/Redoに含まれます。非表示面、未選択面、別オブジェクトの面、既存マテリアルは変更しません。面の境界と選択中の辺・頂点は読み分けられるように表示します。
 
 ## Preferences
 
@@ -126,6 +138,7 @@ Blender同梱のNumPyを使用します。大規模メッシュでは初回の�
 - `Show Mode Indicator`: MFO/FSMFO の状態表示
 - `Debug Display`: Orbit 中心のデバッグポイント表示
 - `RetopoFlow Focus-Island Snap/Weld Filter`: FSMFO 中の RetopoFlow Snap/Weld 制限。既定 OFF
+- `Topology Colors`: 6色オーバーレイの表示と透明度
 
 ## 制限と復旧
 
@@ -141,13 +154,14 @@ Blender同梱のNumPyを使用します。大規模メッシュでは初回の�
 
 A Blender 5.2 add-on for manual retopology workflows.
 
-Current add-on version: **3.0.1**
+Current add-on version: **3.2.12**
 
 Main features:
 
 - **Normal MFO**: temporarily orbits around the surface point at the center of the viewport
 - **Face Set MFO (FSMFO)**: temporarily shows one Reference Face Set and its matching Retopo island
-- **Smart Face Set Fill**: applies the Face Set under the cursor to a geometry-aware hair-bundle region in one step
+- **Smart Face Set Fill**: previews a local geometry-aware region under the cursor and applies only the displayed faces after a second E press or Enter
+- **Topology Colors**: assigns six translucent topology guide colors to selected Edit Mesh faces
 
 ## Installation
 
@@ -166,8 +180,9 @@ The default Activation Key is `Right Shift`.
 | --- | --- |
 | Normal MFO ON/OFF | Double-tap the configured key |
 | Face Set MFO ON/OFF | Hold `Ctrl` and double-tap the configured key |
-| Smart Face Set Fill | `E` in Sculpt Mode |
-| Strict Smart Face Set Fill | `Ctrl + E` in Sculpt Mode |
+| Smart Face Set Fill preview | `E` in Sculpt Mode; release and press `E` again (or press `Enter`) to apply, wheel changes distance, `Esc` cancels |
+| Strict Smart Face Set Fill preview | `Ctrl + E` in Sculpt Mode; release and press `E` again (or press `Enter`) to apply, wheel changes distance, `Esc` cancels |
+| Topology Colors | `Ctrl + Alt + 1..6` in Edit Mode (`0` clears) |
 
 Normal MFO and FSMFO use separate KeyMap Items. FSMFO is started directly by its Undo-enabled Activation Operator; it does not pass through an outer non-Undo trigger. The Activation Operator starts the non-Undo Watcher and then finishes.
 
@@ -232,7 +247,7 @@ Undo is not executed automatically. This avoids repeating Blender Access Violati
 
 ## Smart Face Set Fill
 
-In Sculpt Mode, place the cursor over a Face Set and press `E` to apply it in one operation. There is no drag preview or Timer.
+In Sculpt Mode, place the cursor over a Face Set and press `E` to start the local preview. Release the starting `E`, then press `E` again or press `Enter` to apply; `Esc` cancels. Holding the starting key or its repeat events cannot apply a partial result. Left and right clicks are consumed by the modal preview and do not apply or cancel it.
 
 The algorithm:
 
@@ -242,16 +257,24 @@ The algorithm:
 - Detects steps and valleys using smoothed normals and curvature at multiple scales
 - Traverses convex crests, detects concave feet with directional curvature, and expands the boundary by one adjacency step
 - Finds the smooth core, then assigns boundary faces to the nearest core without merging cores
-- Respects hidden faces and non-manifold boundaries, with no distance or 100,000-face cutoff
+- Skips hidden faces and non-manifold boundaries; a ray that first reaches a hidden face continues to the first visible face. There is no fixed 100,000-face cutoff; wheel-adjusted search distance is capped at 16 times the initial radius
 - Writes the existing seed Face Set ID directly to the accepted faces
+
+The first preparation stays in Sculpt Mode. It reads only all face centers and the global degree of every loop edge, then crops a cursor-centered Euclidean range with an analysis halo. Polygon edges, normals, and hidden flags are read only inside that range to build the local CSR, surface distances, valley bands, and boundaries. It does not build full-mesh curvature or partition data and crop it afterward. A normal shared edge is connected only when its global degree is two. A degree-one seam is bridged only after coincident endpoints, reverse winding, and compatible normals are confirmed. Crop boundaries and non-manifold edges are never treated as seams. Wheel expansion prepares only the missing cursor range; shrink and revisiting a prepared radius reuse the local data.
 
 `Ctrl + E` enables Strict Mode with the same search extent and stricter boundary decisions. Use normal Blender `Ctrl + Z` to undo the complete operation in one step.
 
-Uses Blender's bundled NumPy. Initial analysis of large meshes can take several seconds; geometry results are reused until coordinates, topology, transforms or visibility change. Tangent-continuous core extensions are reserved first, using both source-anchored normal and plane-height tolerances; these extensions cannot be reassigned by contour smoothing. This keeps the flat base beyond a raised foot on the base side. Remaining boundary ownership uses physical surface distance, followed by up to six local contour-relaxation sweeps restricted to the boundary band. The energy combines physical boundary length with broadly smoothed concave normal changes; it does not sample screen brightness and is independent of view and lighting. Mesh coordinates are unchanged. Wide gaps or geometrically indistinguishable boundaries can still leak. Components with no smooth core fall back to the clicked face.
+Uses Blender's bundled NumPy. Initial local preparation of large meshes can take several seconds; geometry results are reused until coordinates, topology, transforms or visibility change. Tangent-continuous core extensions are reserved first, using both source-anchored normal and plane-height tolerances; these extensions cannot be reassigned by contour smoothing. This keeps the flat base beyond a raised foot on the base side. Remaining boundary ownership uses physical surface distance, followed by up to six local contour-relaxation sweeps restricted to the boundary band. The energy combines physical boundary length with broadly smoothed concave normal changes; it does not sample screen brightness and is independent of view and lighting. Mesh coordinates are unchanged. Wide gaps or geometrically indistinguishable boundaries can still leak. Components with no smooth core fall back to the clicked face.
 
-This feature is Sculpt Mode only. It does not use `bpy.ops.sculpt.expand()`, Sculpt Mask, GPU preview, Timer-driven interaction, or newly generated Face Set IDs.
+This feature is Sculpt Mode only. It does not use `bpy.ops.sculpt.expand()`, Sculpt Mask, screen depth/backface state to choose candidates, or newly generated Face Set IDs. Preparation is divided across internal timer ticks; E/Enter before Ready cannot apply a partial result.
 
 The shortcut can be changed in Blender's `Preferences > Keymap` by searching for `Mesh Focus: Local Face Set Grow`.
+
+## Topology Colors
+
+In Edit Mode, select faces and press the top-row `Ctrl + Alt + 1` through `6` to store a color number on the selected visible faces and draw a translucent overlay. `Ctrl + Alt + 0` clears the selected faces. The feature's keymap entries are also registered while RetopoFlow 4 PolyPen is waiting. Colors remain visible after deselection. Use `MFO > Topology Colors` in the N-panel to toggle display, adjust opacity, assign colors, or clear them.
+
+The color number is stored without creating materials, in the active Edit Mesh's `mfo_topology_color` FACE integer attribute (`0` cleared, `1` through `6` colored). It is included in `.blend` files and Blender Undo/Redo. Hidden faces, unselected faces, other objects, and existing materials are left unchanged. Face boundaries and selected edges and vertices remain distinguishable.
 
 ## Preferences
 
@@ -265,6 +288,7 @@ Open `Edit > Preferences > Add-ons > Mesh Focus Orbit`.
 - `Show Mode Indicator`: Show the MFO/FSMFO status indicator
 - `Debug Display`: Show the temporary orbit-center debug point
 - `RetopoFlow Focus-Island Snap/Weld Filter`: Restrict RetopoFlow Snap/Weld candidates during FSMFO; OFF by default
+- `Topology Colors`: Toggle the six-color overlay and adjust its opacity
 
 ## Limitations and recovery
 
