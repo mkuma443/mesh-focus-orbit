@@ -2,7 +2,7 @@
 
 Blender 5.2 用のリトポロジー支援アドオンです。
 
-現在のアドオンバージョン: **3.2.12**
+現在のアドオンバージョン: **3.2.17**
 
 主な機能:
 
@@ -107,14 +107,18 @@ Sculpt Mode でカーソルを Face Set 上へ置き、`E` を押すと局所プ
 - 滑らかな領域を取得し、境界の帯は近い領域へ割り当てる。帯から別領域へ再拡張しない
 - 非表示面・非多様体エッジは横断しない。rayが非表示面に当たった場合はその面を越えて最初の可視面をseedにする。10万面の固定上限は設けず、探索距離は初期半径の16倍を上限にホイールで調整する
 - 対象 Face に既存の seed Face Set ID を直接書き込む
+- 固定した複数方向の Lambert 照度近似を使い、まず指定距離の局所 patch を取得してから谷の符号付き変化を検出する。実影や AO、画面の照明は使わず、谷barrierでseed側の元face成分を選び、その周囲を元の面で補正する。半径変更ごとに現在patchから再判定するため、有限長の谷端での正当な再加入を妨げない
+- 指定距離内の可視面graphで候補に囲まれた未選択成分だけを補完する。距離境界、欠落edge（crop/メッシュ境界、非多様体、hidden、未接続seam）へつながる成分や別sheetは補完しない
+- 予測で表示した面集合をそのまま確定に使う。履歴は現在と直前2段階、GPU描画 batch は最大3候補まで保持し、ready中に再生成しない
+- 同期計算中と最新結果の実描画前後に届いたwheel入力は捨て、最新結果の描画後に短い排出区間を経た次のwheelだけを1段階として受け付ける。Escとready済み結果のE/Enter確定は維持する
 
-初回準備では Edit Mode へ切り替えず、全 Face の center と全 loop の edge 次数だけを読み取ります。そこからカーソル seed の Euclidean 範囲と解析用 halo を切り出し、範囲内の polygon の edge、法線、非表示状態だけで局所 CSR、距離、谷・境界判定を作ります。全体の曲率や partition を先に作ってから切り出す処理は行いません。edge の全体次数が2の共有だけを通常接続とし、次数1の継ぎ目は両端点の一致と逆向き、法線の互換性を確認した場合だけ橋渡しします。局所切断境界や非多様体 edge は継ぎ目として扱いません。ホイールで範囲を広げた場合は不足した cursor 範囲だけを追加準備し、縮小と同じ半径への再訪では準備済みの局所データを再利用します。
+初回準備では Edit Mode へ切り替えず、全 Face の center と全 loop の edge 次数だけを読み取ります。そこからカーソル seed の Euclidean 範囲と解析用 halo を切り出し、範囲内の polygon の edge、法線、非表示状態だけで局所 CSR、距離、谷・境界判定を作ります。全体の曲率や partition を先に作ってから切り出す処理は行いません。edge の全体次数が2の共有だけを通常接続とし、次数1の継ぎ目は両端点の一致と逆向き、法線の互換性を確認した場合だけ橋渡しします。局所切断境界や非多様体 edge は継ぎ目として扱いません。ホイールで範囲を広げた場合は保持済み配列・面 record を使いながら要求された局所 crop と record を再構築し、縮小と同じ半径への再訪では準備済みの結果を再利用します。
 
 `Ctrl + E` は厳格モードです。探索範囲は通常モードと同じで、境界判定だけを厳しくします。結果が気に入らない場合は、通常の `Ctrl + Z` で操作全体を1ステップ戻してください。
 
 Blender同梱のNumPyを使用します。大規模メッシュでは初回の形状解析に時間がかかります。形状が同じ間は解析結果を再利用し、Sculpt・Undo・接続変更・非表示変更後は再計算します。まず面の向きと接平面からの高さが連続する部分を元の領域へ確保し、盛り上がりが平面側へ侵食するのを抑えます。残る境界帯の所属は面に沿った実距離で決め、その帯の中だけで、広く平滑化した谷の強さと境界の実際の長さを使って線を整えます。画面の明るさは参照せず、視点や照明を変えても同じ境界を使います。メッシュの座標は変更しません。広い途切れや形状上区別できない境界は越える可能性があり、滑らかな領域が全くない部分はクリック面だけを対象にします。
 
-大規模メッシュの初回準備では Edit Mode へ切り替えず、全 Face の center と全 loop の edge 次数だけを読み取ります。カーソル seed の Euclidean 範囲と解析用 halo を切り出し、範囲内の polygon の edge、法線、非表示状態だけで局所 CSR と形状判定を作ります。全体の曲率や partition を先に計算してから切り出す処理は行いません。edge の全体次数が2の共有だけを接続し、次数1の継ぎ目は両端点の一致、逆向き、法線の互換性を確認した場合だけ橋渡しします。局所切断境界と非多様体 edge は継ぎ目として扱いません。ホイール拡大時は不足した範囲だけを追加準備し、縮小と同じ半径への再訪では局所データを再利用します。
+大規模メッシュの初回準備では Edit Mode へ切り替えず、全 Face の center と全 loop の edge 次数だけを読み取ります。カーソル seed の Euclidean 範囲と解析用 halo を切り出し、範囲内の polygon の edge、法線、非表示状態だけで局所 CSR と形状判定を作ります。全体の曲率や partition を先に計算してから切り出す処理は行いません。edge の全体次数が2の共有だけを接続し、次数1の継ぎ目は両端点の一致、逆向き、法線の互換性を確認した場合だけ橋渡しします。局所切断境界と非多様体 edge は継ぎ目として扱いません。ホイール拡大時は保持済み配列・面 record を使って要求された局所 crop と record を再構築し、縮小と同じ半径への再訪では局所データを再利用します。
 
 この機能は Sculpt Mode 専用です。`bpy.ops.sculpt.expand()`、Sculpt Mask、画面の深度や表裏で候補を決める処理、Face Set の新規 ID 生成は使用しません。準備中の処理は内部timerで区切られ、ready前のE再押下やEnterは確定しません。
 
@@ -154,7 +158,7 @@ Blender同梱のNumPyを使用します。大規模メッシュでは初回の�
 
 A Blender 5.2 add-on for manual retopology workflows.
 
-Current add-on version: **3.2.12**
+Current add-on version: **3.2.17**
 
 Main features:
 
@@ -259,8 +263,12 @@ The algorithm:
 - Finds the smooth core, then assigns boundary faces to the nearest core without merging cores
 - Skips hidden faces and non-manifold boundaries; a ray that first reaches a hidden face continues to the first visible face. There is no fixed 100,000-face cutoff; wheel-adjusted search distance is capped at 16 times the initial radius
 - Writes the existing seed Face Set ID directly to the accepted faces
+- Uses fixed view-independent multi-direction Lambert illumination as an approximation, not real shadows or ambient occlusion. It acquires the requested local distance patch first, detects signed valley changes there, keeps the seed-side original-face component across valley barriers, and corrects its surrounding band against original faces. Each radius is reevaluated from the current patch so a finite valley may reconnect naturally at its end.
+- Fills only visible unselected face components enclosed by the candidate in the requested-distance mesh graph. Components reaching the distance boundary or an unpaired edge (crop or mesh boundary, non-manifold edge, hidden neighbor, unmatched seam), and separate sheets, remain unfilled.
+- The displayed prediction is the exact face set written on confirmation. History keeps the current and two previous stages, and GPU draw batches are retained for up to three candidates instead of being rebuilt while Ready.
+- Wheel input received during synchronous computation and around the first draw of the latest result is discarded. After the draw callback and a short drain interval, the next wheel is accepted as one stage; Esc and E/Enter confirmation of a ready result remain available.
 
-The first preparation stays in Sculpt Mode. It reads only all face centers and the global degree of every loop edge, then crops a cursor-centered Euclidean range with an analysis halo. Polygon edges, normals, and hidden flags are read only inside that range to build the local CSR, surface distances, valley bands, and boundaries. It does not build full-mesh curvature or partition data and crop it afterward. A normal shared edge is connected only when its global degree is two. A degree-one seam is bridged only after coincident endpoints, reverse winding, and compatible normals are confirmed. Crop boundaries and non-manifold edges are never treated as seams. Wheel expansion prepares only the missing cursor range; shrink and revisiting a prepared radius reuse the local data.
+The first preparation stays in Sculpt Mode. It reads only all face centers and the global degree of every loop edge, then crops a cursor-centered Euclidean range with an analysis halo. Polygon edges, normals, and hidden flags are read only inside that range to build the local CSR, surface distances, valley bands, and boundaries. It does not build full-mesh curvature or partition data and crop it afterward. A normal shared edge is connected only when its global degree is two. A degree-one seam is bridged only after coincident endpoints, reverse winding, and compatible normals are confirmed. Crop boundaries and non-manifold edges are never treated as seams. Wheel expansion reuses retained arrays and face records while rebuilding the requested local crop and records; shrink and revisiting a prepared radius reuse the local data.
 
 `Ctrl + E` enables Strict Mode with the same search extent and stricter boundary decisions. Use normal Blender `Ctrl + Z` to undo the complete operation in one step.
 

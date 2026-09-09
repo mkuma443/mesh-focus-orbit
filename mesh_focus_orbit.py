@@ -9,7 +9,7 @@ rotating the view.
 bl_info = {
     "name": "Mesh Focus Orbit",
     "author": "OpenAI",
-    "version": (3, 2, 12),
+    "version": (3, 2, 17),
     "blender": (5, 2, 0),
     "location": "3D View",
     "description": "Temporary mesh-centered orbit and local Smart Face Set Fill preview",
@@ -75,6 +75,7 @@ _fill_preview_state = None
 _fill_preview_draw_handler = None
 _fill_preview_text_draw_handler = None
 _fill_preview_shader = None
+_FILL_PREVIEW_WHEEL_DRAIN_SECONDS = 0.12
 _is_registered = False
 _polyquilt_qsnap_class = None
 _polyquilt_qsnap_original_snap_objects = None
@@ -6994,12 +6995,35 @@ def _fill_preview_cursor_initial_radius(obj, cache, seed_face, geometry=None):
     if geometry is not None:
         edge_lengths = list(geometry.get("seed_neighbor_lengths", ()))
     if not edge_lengths:
-        polygon = mesh.polygons[seed_face]
-        world_points = [matrix @ mesh.vertices[int(vertex)].co for vertex in polygon.vertices]
-        edge_lengths = [
-            (world_points[index] - world_points[(index + 1) % len(world_points)]).length
-            for index in range(len(world_points))
-        ]
+        # Recover the seed's existing face-center scale from cached loop-edge
+        # ids.  This avoids endpoint RNA reads and keeps the first crop close
+        # to the exact center-neighbor radius used after graph preparation.
+        loop_edges = np.asarray(cache.get("loop_edges", ()), dtype=np.int32)
+        totals = np.asarray(cache.get("totals", ()), dtype=np.int32)
+        if len(loop_edges) and len(totals):
+            starts = np.r_[0, np.cumsum(totals[:-1], dtype=np.int64)]
+            seed_loops = np.arange(
+                int(starts[seed_face]),
+                int(starts[seed_face] + totals[seed_face]),
+                dtype=np.int64,
+            )
+            seed_edges = np.unique(loop_edges[seed_loops])
+            matching_loops = np.flatnonzero(np.isin(loop_edges, seed_edges))
+            matching_faces = np.searchsorted(starts, matching_loops, side="right") - 1
+            other_faces = matching_faces[matching_faces != seed_face]
+            if len(other_faces):
+                edge_lengths = np.linalg.norm(
+                    cache["world_centers"][other_faces]
+                    - cache["world_centers"][seed_face],
+                    axis=1,
+                ).tolist()
+        if not edge_lengths:
+            polygon = mesh.polygons[seed_face]
+            world_points = [matrix @ mesh.vertices[int(vertex)].co for vertex in polygon.vertices]
+            edge_lengths = [
+                (world_points[index] - world_points[(index + 1) % len(world_points)]).length
+                for index in range(len(world_points))
+            ]
     local_scale = float(np.median(edge_lengths)) if edge_lengths else 0.0
     extent = np.ptp(cache["world_centers"], axis=0)
     diagonal = float(np.linalg.norm(extent))
@@ -7010,6 +7034,174 @@ def _fill_preview_cursor_initial_radius(obj, cache, seed_face, geometry=None):
         diagonal * 1.0e-4,
         1.0e-8,
     )
+
+
+def _fill_preview_cursor_build_shading_geometry(obj, cache, spatial_radius):
+    """Build the fixed-light cursor graph with bulk face reads.
+
+    Centers, loop edge ids, and loop totals are already cached.  Manifold
+    adjacency is recovered from those arrays without per-loop RNA calls;
+    vertex endpoints are fetched only for globally open edges that may form a
+    validated seam.  Draw-time endpoint reads are deferred until a boundary
+    segment is actually emitted.
+    """
+    import numpy as np
+
+    mesh = obj.data
+    centers_all = cache["world_centers"]
+    seed_face = int(cache["seed_face"])
+    seed_center = centers_all[seed_face]
+    spatial_ids = np.flatnonzero(
+        np.linalg.norm(centers_all - seed_center, axis=1) <= float(spatial_radius)
+    ).astype(np.int32)
+    hidden_all = np.empty(len(mesh.polygons), dtype=bool)
+    normals_all = np.empty((len(mesh.polygons), 3), dtype=np.float32)
+    mesh.polygons.foreach_get("hide", hidden_all)
+    mesh.polygons.foreach_get("normal", normals_all.ravel())
+    face_ids = spatial_ids[~hidden_all[spatial_ids]].astype(np.int32, copy=False)
+    if seed_face not in set(int(face) for face in face_ids):
+        raise RuntimeError("preview seed is hidden")
+    totals = np.asarray(cache["totals"], dtype=np.int32)
+    loop_edges = np.asarray(cache["loop_edges"], dtype=np.int32)
+    face_starts = np.r_[0, np.cumsum(totals[:-1], dtype=np.int64)]
+    local_counts = totals[face_ids]
+    face_count = int(len(face_ids))
+    local_face = np.repeat(np.arange(face_count, dtype=np.int32), local_counts)
+    local_start = np.repeat(
+        np.r_[0, np.cumsum(local_counts[:-1], dtype=np.int64)], local_counts
+    )
+    local_loops = (
+        np.repeat(face_starts[face_ids], local_counts)
+        + np.arange(int(np.sum(local_counts)), dtype=np.int64)
+        - local_start
+    )
+    local_global_faces = face_ids[local_face]
+    local_next_loops = face_starts[local_global_faces] + (
+        (local_loops - face_starts[local_global_faces] + 1)
+        % np.maximum(totals[local_global_faces], 1)
+    )
+    edge_values = loop_edges[local_loops]
+    order = np.argsort(edge_values, kind="stable")
+    sorted_edges = edge_values[order]
+    starts = np.r_[0, np.flatnonzero(np.diff(sorted_edges)) + 1]
+    lengths = np.diff(np.r_[starts, len(order)])
+    group_edges = sorted_edges[starts]
+    edge_degree = np.asarray(cache["edge_degree"], dtype=np.int32)
+    manifold = (lengths == 2) & (edge_degree[group_edges] == 2)
+    pair_starts = starts[manifold]
+    first_loop = order[pair_starts]
+    second_loop = order[pair_starts + 1]
+    first = local_face[first_loop]
+    second = local_face[second_loop]
+    keep = first != second
+    first = first[keep].astype(np.int32, copy=False)
+    second = second[keep].astype(np.int32, copy=False)
+    pair_edges = group_edges[manifold][keep].astype(np.int32, copy=False)
+    pair_kind = np.zeros(len(first), dtype=np.int8)
+
+    boundary_mask = (lengths == 1) & (edge_degree[group_edges] == 1)
+    boundary_positions = order[starts[boundary_mask]]
+    boundary_faces = local_face[boundary_positions]
+    boundary_edges = group_edges[boundary_mask].astype(np.int32, copy=False)
+    boundary_records = []
+    for local_position, face, edge_index in zip(
+        boundary_positions, boundary_faces, boundary_edges
+    ):
+        loop_index = int(local_loops[int(local_position)])
+        next_loop_index = int(local_next_loops[int(local_position)])
+        v0 = int(mesh.loops[loop_index].vertex_index)
+        v1 = int(mesh.loops[next_loop_index].vertex_index)
+        p0 = np.asarray(obj.matrix_world @ mesh.vertices[v0].co, dtype=np.float64)
+        p1 = np.asarray(obj.matrix_world @ mesh.vertices[v1].co, dtype=np.float64)
+        boundary_records.append((int(face), int(edge_index), v0, v1, p0, p1))
+
+    seam_records = []
+    seam_count = 0
+    if boundary_records:
+        lengths_world = [
+            float(np.linalg.norm(record[5] - record[4]))
+            for record in boundary_records
+        ]
+        tolerance = max(float(np.median(lengths_world)) * 1.0e-4, 1.0e-12)
+        buckets = {}
+        for record in boundary_records:
+            _face, _edge, _v0, _v1, p0, p1 = record
+            qa = tuple(np.rint(p0 / tolerance).astype(np.int64))
+            qb = tuple(np.rint(p1 / tolerance).astype(np.int64))
+            buckets.setdefault(tuple(sorted((qa, qb))), []).append(record)
+        normals = normals_all[face_ids].astype(np.float64) @ np.linalg.inv(
+            np.asarray(obj.matrix_world, dtype=np.float64)[:3, :3]
+        )
+        normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1.0e-20)
+        for records in buckets.values():
+            if len(records) != 2:
+                continue
+            first_record, second_record = records
+            first_face, first_edge, _v0, _v1, first_a, first_b = first_record
+            second_face, second_edge, _v2, _v3, second_a, second_b = second_record
+            if (
+                first_face == second_face
+                or np.linalg.norm(first_a - second_b) > tolerance
+                or np.linalg.norm(first_b - second_a) > tolerance
+                or float(np.dot(normals[first_face], normals[second_face])) <= 0.5
+            ):
+                continue
+            seam_records.append((first_face, second_face, first_edge))
+            seam_count += 1
+    if seam_records:
+        seam_first = np.asarray([record[0] for record in seam_records], dtype=np.int32)
+        seam_second = np.asarray([record[1] for record in seam_records], dtype=np.int32)
+        seam_edges = np.asarray([record[2] for record in seam_records], dtype=np.int32)
+        first = np.r_[first, seam_first]
+        second = np.r_[second, seam_second]
+        pair_edges = np.r_[pair_edges, seam_edges]
+        pair_kind = np.r_[pair_kind, np.ones(len(seam_records), dtype=np.int8)]
+
+    centers = centers_all[face_ids].astype(np.float64, copy=True)
+    transform = np.asarray(obj.matrix_world, dtype=np.float64)[:3, :3]
+    normals = normals_all[face_ids].astype(np.float64) @ np.linalg.inv(transform)
+    normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1.0e-20)
+    delta = centers[second] - centers[first]
+    pair_lengths = np.maximum(np.linalg.norm(delta, axis=1), 1.0e-20)
+    sources = np.r_[first, second]
+    destinations = np.r_[second, first]
+    directed_lengths = np.r_[pair_lengths, pair_lengths]
+    directed_edges = np.r_[pair_edges, pair_edges]
+    graph_order = np.argsort(sources, kind="stable")
+    degree = np.bincount(sources, minlength=face_count)
+    offsets = np.r_[0, np.cumsum(degree)].astype(np.int64)
+    return {
+        "signature": cache["signature"],
+        "count": face_count,
+        "face_edge_counts": local_counts.astype(np.int32, copy=False),
+        "centers": centers,
+        "normals": normals,
+        "hidden": np.zeros(face_count, dtype=bool),
+        "world_vertices": np.empty((0, 3), dtype=np.float64),
+        "offsets": offsets,
+        "neighbors": destinations[graph_order].astype(np.int32, copy=False),
+        "neighbor_lengths": directed_lengths[graph_order],
+        "edge_v0": directed_edges[graph_order].astype(np.int32, copy=False),
+        "edge_v1": directed_edges[graph_order].astype(np.int32, copy=False),
+        "edge_indices": directed_edges[graph_order].astype(np.int32, copy=False),
+        "first": first,
+        "second": second,
+        "pair_lengths": pair_lengths,
+        "pair_v0": pair_edges,
+        "pair_v1": pair_edges,
+        "pair_edge_indices": pair_edges,
+        "pair_kind": pair_kind,
+        "seam_count": int(seam_count),
+        "face_ids": face_ids,
+        "spatial_radius": float(spatial_radius),
+        "spatial_faces": int(len(spatial_ids)),
+        "seed_neighbor_lengths": pair_lengths[
+            (first == int(np.flatnonzero(face_ids == seed_face)[0]))
+            | (second == int(np.flatnonzero(face_ids == seed_face)[0]))
+        ],
+        "cursor_local": True,
+        "shading_approx": True,
+    }
 
 
 def _fill_preview_cursor_build_geometry(obj, cache, spatial_radius):
@@ -7085,6 +7277,7 @@ def _fill_preview_cursor_build_geometry(obj, cache, spatial_radius):
                 boundary_records.append(record)
 
     pair_records = []
+    pair_kind = []
     pair_seen = set()
     for edge_index, records in edge_records.items():
         if len(records) != 2:
@@ -7099,6 +7292,7 @@ def _fill_preview_cursor_build_geometry(obj, cache, spatial_radius):
             continue
         pair_seen.add(pair_key)
         pair_records.append((first_face, second_face, first_v0, first_v1))
+        pair_kind.append(0)
 
     seam_count = 0
     if boundary_records:
@@ -7142,6 +7336,7 @@ def _fill_preview_cursor_build_geometry(obj, cache, spatial_radius):
                 continue
             pair_seen.add(pair_key)
             pair_records.append((first_face, second_face, first_v0, first_v1))
+            pair_kind.append(1)
             seam_count += 1
 
     if pair_records:
@@ -7151,6 +7346,9 @@ def _fill_preview_cursor_build_geometry(obj, cache, spatial_radius):
         pair_v1 = np.asarray([record[3] for record in pair_records], dtype=np.int32)
     else:
         first = second = pair_v0 = pair_v1 = np.empty(0, dtype=np.int32)
+        pair_kind = np.empty(0, dtype=np.int8)
+    if pair_records:
+        pair_kind = np.asarray(pair_kind, dtype=np.int8)
     delta = centers[second] - centers[first]
     pair_lengths = np.maximum(np.linalg.norm(delta, axis=1), 1.0e-20)
     sources = np.r_[first, second]
@@ -7168,6 +7366,7 @@ def _fill_preview_cursor_build_geometry(obj, cache, spatial_radius):
     return {
         "signature": cache["signature"],
         "count": int(len(face_ids)),
+        "face_edge_counts": totals[face_ids].astype(np.int32, copy=False),
         "centers": centers,
         "normals": normals,
         "hidden": np.zeros(len(face_ids), dtype=bool),
@@ -7182,6 +7381,7 @@ def _fill_preview_cursor_build_geometry(obj, cache, spatial_radius):
         "pair_lengths": pair_lengths,
         "pair_v0": pair_v0,
         "pair_v1": pair_v1,
+        "pair_kind": pair_kind,
         "seam_count": int(seam_count),
         "face_ids": face_ids,
         "spatial_radius": float(spatial_radius),
@@ -7204,18 +7404,23 @@ def _fill_preview_cursor_prepare_steps(obj, seed_face):
     if cache is None:
         face_count = len(mesh.polygons)
         centers_local = np.empty((face_count, 3), dtype=np.float32)
+        totals = np.empty(face_count, dtype=np.int32)
         loop_edges = np.empty(len(mesh.loops), dtype=np.int32)
         yield "cursor-allocate"
         mesh.polygons.foreach_get("center", centers_local.ravel())
         matrix = np.asarray(obj.matrix_world, dtype=np.float64)
         world_centers = centers_local.astype(np.float64) @ matrix[:3, :3].T + matrix[:3, 3]
         yield "cursor-centers"
+        mesh.polygons.foreach_get("loop_total", totals)
+        yield "cursor-totals"
         mesh.loops.foreach_get("edge_index", loop_edges)
         edge_degree = np.bincount(loop_edges, minlength=len(mesh.edges)).astype(np.int32, copy=False)
         cache = {
             "signature": signature,
             "world_centers": world_centers,
             "edge_degree": edge_degree,
+            "loop_edges": loop_edges,
+            "totals": totals,
         }
         _fill_preview_cursor_cache[signature] = cache
         yield "cursor-edge-degree"
@@ -7223,14 +7428,24 @@ def _fill_preview_cursor_prepare_steps(obj, seed_face):
         yield "cursor-cache"
     cache["seed_face"] = int(seed_face)
     provisional_radius = _fill_preview_cursor_initial_radius(obj, cache, seed_face)
-    spatial_radius = provisional_radius + max(provisional_radius * 0.5, provisional_radius * 0.5)
-    geometry = _fill_preview_cursor_build_geometry(obj, cache, spatial_radius)
+    # Prepare only the initial preview crop.  Wider wheel ranges are extended
+    # on demand so the first Ready time does not hide a 4x cold preparation.
+    spatial_radius = max(
+        provisional_radius * 1.5,
+        provisional_radius * 1.0,
+    )
+    geometry = _fill_preview_cursor_build_shading_geometry(
+        obj, cache, spatial_radius
+    )
     initial_radius = _fill_preview_cursor_initial_radius(
         obj, cache, seed_face, geometry=geometry
     )
-    required_radius = initial_radius + max(initial_radius * 0.5, initial_radius * 0.5)
+    required_radius = max(
+        initial_radius * 1.5,
+        initial_radius * 1.0,
+    )
     if required_radius > spatial_radius * (1.0 + 1.0e-9):
-        geometry = _fill_preview_cursor_build_geometry(
+        geometry = _fill_preview_cursor_build_shading_geometry(
             obj, cache, required_radius
         )
     geometry["cursor_cache"] = cache
@@ -7363,6 +7578,7 @@ def _fill_preview_build_adjacency(obj, prepared=None):
     cached = {
         "signature": signature,
         "count": int(face_count),
+        "face_edge_counts": totals.astype(np.int32, copy=False),
         "centers": centers,
         "normals": normals,
         "hidden": hidden,
@@ -7461,6 +7677,150 @@ def _fill_preview_dijkstra_incremental(geometry, seed_face, max_distance, state)
     return distances, ids, int(state["popped"]), state
 
 
+def _fill_preview_shading_proxy(geometry, patch_ids, distances, target_radius, seed_local):
+    """Choose a coarse candidate plus a narrow correction band.
+
+    The cursor graph already contains centers, normals, and manifold pairs.
+    Fixed Lambert samples are evaluated only on the current distance patch.
+    The signed valley barriers then split the original face graph, and the
+    seed-connected component is retained.  The returned ids deliberately
+    include one graph ring and adjacent signed barriers so the existing exact
+    partition can inspect the original boundary without deciding the radius.
+    """
+    import time
+    import numpy as np
+
+    started = time.perf_counter()
+    patch_ids = np.asarray(patch_ids, dtype=np.int32)
+    count = int(len(patch_ids))
+    if count == 0:
+        return patch_ids, {"proxy_seconds": 0.0, "proxy_nodes": 0}
+    global_count = int(geometry["count"])
+    local_id = np.full(global_count, -1, dtype=np.int32)
+    local_id[patch_ids] = np.arange(count, dtype=np.int32)
+    graph_first = np.asarray(geometry["first"], dtype=np.int32)
+    graph_second = np.asarray(geometry["second"], dtype=np.int32)
+    keep = (local_id[graph_first] >= 0) & (local_id[graph_second] >= 0)
+    first = local_id[graph_first[keep]]
+    second = local_id[graph_second[keep]]
+    pair_lengths = np.asarray(geometry["pair_lengths"], dtype=np.float64)[keep]
+    if len(first) == 0:
+        return patch_ids, {
+            "proxy_seconds": float(time.perf_counter() - started),
+            "proxy_nodes": count,
+            "proxy_candidate_faces": count,
+            "proxy_band_faces": count,
+            "proxy_barrier_edges": 0,
+        }
+
+    lights = np.asarray(
+        (
+            (1.0, 0.0, 0.0), (-1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0), (0.0, -1.0, 0.0),
+            (0.0, 0.0, 1.0), (0.0, 0.0, -1.0),
+            (1.0, 1.0, 1.0), (-1.0, 1.0, 1.0),
+        ),
+        dtype=np.float64,
+    )
+    lights /= np.maximum(np.linalg.norm(lights, axis=1, keepdims=True), 1.0e-20)
+    normals = np.asarray(geometry["normals"], dtype=np.float64)[patch_ids]
+    centers = np.asarray(geometry["centers"], dtype=np.float64)[patch_ids]
+    shading = np.clip(normals @ lights.T, 0.0, 1.0)
+    delta = centers[second] - centers[first]
+    lengths = np.maximum(np.linalg.norm(delta, axis=1), 1.0e-20)
+    direction = delta / lengths[:, None]
+    shade_delta = shading[second] - shading[first]
+    signed_turn = np.mean(shade_delta * (direction @ lights.T), axis=1)
+    local_scale = max(float(np.median(pair_lengths)), 1.0e-12)
+    normalized_turn = -signed_turn / np.maximum(pair_lengths / local_scale, 1.0e-12)
+    face_valley = np.zeros(count, dtype=np.float64)
+    np.maximum.at(face_valley, first, np.maximum(normalized_turn, 0.0))
+    np.maximum.at(face_valley, second, np.maximum(normalized_turn, 0.0))
+    face_degree = np.bincount(first, minlength=count) + np.bincount(second, minlength=count)
+    for _ in range(2):
+        face_valley = (
+            face_valley
+            + np.bincount(first, weights=face_valley[second], minlength=count)
+            + np.bincount(second, weights=face_valley[first], minlength=count)
+        ) / np.maximum(face_degree + 1, 1)
+    center = float(np.median(face_valley))
+    mad = float(np.median(np.abs(face_valley - center)))
+    valley_threshold = max(0.025, center + 2.0 * mad)
+    edge_valley = np.maximum(face_valley[first], face_valley[second])
+    barrier = edge_valley >= valley_threshold
+    pair_kind = np.asarray(geometry.get("pair_kind", np.zeros(len(first), dtype=np.int8)), dtype=np.int8)
+    if len(pair_kind) == len(graph_first):
+        pair_kind = pair_kind[keep]
+    else:
+        pair_kind = np.zeros(len(first), dtype=np.int8)
+
+    # Split the original face graph at the signed valley barriers.  True seams
+    # remain traversable here; they are not geometric valley barriers.  This
+    # component uses only the requested target radius.  The halo is retained
+    # for valley detection and fine boundary inspection, but it cannot provide
+    # a route around a valley that lies outside the requested display range.
+    patch_distances = np.asarray(distances, dtype=np.float64)[patch_ids]
+    target_mask = np.isfinite(patch_distances) & (
+        patch_distances <= float(target_radius) + 1.0e-9
+    )
+    parent = np.arange(count, dtype=np.int32)
+    sizes = np.ones(count, dtype=np.int32)
+
+    def find(value):
+        value = int(value)
+        while parent[value] != value:
+            parent[value] = parent[parent[value]]
+            value = int(parent[value])
+        return value
+
+    for edge, (left, right) in enumerate(zip(first, second)):
+        if barrier[edge] or not (target_mask[left] and target_mask[right]):
+            continue
+        left_root, right_root = find(left), find(right)
+        if left_root == right_root:
+            continue
+        if sizes[left_root] < sizes[right_root]:
+            left_root, right_root = right_root, left_root
+        parent[right_root] = left_root
+        sizes[left_root] += sizes[right_root]
+    roots = np.asarray([find(index) for index in range(count)], dtype=np.int32)
+    seed_local = int(seed_local)
+    seed_root = int(roots[seed_local])
+    candidate = (roots == seed_root) & target_mask
+    if not np.any(candidate):
+        candidate[seed_local] = True
+
+    # One unrestricted ring supplies the fine correction band.  The band may
+    # contain the opposite side so the exact local routine can inspect the
+    # original faces, but the final candidate ids stay in the seed component.
+    band = candidate.copy()
+    adjacent = candidate[first] | candidate[second]
+    band[first[adjacent]] = True
+    band[second[adjacent]] = True
+    barrier_adjacent = barrier & adjacent
+    band[first[barrier_adjacent]] = True
+    band[second[barrier_adjacent]] = True
+    band[seed_local] = True
+    frontier = np.isfinite(patch_distances) & (
+        np.abs(patch_distances - float(target_radius))
+        <= max(local_scale * 2.0, 1.0e-9)
+    )
+    band |= frontier
+    selected = np.flatnonzero(band).astype(np.int32)
+    proxy_candidate_ids = patch_ids[np.flatnonzero(candidate)].astype(np.int32, copy=False)
+    return patch_ids[selected], {
+        "proxy_seconds": float(time.perf_counter() - started),
+        "proxy_nodes": count,
+        "proxy_candidate_faces": int(np.count_nonzero(candidate)),
+        "proxy_component_faces": int(np.count_nonzero(candidate)),
+        "proxy_correction_faces": 0,
+        "proxy_band_faces": int(len(selected)),
+        "proxy_barrier_edges": int(np.count_nonzero(barrier)),
+        "proxy_valley_threshold": float(valley_threshold),
+        "proxy_candidate_ids": proxy_candidate_ids,
+    }
+
+
 def _fill_preview_local_geometry(geometry, face_ids):
     """Slice adjacency and recompute all scalar features on the local patch."""
     import numpy as np
@@ -7489,10 +7849,16 @@ def _fill_preview_local_geometry(geometry, face_ids):
         pair_lengths = geometry["neighbor_lengths"][edge_ids][keep]
         pair_v0 = geometry["edge_v0"][edge_ids][keep]
         pair_v1 = geometry["edge_v1"][edge_ids][keep]
+        pair_edge_indices = geometry.get("edge_indices")
+        if pair_edge_indices is not None:
+            pair_edge_indices = pair_edge_indices[edge_ids][keep]
+        else:
+            pair_edge_indices = np.full(len(pair_v0), -1, dtype=np.int32)
     else:
         first = second = np.empty(0, dtype=np.int32)
         pair_lengths = np.empty(0, dtype=np.float64)
         pair_v0 = pair_v1 = np.empty(0, dtype=np.int32)
+        pair_edge_indices = np.empty(0, dtype=np.int32)
 
     sources = np.r_[first, second]
     destinations = np.r_[second, first]
@@ -7516,6 +7882,7 @@ def _fill_preview_local_geometry(geometry, face_ids):
         "edge_v1": directed_v1[order].astype(np.int32, copy=False),
         "pair_v0": pair_v0.astype(np.int32, copy=False),
         "pair_v1": pair_v1.astype(np.int32, copy=False),
+        "pair_edge_indices": pair_edge_indices.astype(np.int32, copy=False),
         "count": int(len(face_ids)),
         "seam_count": int(geometry.get("seam_count", 0)),
         "partitions": {},
@@ -7529,6 +7896,61 @@ def _fill_preview_local_geometry(geometry, face_ids):
         np.bincount(first, minlength=count) + np.bincount(second, minlength=count),
         1,
     )
+    if geometry.get("shading_approx"):
+        # Fixed, view-independent Lambert samples are used as a coarse shape
+        # signal.  Normalize the signed change by local edge scale, aggregate
+        # it over two face-neighborhoods, and retain only the concave sign as
+        # a barrier.  Convex crests therefore remain traversable.
+        lights = np.asarray(
+            (
+                (1.0, 0.0, 0.0),
+                (-1.0, 0.0, 0.0),
+                (0.0, 1.0, 0.0),
+                (0.0, -1.0, 0.0),
+                (0.0, 0.0, 1.0),
+                (0.0, 0.0, -1.0),
+                (1.0, 1.0, 1.0),
+                (-1.0, 1.0, 1.0),
+            ),
+            dtype=np.float64,
+        )
+        lights /= np.maximum(np.linalg.norm(lights, axis=1, keepdims=True), 1.0e-20)
+        shading = np.clip(local["normals"] @ lights.T, 0.0, 1.0)
+        shade_delta = shading[second] - shading[first]
+        delta = local["centers"][second] - local["centers"][first]
+        distance = np.maximum(np.linalg.norm(delta, axis=1), 1.0e-20)
+        direction = delta / distance[:, None]
+        signed_turn = np.mean(shade_delta * (direction @ lights.T), axis=1)
+        local_scale = max(float(np.median(pair_lengths)), 1.0e-12)
+        normalized_turn = -signed_turn / np.maximum(pair_lengths / local_scale, 1.0e-12)
+        face_valley = np.zeros(count, dtype=np.float64)
+        np.maximum.at(face_valley, first, np.maximum(normalized_turn, 0.0))
+        np.maximum.at(face_valley, second, np.maximum(normalized_turn, 0.0))
+        degree = np.bincount(first, minlength=count) + np.bincount(second, minlength=count)
+        for _ in range(2):
+            face_valley = (
+                face_valley
+                + np.bincount(first, weights=face_valley[second], minlength=count)
+                + np.bincount(second, weights=face_valley[first], minlength=count)
+            ) / np.maximum(degree + 1, 1)
+        robust_center = float(np.median(face_valley))
+        robust_mad = float(np.median(np.abs(face_valley - robust_center)))
+        valley_threshold = max(0.025, robust_center + 2.0 * robust_mad)
+        normalized_face_valley = np.maximum(
+            face_valley / max(valley_threshold, 1.0e-12) * 0.10,
+            0.0,
+        )
+        edge_valley = np.maximum(
+            normalized_face_valley[first], normalized_face_valley[second]
+        )
+        contour_cost = pair_lengths / (1.0 + (edge_valley / 0.10) ** 2)
+        local["contrast"] = np.zeros(count, dtype=np.float64)
+        local["concavity"] = normalized_face_valley
+        local["directional_valley"] = normalized_face_valley
+        local["crease"] = np.zeros(count, dtype=np.float64)
+        local["contour_cost"] = np.r_[contour_cost, contour_cost][order]
+        local["shading_threshold"] = float(valley_threshold)
+        return local
     normals = local["normals"]
     smooth = _fill_average(normals, first, second, count, 2)
     smooth /= np.maximum(np.linalg.norm(smooth, axis=1, keepdims=True), 1.0e-20)
@@ -7679,9 +8101,12 @@ def _fill_preview_cursor_expand(state, radius):
     if cache is None:
         raise RuntimeError("preview cursor cache is unavailable")
     cache["seed_face"] = int(state["seed_face"])
-    expanded = _fill_preview_cursor_build_geometry(
-        state["obj"], cache, required
+    build_geometry = (
+        _fill_preview_cursor_build_shading_geometry
+        if geometry.get("shading_approx")
+        else _fill_preview_cursor_build_geometry
     )
+    expanded = build_geometry(state["obj"], cache, required)
     expanded["cursor_cache"] = cache
     expanded["initial_radius"] = float(state["initial_radius"])
     state["adjacency"] = expanded
@@ -7689,9 +8114,103 @@ def _fill_preview_cursor_expand(state, radius):
         np.flatnonzero(expanded["face_ids"] == int(state["seed_face"]))[0]
     )
     state["distance_state"] = None
-    state["results"] = {}
+    # Result faces are stored in stable mesh-face ids and their draw batches
+    # own copied vertices, so prior radii remain valid across a crop growth.
+    # Keep only the current result plus the two immediately preceding stages;
+    # the timer path performs the bounded eviction after adding a new radius.
     state["expansion_count"] = int(state.get("expansion_count", 0)) + 1
     return True
+
+
+def _fill_preview_enclosed_gap_faces(geometry, distances, target_radius, selected_ids):
+    """Return visible distance-domain components enclosed by the candidate.
+
+    This is a topological completion pass for holes left by a valley band.  It
+    only fills an unselected component when it touches the current candidate,
+    has no route to the requested-distance boundary, and every source face
+    edge is represented by a valid graph pair.  The last condition keeps open
+    mesh boundaries, non-manifold edges, hidden neighbors, crop cuts, and
+    unmatched seams classified as outside instead of as holes.
+    """
+    import numpy as np
+
+    count = int(geometry["count"])
+    distances = np.asarray(distances, dtype=np.float64)
+    if len(distances) != count:
+        return np.empty(0, dtype=np.int32), {
+            "enclosed_gap_faces": 0,
+            "enclosed_gap_components": 0,
+            "enclosed_gap_skipped": "distance-size",
+        }
+    edge_counts = geometry.get("face_edge_counts")
+    if edge_counts is None or len(edge_counts) != count:
+        return np.empty(0, dtype=np.int32), {
+            "enclosed_gap_faces": 0,
+            "enclosed_gap_components": 0,
+            "enclosed_gap_skipped": "edge-counts-unavailable",
+        }
+    edge_counts = np.asarray(edge_counts, dtype=np.int32)
+    hidden = np.asarray(geometry.get("hidden", np.zeros(count, dtype=bool)), dtype=bool)
+    domain = np.isfinite(distances) & (
+        distances <= float(target_radius) + max(float(target_radius) * 1.0e-8, 1.0e-9)
+    ) & ~hidden
+    selected = np.zeros(count, dtype=bool)
+    selected_ids = np.asarray(selected_ids, dtype=np.int32).reshape(-1)
+    selected_ids = selected_ids[(selected_ids >= 0) & (selected_ids < count)]
+    selected[selected_ids] = True
+    missing = domain & ~selected
+    if not np.any(missing):
+        return np.empty(0, dtype=np.int32), {
+            "enclosed_gap_faces": 0,
+            "enclosed_gap_components": 0,
+        }
+
+    offsets = np.asarray(geometry["offsets"], dtype=np.int64)
+    neighbors = np.asarray(geometry["neighbors"], dtype=np.int32)
+    degree = np.diff(offsets)
+    # A face with an unpaired original edge is connected to a real mesh/crop
+    # boundary, non-manifold edge, hidden face, or an unmatched open seam.
+    outside = missing & (degree < edge_counts)
+    touches_selected = np.zeros(count, dtype=bool)
+    for face in np.flatnonzero(missing):
+        start, end = int(offsets[face]), int(offsets[face + 1])
+        for neighbor in neighbors[start:end]:
+            neighbor = int(neighbor)
+            if selected[neighbor]:
+                touches_selected[face] = True
+            elif not domain[neighbor]:
+                outside[face] = True
+
+    fills = []
+    enclosed_components = 0
+    visited = np.zeros(count, dtype=bool)
+    for start_face in np.flatnonzero(missing):
+        start_face = int(start_face)
+        if visited[start_face]:
+            continue
+        pending = [start_face]
+        visited[start_face] = True
+        component = []
+        reaches_outside = False
+        reaches_selected = False
+        while pending:
+            face = pending.pop()
+            component.append(face)
+            reaches_outside |= bool(outside[face])
+            reaches_selected |= bool(touches_selected[face])
+            for neighbor in neighbors[int(offsets[face]) : int(offsets[face + 1])]:
+                neighbor = int(neighbor)
+                if missing[neighbor] and not visited[neighbor]:
+                    visited[neighbor] = True
+                    pending.append(neighbor)
+        if not reaches_outside and reaches_selected:
+            fills.extend(component)
+            enclosed_components += 1
+    fills = np.asarray(fills, dtype=np.int32)
+    return np.unique(fills), {
+        "enclosed_gap_faces": int(len(fills)),
+        "enclosed_gap_components": int(enclosed_components),
+    }
 
 
 def _fill_preview_make_result(state, radius):
@@ -7716,27 +8235,74 @@ def _fill_preview_make_result(state, radius):
     state["distance_state"] = distance_state
     if len(patch_ids) == 0 or not np.isfinite(distances[seed_face]):
         raise RuntimeError("preview seed is outside the prepared patch")
-    local = _fill_preview_local_geometry(geometry, patch_ids)
-    seed_local = int(np.flatnonzero(patch_ids == seed_face)[0])
+    proxy_metrics = {}
+    analysis_ids = patch_ids
+    if geometry.get("shading_approx"):
+        analysis_ids, proxy_metrics = _fill_preview_shading_proxy(
+            geometry,
+            patch_ids,
+            distances,
+            radius,
+            int(np.flatnonzero(patch_ids == seed_face)[0]),
+        )
+    local = _fill_preview_local_geometry(geometry, analysis_ids)
+    seed_local = int(np.flatnonzero(analysis_ids == seed_face)[0])
     local_region, partition = _fill_preview_region(
         local, seed_local, bool(state["strict_mode"])
     )
-    local_global = patch_ids[local_region]
+    # Let the exact local partition inspect the original boundary band while
+    # retaining only the current distance-first seed component.  The component
+    # is recomputed for every radius, so finite valleys can reconnect at their
+    # visible ends without carrying a blacklist between wheel stages.
+    coarse_candidate_ids = proxy_metrics.get("proxy_candidate_ids")
+    if coarse_candidate_ids is not None and len(coarse_candidate_ids):
+        # The exact local partition may see both sides of a newly detected
+        # valley because the correction band intentionally includes the
+        # adjacent original faces.  Keep that fine inspection, but constrain
+        # the accepted region to the distance-first seed component returned by
+        # the current patch.  A later radius recomputes this component from
+        # the newly acquired distance range, so a finite valley can reconnect
+        # naturally without a persistent blacklist.
+        allowed_local = np.isin(analysis_ids, coarse_candidate_ids)
+        local_region = local_region[allowed_local[local_region]]
+        local_region = np.unique(local_region).astype(np.int32)
+    local_global = analysis_ids[local_region]
     candidate_mask = (
         (distances[local_global] <= float(radius) + max(radius * 1.e-8, 1.e-9))
         & ~geometry["hidden"][local_global]
     )
-    preview_faces = local_global[candidate_mask].astype(np.int32, copy=False)
+    preview_local_ids = local_global[candidate_mask].astype(np.int32, copy=False)
+    enclosed_gap_ids, enclosed_gap_metrics = _fill_preview_enclosed_gap_faces(
+        geometry, distances, radius, preview_local_ids
+    )
+    if len(enclosed_gap_ids):
+        preview_local_ids = np.unique(
+            np.r_[preview_local_ids, enclosed_gap_ids]
+        ).astype(np.int32, copy=False)
+        expanded_analysis_ids = np.unique(
+            np.r_[analysis_ids, enclosed_gap_ids]
+        ).astype(np.int32, copy=False)
+        if len(expanded_analysis_ids) != len(analysis_ids):
+            analysis_ids = expanded_analysis_ids
+            local = _fill_preview_local_geometry(geometry, analysis_ids)
+            seed_local = int(np.flatnonzero(analysis_ids == seed_face)[0])
+            # Recompute only the local partition metadata used for boundary
+            # classification.  The selected mask below remains the exact
+            # candidate plus the enclosed components found above.
+            _unused_region, partition = _fill_preview_region(
+                local, seed_local, bool(state["strict_mode"])
+            )
+    preview_faces = preview_local_ids
     face_ids = geometry.get("face_ids")
     if face_ids is not None:
         preview_faces = face_ids[preview_faces].astype(np.int32, copy=False)
     if len(preview_faces) == 0:
         raise RuntimeError("preview produced no visible candidate faces")
-    preview_set = np.zeros(int(local["count"]), dtype=bool)
-    preview_set[local_region[candidate_mask]] = True
+    preview_set = np.isin(analysis_ids, preview_local_ids)
     first, second = local["first"], local["second"]
     shape_segments = []
     distance_segments = []
+    mesh = state["obj"].data
     boundary = preview_set[first] != preview_set[second]
     for edge in np.flatnonzero(boundary):
         left, right = int(first[edge]), int(second[edge])
@@ -7744,11 +8310,21 @@ def _fill_preview_make_result(state, radius):
         outside = right if preview_set[left] else left
         v0 = int(local["pair_v0"][edge])
         v1 = int(local["pair_v1"][edge])
-        segment = (
-            tuple(float(value) for value in geometry["world_vertices"][v0]),
-            tuple(float(value) for value in geometry["world_vertices"][v1]),
-        )
-        outside_distance = float(distances[patch_ids[outside]])
+        edge_indices = local.get("pair_edge_indices")
+        if edge_indices is not None and int(edge_indices[edge]) >= 0:
+            edge_index = int(edge_indices[edge])
+            edge_vertices = tuple(int(value) for value in mesh.edges[edge_index].vertices)
+            matrix = state["obj"].matrix_world
+            segment = tuple(
+                tuple(float(value) for value in (matrix @ mesh.vertices[vertex].co))
+                for vertex in edge_vertices
+            )
+        else:
+            segment = (
+                tuple(float(value) for value in geometry["world_vertices"][v0]),
+                tuple(float(value) for value in geometry["world_vertices"][v1]),
+            )
+        outside_distance = float(distances[analysis_ids[outside]])
         shape_boundary = (
             np.isfinite(outside_distance)
             and outside_distance < float(radius) - max(radius * 0.01, 1.e-8)
@@ -7762,11 +8338,13 @@ def _fill_preview_make_result(state, radius):
         and np.any(distances[patch_ids] >= patch_radius - max(patch_radius * 0.01, 1.e-8))
     )
     elapsed = time.perf_counter() - started
+    proxy_metrics_for_result = dict(proxy_metrics)
+    proxy_metrics_for_result.pop("proxy_candidate_ids", None)
     return {
         "radius": float(radius),
         "faces": preview_faces,
         "candidate_count": int(len(preview_faces)),
-        "analysis_faces": int(len(patch_ids)),
+        "analysis_faces": int(len(analysis_ids)),
         "popped_faces": int(popped),
         "shape_segments": shape_segments,
         "distance_segments": distance_segments,
@@ -7775,54 +8353,72 @@ def _fill_preview_make_result(state, radius):
         "geometry": local,
         "partition": partition,
         "created_generation": int(state["generation"]),
+        **enclosed_gap_metrics,
+        **proxy_metrics_for_result,
     }
 
 
 def _fill_preview_build_draw_batches(state, result):
-    """Create copied world-space GPU vertices from the current candidate."""
+    """Create copied vertices and GPU batches once for one candidate result."""
     import numpy as np
 
-    if result.get("triangles") is not None:
+    if result.get("triangles") is not None and result.get("gpu_batches") is not None:
         return
-    obj = state["obj"]
-    mesh = obj.data
-    matrix = obj.matrix_world
-    triangles = []
-    try:
-        for face_index in result["faces"]:
-            polygon = mesh.polygons[int(face_index)]
-            points = [
-                Vector(matrix @ mesh.vertices[int(vertex)].co)
-                for vertex in polygon.vertices
-            ]
-            if len(points) < 3:
-                continue
-            for triangle in tessellate_polygon([points]):
-                if len(triangle) == 3:
-                    triangle_vertices = []
-                    for vertex in triangle:
-                        # Blender 5.2 returns polygon-local integer indices;
-                        # older builds returned Vector objects.
-                        if isinstance(vertex, (int, np.integer)):
-                            vertex = points[int(vertex)]
-                        triangle_vertices.append(
-                            tuple(float(value) for value in vertex)
-                        )
-                    # Some Sculpt viewport configurations cull the back side
-                    # of a face.  Keep the original coordinates and depth,
-                    # but submit the same triangle with both winding orders;
-                    # this makes an inside-view preview visible without
-                    # moving vertices along normals or changing GPU state.
-                    triangles.extend(triangle_vertices)
-                    triangles.extend(reversed(triangle_vertices))
-    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError, IndexError):
+    if result.get("triangles") is None:
+        obj = state["obj"]
+        mesh = obj.data
+        matrix = obj.matrix_world
         triangles = []
-    result["triangles"] = triangles
-    result["shape_lines"] = [value for segment in result["shape_segments"] for value in segment]
-    result["distance_lines"] = [value for segment in result["distance_segments"] for value in segment]
-    result["triangles_np"] = np.asarray(triangles, dtype=np.float32) if triangles else np.empty((0, 3), dtype=np.float32)
-    result["shape_lines_np"] = np.asarray(result["shape_lines"], dtype=np.float32) if result["shape_lines"] else np.empty((0, 3), dtype=np.float32)
-    result["distance_lines_np"] = np.asarray(result["distance_lines"], dtype=np.float32) if result["distance_lines"] else np.empty((0, 3), dtype=np.float32)
+        try:
+            for face_index in result["faces"]:
+                polygon = mesh.polygons[int(face_index)]
+                points = [
+                    Vector(matrix @ mesh.vertices[int(vertex)].co)
+                    for vertex in polygon.vertices
+                ]
+                if len(points) < 3:
+                    continue
+                for triangle in tessellate_polygon([points]):
+                    if len(triangle) == 3:
+                        triangle_vertices = []
+                        for vertex in triangle:
+                            # Blender 5.2 returns polygon-local integer indices;
+                            # older builds returned Vector objects.
+                            if isinstance(vertex, (int, np.integer)):
+                                vertex = points[int(vertex)]
+                            triangle_vertices.append(
+                                tuple(float(value) for value in vertex)
+                            )
+                        # Some Sculpt viewport configurations cull the back side
+                        # of a face.  Keep the original coordinates and depth,
+                        # but submit the same triangle with both winding orders.
+                        triangles.extend(triangle_vertices)
+                        triangles.extend(reversed(triangle_vertices))
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError, IndexError):
+            triangles = []
+        result["triangles"] = triangles
+        result["shape_lines"] = [value for segment in result["shape_segments"] for value in segment]
+        result["distance_lines"] = [value for segment in result["distance_segments"] for value in segment]
+        result["triangles_np"] = np.asarray(triangles, dtype=np.float32) if triangles else np.empty((0, 3), dtype=np.float32)
+        result["shape_lines_np"] = np.asarray(result["shape_lines"], dtype=np.float32) if result["shape_lines"] else np.empty((0, 3), dtype=np.float32)
+        result["distance_lines_np"] = np.asarray(result["distance_lines"], dtype=np.float32) if result["distance_lines"] else np.empty((0, 3), dtype=np.float32)
+    if result.get("gpu_batches") is None:
+        shader = _fill_preview_shader_get()
+        batches = {}
+        if shader is not None:
+            if len(result["triangles_np"]):
+                batches["triangles"] = batch_for_shader(
+                    shader, "TRIS", {"pos": result["triangles_np"]}
+                )
+            if len(result["distance_lines_np"]):
+                batches["distance_lines"] = batch_for_shader(
+                    shader, "LINES", {"pos": result["distance_lines_np"]}
+                )
+            if len(result["shape_lines_np"]):
+                batches["shape_lines"] = batch_for_shader(
+                    shader, "LINES", {"pos": result["shape_lines_np"]}
+                )
+        result["gpu_batches"] = batches
 
 
 def _fill_preview_draw_text(state, result):
@@ -7886,6 +8482,18 @@ def _fill_preview_draw():
             return
         if result is not None:
             _fill_preview_build_draw_batches(state, result)
+            if (
+                state.get("phase") == "ready"
+                and result is state.get("result")
+                and state.get("drawn_generation") != state.get("generation")
+            ):
+                # The modal gate does not open merely because a compute timer
+                # returned.  Mark the first callback that actually draws the
+                # newest result, then drain already queued wheel input briefly.
+                state["drawn_generation"] = int(state.get("generation", 0))
+                state["wheel_drain_until"] = (
+                    time.perf_counter() + _FILL_PREVIEW_WHEEL_DRAIN_SECONDS
+                )
             gpu.state.blend_set("ALPHA")
             depth_set = False
             depth_mask = False
@@ -7903,16 +8511,20 @@ def _fill_preview_draw():
                 if len(result["triangles_np"]):
                     shader.bind()
                     shader.uniform_float("color", (0.16, 0.72, 0.96, 0.20))
-                    batch_for_shader(shader, "TRIS", {"pos": result["triangles_np"]}).draw(shader)
-                for key, color in (
-                    ("distance_lines_np", (0.20, 0.86, 1.0, 0.95)),
-                    ("shape_lines_np", (1.0, 0.38, 0.08, 0.95)),
+                    batch = result.get("gpu_batches", {}).get("triangles")
+                    if batch is not None:
+                        batch.draw(shader)
+                for key, color, batch_key in (
+                    ("distance_lines_np", (0.20, 0.86, 1.0, 0.95), "distance_lines"),
+                    ("shape_lines_np", (1.0, 0.38, 0.08, 0.95), "shape_lines"),
                 ):
                     if len(result[key]):
                         shader.bind()
                         shader.uniform_float("color", color)
                         gpu.state.line_width_set(2.0)
-                        batch_for_shader(shader, "LINES", {"pos": result[key]}).draw(shader)
+                        batch = result.get("gpu_batches", {}).get(batch_key)
+                        if batch is not None:
+                            batch.draw(shader)
             finally:
                 if depth_mask:
                     try:
@@ -8510,6 +9122,11 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
             "desired_radius": None,
             "processed_radius": None,
             "pending": True,
+            "wheel_armed": False,
+            "wheel_gate": False,
+            "dropped_wheel_events": 0,
+            "drawn_generation": None,
+            "wheel_drain_until": 0.0,
             "result": None,
             "results": {},
             "generation": 0,
@@ -8561,6 +9178,8 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
                         state["desired_radius"] = state["initial_radius"]
                         state["phase"] = "compute"
                         state["pending"] = True
+                        state["wheel_armed"] = False
+                        state["wheel_gate"] = False
                         state["prepare_stage"] = "cache"
                         return True
                     if state.get("cursor_prepare"):
@@ -8591,6 +9210,8 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
                         state["prepare_stage"] = "cursor-ready"
                         state["phase"] = "compute"
                         state["pending"] = True
+                        state["wheel_armed"] = False
+                        state["wheel_gate"] = False
                     else:
                         state["prepare_raw"] = complete.value
                         state["prepare_stage"] = "arrays-ready"
@@ -8636,6 +9257,8 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
                     return True
                 state["phase"] = "compute"
                 state["pending"] = True
+                state["wheel_armed"] = False
+                state["wheel_gate"] = False
                 _fill_preview_tag_redraw(state)
                 return True
             if state["phase"] == "compute" and state["pending"]:
@@ -8647,9 +9270,17 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
                 if cached is None:
                     cached = _fill_preview_make_result(state, radius)
                     state["results"][key] = cached
+                    while len(state["results"]) > 3:
+                        state["results"].pop(next(iter(state["results"])), None)
+                else:
+                    # Treat a shrink/revisit as the current stage so eviction
+                    # preserves the current radius and its two predecessors.
+                    state["results"].pop(key, None)
+                    state["results"][key] = cached
                 if int(cached.get("created_generation", -1)) != int(state["generation"]):
                     cached = dict(cached)
                     cached["created_generation"] = int(state["generation"])
+                _fill_preview_build_draw_batches(state, cached)
                 state["last_tick_seconds"] = float(cached.get("compute_seconds", 0.0))
                 state["max_tick_seconds"] = max(
                     float(state["max_tick_seconds"]),
@@ -8659,6 +9290,10 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
                 state["processed_radius"] = radius
                 state["pending"] = False
                 state["phase"] = "ready"
+                state["wheel_armed"] = False
+                state["wheel_gate"] = True
+                state["drawn_generation"] = None
+                state["wheel_drain_until"] = 0.0
                 _fill_preview_tag_redraw(state)
                 return True
         except (
@@ -8747,17 +9382,40 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
             # preparation phase must never confirm the old/partial result.
             return {"RUNNING_MODAL"}
         if event.type in {"WHEELUPMOUSE", "WHEELDOWNMOUSE"}:
-            if state["initial_radius"] is not None:
-                factor = 1.25 if event.type == "WHEELUPMOUSE" else 1.0 / 1.25
-                base = float(state["desired_radius"] or state["initial_radius"])
-                state["desired_radius"] = max(
-                    float(state["initial_radius"]) * 0.125,
-                    min(float(state["initial_radius"]) * 16.0, base * factor),
-                )
-                state["pending"] = True
-                state["phase"] = "compute"
-                state["result"] = None
-                _fill_preview_tag_redraw(state)
+            # Wheel events cannot carry an input timestamp through Blender's
+            # Python modal API.  Drop every event until the latest generation
+            # has drawn and its short queue-drain interval has elapsed.  A
+            # queued burst therefore cannot mutate desired_radius immediately
+            # after a synchronous compute returns Ready.
+            if (
+                state.get("initial_radius") is None
+                or state.get("phase") != "ready"
+                or state.get("pending")
+                or not state.get("wheel_armed")
+            ):
+                state["dropped_wheel_events"] = int(
+                    state.get("dropped_wheel_events", 0)
+                ) + 1
+                if (
+                    state.get("wheel_gate")
+                    and state.get("drawn_generation") == state.get("generation")
+                ):
+                    state["wheel_drain_until"] = (
+                        time.perf_counter() + _FILL_PREVIEW_WHEEL_DRAIN_SECONDS
+                    )
+                return {"RUNNING_MODAL"}
+            factor = 1.25 if event.type == "WHEELUPMOUSE" else 1.0 / 1.25
+            base = float(state["desired_radius"] or state["initial_radius"])
+            state["desired_radius"] = max(
+                float(state["initial_radius"]) * 0.125,
+                min(float(state["initial_radius"]) * 16.0, base * factor),
+            )
+            state["wheel_armed"] = False
+            state["wheel_gate"] = False
+            state["pending"] = True
+            state["phase"] = "compute"
+            state["result"] = None
+            _fill_preview_tag_redraw(state)
             return {"RUNNING_MODAL"}
         if event.type in {"RET", "NUMPAD_ENTER", "ENTER"}:
             return self._finish_confirm(context, state)
@@ -8782,6 +9440,16 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
             ):
                 return {"RUNNING_MODAL"}
             state["last_timer_dispatch"] = now
+            if (
+                state.get("phase") == "ready"
+                and state.get("wheel_gate")
+                and state.get("drawn_generation") == state.get("generation")
+                and now >= float(state.get("wheel_drain_until", 0.0))
+            ):
+                # This timer is the first modal boundary after the real draw
+                # and the short drain interval; the next wheel is new input.
+                state["wheel_gate"] = False
+                state["wheel_armed"] = True
             if not self._process_timer(context, state):
                 return {"CANCELLED"}
             return {"RUNNING_MODAL"}
