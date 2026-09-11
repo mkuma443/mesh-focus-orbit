@@ -2,13 +2,14 @@
 
 Blender 5.2 用のリトポロジー支援アドオンです。
 
-現在のアドオンバージョン: **3.2.17**
+現在のアドオンバージョン: **3.2.23**
 
 主な機能:
 
-- **通常 MFO**: 画面中央の Reference Object 表面を一時 Orbit 中心にする
+- **通常 MFO**: Object / Edit / Sculpt Mode で、画面中央の Reference Object 表面を一時 Orbit 中心にする
 - **Face Set MFO (FSMFO)**: Reference Object の対象 Face Set と、対応する Retopo island だけを一時表示する
 - **Smart Face Set Fill**: Sculpt Mode でカーソル直下の局所候補をプレビューし、E再押下またはEnterで表示面だけを Face Set 化する
+- Smart Face Set Fill の形状境界は、現在の候補に接続する既存 edge の1-hop外側を必要な場合だけ一度評価し、距離境界・閉鎖gap・seed接続を保護する。補正後の表示境界はfull geometryの実edgeから描画する
 - **Topology Colors**: 編集中の選択面へ6色の半透明ガイドを割り当てる
 
 ## インストール
@@ -26,8 +27,8 @@ Reference Object は、リトポロジー対象のハイポリメッシュです
 
 | 機能 | 操作 |
 | --- | --- |
-| 通常 MFO ON/OFF | 設定キーを短時間に2回押す |
-| Face Set MFO ON/OFF | `Ctrl` を押しながら設定キーを短時間に2回押す |
+| 通常 MFO ON/OFF | Object / Edit / Sculpt Mode で設定キーを短時間に2回押す |
+| Face Set MFO ON/OFF | Object / Edit Mode で `Ctrl` を押しながら設定キーを短時間に2回押す |
 | Smart Face Set Fill プレビュー | Sculpt Mode で `E`、開始Eのrelease後に `E` を再押下（または `Enter`）で確定、ホイールで距離変更、`Esc` で取消 |
 | Smart Face Set Fill 厳格プレビュー | Sculpt Mode で `Ctrl + E`、開始Eのrelease後に `E` を再押下（または `Enter`）で確定、ホイールで距離変更、`Esc` で取消 |
 | Topology Colors | 編集モードで `Ctrl + Alt + 1..6`（`0`で解除） |
@@ -36,7 +37,7 @@ Reference Object は、リトポロジー対象のハイポリメッシュです
 
 ## 通常 MFO
 
-1. Reference Object を画面中央に置く
+1. Reference Object を画面中央に置く（Object / Edit / Sculpt Mode で利用できます）
 2. 設定キーをダブルタップする
 3. 画面中央のスクリーン座標から Reference Object だけへ Ray Cast する
 4. 最初の交点を一時的な Orbit 中心にする
@@ -109,6 +110,9 @@ Sculpt Mode でカーソルを Face Set 上へ置き、`E` を押すと局所プ
 - 対象 Face に既存の seed Face Set ID を直接書き込む
 - 固定した複数方向の Lambert 照度近似を使い、まず指定距離の局所 patch を取得してから谷の符号付き変化を検出する。実影や AO、画面の照明は使わず、谷barrierでseed側の元face成分を選び、その周囲を元の面で補正する。半径変更ごとに現在patchから再判定するため、有限長の谷端での正当な再加入を妨げない
 - 指定距離内の可視面graphで候補に囲まれた未選択成分だけを補完する。距離境界、欠落edge（crop/メッシュ境界、非多様体、hidden、未接続seam）へつながる成分や別sheetは補完しない
+- 現在半径の候補距離内にある有効な共有辺crossingはshape/領域境界（orange）として扱い、fine partition barrierの有無で距離境界（cyan）へ戻さない。距離外または未探索のcrossingは距離境界のままにする
+- shape境界が大きすぎる場合は、固定した面辺数・成分数・候補辺数の予算内だけで既存route補正を試し、超過時は補正を見送る。境界の色分類はそのまま行い、応答時間を無制限に延ばさない
+- 境界分類では選択側ではなく隣接する非選択側の距離を使い、route入口と最終描画のoutside面を一致させる
 - 予測で表示した面集合をそのまま確定に使う。履歴は現在と直前2段階、GPU描画 batch は最大3候補まで保持し、ready中に再生成しない
 - 同期計算中と最新結果の実描画前後に届いたwheel入力は捨て、最新結果の描画後に短い排出区間を経た次のwheelだけを1段階として受け付ける。Escとready済み結果のE/Enter確定は維持する
 
@@ -158,13 +162,14 @@ Blender同梱のNumPyを使用します。大規模メッシュでは初回の�
 
 A Blender 5.2 add-on for manual retopology workflows.
 
-Current add-on version: **3.2.17**
+Current add-on version: **3.2.23**
 
 Main features:
 
-- **Normal MFO**: temporarily orbits around the surface point at the center of the viewport
+- **Normal MFO**: in Object, Edit, or Sculpt Mode, temporarily orbits around the surface point at the center of the viewport
 - **Face Set MFO (FSMFO)**: temporarily shows one Reference Face Set and its matching Retopo island
 - **Smart Face Set Fill**: previews a local geometry-aware region under the cursor and applies only the displayed faces after a second E press or Enter
+- Smart Face Set Fill may evaluate one existing-edge hop outside the current connected shape boundary once, while preserving distance boundaries, enclosed gaps, and seed connectivity; corrected boundaries are drawn from the full geometry edge graph
 - **Topology Colors**: assigns six translucent topology guide colors to selected Edit Mesh faces
 
 ## Installation
@@ -182,8 +187,8 @@ The default Activation Key is `Right Shift`.
 
 | Feature | Shortcut |
 | --- | --- |
-| Normal MFO ON/OFF | Double-tap the configured key |
-| Face Set MFO ON/OFF | Hold `Ctrl` and double-tap the configured key |
+| Normal MFO ON/OFF | In Object, Edit, or Sculpt Mode, double-tap the configured key |
+| Face Set MFO ON/OFF | In Object or Edit Mode, hold `Ctrl` and double-tap the configured key |
 | Smart Face Set Fill preview | `E` in Sculpt Mode; release and press `E` again (or press `Enter`) to apply, wheel changes distance, `Esc` cancels |
 | Strict Smart Face Set Fill preview | `Ctrl + E` in Sculpt Mode; release and press `E` again (or press `Enter`) to apply, wheel changes distance, `Esc` cancels |
 | Topology Colors | `Ctrl + Alt + 1..6` in Edit Mode (`0` clears) |
@@ -192,7 +197,7 @@ Normal MFO and FSMFO use separate KeyMap Items. FSMFO is started directly by its
 
 ## Normal MFO
 
-1. Place the Reference Object at the center of the viewport
+1. Place the Reference Object at the center of the viewport (available in Object, Edit, and Sculpt Mode)
 2. Double-tap the configured key
 3. Cast one ray from the viewport center to the Reference Object
 4. Use the first hit point as the temporary orbit center
@@ -265,6 +270,9 @@ The algorithm:
 - Writes the existing seed Face Set ID directly to the accepted faces
 - Uses fixed view-independent multi-direction Lambert illumination as an approximation, not real shadows or ambient occlusion. It acquires the requested local distance patch first, detects signed valley changes there, keeps the seed-side original-face component across valley barriers, and corrects its surrounding band against original faces. Each radius is reevaluated from the current patch so a finite valley may reconnect naturally at its end.
 - Fills only visible unselected face components enclosed by the candidate in the requested-distance mesh graph. Components reaching the distance boundary or an unpaired edge (crop or mesh boundary, non-manifold edge, hidden neighbor, unmatched seam), and separate sheets, remain unfilled.
+- Treats a valid shared-edge crossing whose outside face is within the current candidate distance as a shape/region boundary (orange); the fine partition barrier does not demote it to the distance boundary (cyan). Crossings outside the distance or beyond the explored patch remain distance boundaries.
+- Bounds the optional route correction by fixed shape-edge, component, per-component candidate-edge, and total candidate-edge budgets; oversized boundaries keep their classification while route correction is skipped to bound response time.
+- Uses the non-selected adjacent face for the boundary distance in both route input and final drawing, keeping their outside-face classification consistent.
 - The displayed prediction is the exact face set written on confirmation. History keeps the current and two previous stages, and GPU draw batches are retained for up to three candidates instead of being rebuilt while Ready.
 - Wheel input received during synchronous computation and around the first draw of the latest result is discarded. After the draw callback and a short drain interval, the next wheel is accepted as one stage; Esc and E/Enter confirmation of a ready result remain available.
 

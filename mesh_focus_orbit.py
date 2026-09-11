@@ -9,7 +9,7 @@ rotating the view.
 bl_info = {
     "name": "Mesh Focus Orbit",
     "author": "OpenAI",
-    "version": (3, 2, 17),
+    "version": (3, 2, 23),
     "blender": (5, 2, 0),
     "location": "3D View",
     "description": "Temporary mesh-centered orbit and local Smart Face Set Fill preview",
@@ -76,6 +76,10 @@ _fill_preview_draw_handler = None
 _fill_preview_text_draw_handler = None
 _fill_preview_shader = None
 _FILL_PREVIEW_WHEEL_DRAIN_SECONDS = 0.12
+_FILL_PREVIEW_BOUNDARY_ROUTE_SHAPE_PAIR_BUDGET = 128
+_FILL_PREVIEW_BOUNDARY_ROUTE_COMPONENT_BUDGET = 8
+_FILL_PREVIEW_BOUNDARY_ROUTE_COMPONENT_PAIR_BUDGET = 512
+_FILL_PREVIEW_BOUNDARY_ROUTE_TOTAL_PAIR_BUDGET = 2048
 _is_registered = False
 _polyquilt_qsnap_class = None
 _polyquilt_qsnap_original_snap_objects = None
@@ -6777,7 +6781,11 @@ class VIEW3D_OT_mesh_focus_face_set_activate(bpy.types.Operator):
 
 
 class VIEW3D_OT_mesh_focus_orbit(bpy.types.Operator):
-    """Double-tap the configured key to start or stop an MFO session."""
+    """Double-tap the configured key to start or stop an MFO session.
+
+    Normal MFO is also available while Sculpt Mode is active.  Face Set MFO
+    keeps its separate Object/Edit-only activation operator and keymap item.
+    """
 
     bl_idname = OPERATOR_ID
     bl_label = "Mesh Focus Orbit"
@@ -6791,7 +6799,7 @@ class VIEW3D_OT_mesh_focus_orbit(bpy.types.Operator):
             and context.region is not None
             and context.region.type == "WINDOW"
             and context.space_data is not None
-            and context.mode in {"OBJECT", "EDIT_MESH"}
+            and context.mode in {"OBJECT", "EDIT_MESH", "SCULPT"}
         )
 
     def invoke(self, context, event):
@@ -8213,6 +8221,713 @@ def _fill_preview_enclosed_gap_faces(geometry, distances, target_radius, selecte
     }
 
 
+def _fill_preview_shape_boundary_mask(crossing, outside_distance, radius, edge_indices):
+    """Classify valid candidate crossings using the shared distance tolerance.
+
+    An edge crossing whose outside face is inside the current candidate
+    distance is a shape/region boundary.  The fine partition barrier is a
+    shape signal for region ownership, but it must not demote an otherwise
+    valid in-range crossing to the distance-boundary color.
+    """
+    import numpy as np
+
+    crossing = np.asarray(crossing, dtype=bool).reshape(-1)
+    outside_distance = np.asarray(outside_distance, dtype=np.float64).reshape(-1)
+    edge_indices = np.asarray(edge_indices, dtype=np.int32).reshape(-1)
+    if (
+        len(crossing) == 0
+        or len(crossing) != len(outside_distance)
+        or len(crossing) != len(edge_indices)
+    ):
+        return np.zeros(len(crossing), dtype=bool)
+    tolerance = max(float(radius) * 1.0e-8, 1.0e-9)
+    return (
+        crossing
+        & (edge_indices >= 0)
+        & np.isfinite(outside_distance)
+        & (outside_distance <= float(radius) + tolerance)
+    )
+
+
+def _fill_preview_boundary_route(
+    state, geometry, local, distances, analysis_ids, radius,
+    preview_local_ids, partition, protected_geometry_ids=(),
+):
+    """Prefer a long, straight current shape interval's nearby edge route.
+
+    This is deliberately a small post-pass over the current candidate.  It
+    does not discover a valley independently: only a connected shape boundary
+    already produced for this radius can enter the route search.  The chosen
+    primal edge path is converted back into a subset of the current face mask,
+    so the drawn and confirmed boundaries remain the same.
+    """
+    import numpy as np
+
+    fallback = {
+        "boundary_route_applied": False,
+        "boundary_route_reason": "not-run",
+        "boundary_route_components": 0,
+        "boundary_route_edges": 0,
+        "boundary_route_changed_faces": 0,
+        "_boundary_route_edge_indices": (),
+    }
+    original_preview_ids = np.asarray(preview_local_ids, dtype=np.int32).reshape(-1)
+    try:
+        mesh = state["obj"].data
+        matrix = state["obj"].matrix_world
+        count = int(local["count"])
+        first = np.asarray(local["first"], dtype=np.int32)
+        second = np.asarray(local["second"], dtype=np.int32)
+        edge_indices = np.asarray(local.get("pair_edge_indices", ()), dtype=np.int32)
+        if count <= 0 or len(first) == 0 or len(edge_indices) != len(first):
+            fallback["boundary_route_reason"] = "edge-data-unavailable"
+            return original_preview_ids, fallback
+        analysis_ids = np.asarray(analysis_ids, dtype=np.int32)
+        if len(analysis_ids) != count:
+            fallback["boundary_route_reason"] = "analysis-size"
+            return original_preview_ids, fallback
+        local_global_ids = np.asarray(local.get("_global_face_ids", ()), dtype=np.int32)
+        if len(local_global_ids) != count:
+            fallback["boundary_route_reason"] = "local-id-data-unavailable"
+            return original_preview_ids, fallback
+        # make_result stores geometry-local ids in preview_local_ids.  Convert
+        # them back to this compact local slice before using them as a mask.
+        selected = np.isin(local_global_ids, original_preview_ids)
+        preview_local_ids = np.flatnonzero(selected).astype(np.int32)
+        local_distances = np.asarray(distances, dtype=np.float64)[analysis_ids]
+        crossing = selected[first] != selected[second]
+        inside = np.where(selected[first], first, second)
+        outside = np.where(selected[first], second, first)
+        outside_distance = local_distances[outside]
+        shape = _fill_preview_shape_boundary_mask(
+            crossing, outside_distance, radius, edge_indices
+        )
+        shape_pairs = np.flatnonzero(shape & (edge_indices >= 0)).astype(np.int32)
+        if len(shape_pairs) > _FILL_PREVIEW_BOUNDARY_ROUTE_SHAPE_PAIR_BUDGET:
+            fallback["boundary_route_reason"] = "shape-budget"
+            return original_preview_ids, fallback
+        if len(shape_pairs) < 6:
+            fallback["boundary_route_reason"] = "shape-interval-short"
+            return original_preview_ids, fallback
+
+        point_cache = {}
+
+        def point(vertex):
+            vertex = int(vertex)
+            value = point_cache.get(vertex)
+            if value is None:
+                value = np.asarray(matrix @ mesh.vertices[vertex].co, dtype=np.float64)
+                point_cache[vertex] = value
+            return value
+
+        edge_vertices = {}
+
+        def vertices_for_edge(edge):
+            edge = int(edge)
+            value = edge_vertices.get(edge)
+            if value is None:
+                values = tuple(int(v) for v in mesh.edges[edge].vertices)
+                if len(values) != 2:
+                    return None
+                edge_vertices[edge] = values
+                value = values
+            return value
+
+        # Split the current shape edges into simple primal chains. Branches and
+        # cycles are kept unchanged, because a single fit would erase their
+        # topology.
+        shape_edges = sorted(set(int(edge_indices[pair]) for pair in shape_pairs))
+        vertex_edges = {}
+        for edge in shape_edges:
+            values = vertices_for_edge(edge)
+            if values is None:
+                continue
+            for vertex in values:
+                vertex_edges.setdefault(vertex, []).append(edge)
+        remaining = set(shape_edges)
+        components = []
+        while remaining:
+            start_edge = min(remaining)
+            pending = [start_edge]
+            remaining.remove(start_edge)
+            component = []
+            while pending:
+                edge = pending.pop()
+                component.append(edge)
+                values = vertices_for_edge(edge) or ()
+                for vertex in values:
+                    for neighbor_edge in vertex_edges.get(vertex, ()):
+                        if neighbor_edge in remaining:
+                            remaining.remove(neighbor_edge)
+                            pending.append(neighbor_edge)
+            components.append(component)
+        fallback["boundary_route_components"] = int(len(components))
+        if len(components) > _FILL_PREVIEW_BOUNDARY_ROUTE_COMPONENT_BUDGET:
+            fallback["boundary_route_reason"] = "component-budget"
+            return original_preview_ids, fallback
+
+        pair_lengths = np.asarray(
+            local.get("pair_lengths", local.get("neighbor_lengths", ())),
+            dtype=np.float64,
+        )
+        spacing = float(np.median(pair_lengths)) if len(pair_lengths) else 0.0
+        if not np.isfinite(spacing) or spacing <= 1.0e-12:
+            fallback["boundary_route_reason"] = "spacing-unavailable"
+            return original_preview_ids, fallback
+        neighbors = np.asarray(local["neighbors"], dtype=np.int32)
+        offsets = np.asarray(local["offsets"], dtype=np.int64)
+        protected_ids = np.asarray(tuple(protected_geometry_ids), dtype=np.int32)
+        protected = (
+            np.isin(local_global_ids, protected_ids)
+            if len(local_global_ids) and len(protected_ids)
+            else np.zeros(count, dtype=bool)
+        )
+        best = None
+        candidate_pair_total = 0
+
+        def chain_turn(edge_list):
+            incident = {}
+            for edge in edge_list:
+                values = vertices_for_edge(edge)
+                if values is None:
+                    continue
+                a, b = values
+                incident.setdefault(a, []).append(b)
+                incident.setdefault(b, []).append(a)
+            total = 0.0
+            for vertex, values in incident.items():
+                if len(values) != 2:
+                    continue
+                va = point(values[0]) - point(vertex)
+                vb = point(values[1]) - point(vertex)
+                denominator = max(float(np.linalg.norm(va) * np.linalg.norm(vb)), 1.0e-20)
+                total += math.pi - math.acos(
+                    float(np.clip(np.dot(va, vb) / denominator, -1.0, 1.0))
+                )
+            return float(total)
+
+        for component in components:
+            if len(component) < 6:
+                continue
+            incident = {}
+            for edge in component:
+                values = vertices_for_edge(edge)
+                if values is None:
+                    continue
+                for vertex in values:
+                    incident.setdefault(vertex, []).append(edge)
+            degrees = {vertex: len(edges) for vertex, edges in incident.items()}
+            endpoints = [vertex for vertex, degree in degrees.items() if degree == 1]
+            if len(endpoints) != 2 or any(degree > 2 for degree in degrees.values()):
+                continue
+            component_vertices = tuple(incident.keys())
+            points = np.asarray([point(vertex) for vertex in component_vertices])
+            center = points.mean(axis=0)
+            _u, _s, vh = np.linalg.svd(points - center, full_matrices=False)
+            direction = np.asarray(vh[0], dtype=np.float64)
+            direction /= max(float(np.linalg.norm(direction)), 1.0e-20)
+            projections = (points - center) @ direction
+            lower, upper = float(projections.min()), float(projections.max())
+            fit_error = float(
+                np.mean(
+                    np.linalg.norm(
+                        (points - center)
+                        - np.outer(projections, direction),
+                        axis=1,
+                    )
+                )
+            )
+            # A current orange interval can be a visibly zigzagged edge chain
+            # before the longer-radius re-evaluation.  Keep the fit gate
+            # conservative enough to reject broad curves, while allowing the
+            # interval to reach the nearby straight-route comparison.
+            if fit_error > spacing * 1.50:
+                continue
+            shape_turn = chain_turn(component)
+            if shape_turn <= 1.0e-6:
+                continue
+
+            component_pairs = shape_pairs[np.isin(edge_indices[shape_pairs], component)]
+            boundary_faces = np.unique(
+                np.r_[first[component_pairs], second[component_pairs]]
+            ).astype(np.int32)
+            neighborhood = np.zeros(count, dtype=bool)
+            neighborhood[boundary_faces] = True
+            for face in boundary_faces:
+                neighborhood[
+                    neighbors[int(offsets[face]) : int(offsets[face + 1])]
+                ] = True
+            candidate_pairs = np.flatnonzero(
+                (neighborhood[first] | neighborhood[second]) & (edge_indices >= 0)
+            )
+            if len(candidate_pairs) > _FILL_PREVIEW_BOUNDARY_ROUTE_COMPONENT_PAIR_BUDGET:
+                continue
+            if (
+                candidate_pair_total + len(candidate_pairs)
+                > _FILL_PREVIEW_BOUNDARY_ROUTE_TOTAL_PAIR_BUDGET
+            ):
+                break
+            candidate_pair_total += len(candidate_pairs)
+            candidate_edges = sorted(set(int(edge_indices[pair]) for pair in candidate_pairs))
+            band = max(spacing * 2.5, 1.0e-8)
+            graph = {}
+            for edge in candidate_edges:
+                values = vertices_for_edge(edge)
+                if values is None:
+                    continue
+                a, b = values
+                pa, pb = point(a), point(b)
+                midpoint = (pa + pb) * 0.5
+                midpoint_delta = midpoint - center
+                midpoint_projection = float(np.dot(midpoint_delta, direction))
+                if midpoint_projection < lower - spacing or midpoint_projection > upper + spacing:
+                    continue
+                endpoint_distances = []
+                for value in (pa, pb):
+                    delta = value - center
+                    endpoint_distances.append(
+                        float(np.linalg.norm(delta - direction * np.dot(delta, direction)))
+                    )
+                if max(endpoint_distances) > band:
+                    continue
+                edge_vector = pb - pa
+                edge_length = max(float(np.linalg.norm(edge_vector)), 1.0e-20)
+                alignment = abs(float(np.dot(edge_vector / edge_length, direction)))
+                if alignment < 0.75:
+                    continue
+                distance_cost = endpoint_distances[0] + endpoint_distances[1]
+                cost = (
+                    (distance_cost / max(2.0 * spacing, 1.0e-20)) ** 2
+                    + 4.0 * (1.0 - alignment)
+                    + 0.05 * (edge_length / spacing)
+                )
+                graph.setdefault(a, []).append((b, edge, cost))
+                graph.setdefault(b, []).append((a, edge, cost))
+            if not graph:
+                continue
+            start_projection = lower
+            end_projection = upper
+            starts = [
+                vertex
+                for vertex in graph
+                if abs(float(np.dot(point(vertex) - center, direction)) - start_projection)
+                <= spacing * 0.25
+            ]
+            ends = {
+                vertex
+                for vertex in graph
+                if abs(float(np.dot(point(vertex) - center, direction)) - end_projection)
+                <= spacing * 0.25
+            }
+            if not starts or not ends:
+                continue
+            scores = {}
+            previous = {}
+            pending = []
+            for vertex in starts:
+                scores[vertex] = 0.0
+                previous[vertex] = None
+                heapq.heappush(pending, (0.0, int(vertex)))
+            target = None
+            while pending:
+                score, vertex = heapq.heappop(pending)
+                if score != scores.get(vertex):
+                    continue
+                if vertex in ends:
+                    target = vertex
+                    break
+                for neighbor, edge, cost in graph.get(vertex, ()):
+                    if float(np.dot(point(neighbor) - point(vertex), direction)) <= 1.0e-8:
+                        continue
+                    candidate_score = score + cost
+                    if candidate_score < scores.get(neighbor, float("inf")):
+                        scores[neighbor] = candidate_score
+                        previous[neighbor] = (vertex, edge)
+                        heapq.heappush(pending, (candidate_score, int(neighbor)))
+            if target is None:
+                continue
+            route_edges = []
+            route_vertices = [target]
+            vertex = target
+            while previous.get(vertex) is not None:
+                old_vertex, edge = previous[vertex]
+                route_edges.append(int(edge))
+                vertex = old_vertex
+                route_vertices.append(vertex)
+            route_edges.reverse()
+            route_vertices.reverse()
+            if len(route_edges) < 6 or len(route_edges) < int(len(component) * 0.60):
+                continue
+            route_turn = chain_turn(route_edges)
+            if route_turn >= shape_turn * 0.85:
+                continue
+            route_points = np.asarray([point(vertex) for vertex in route_vertices])
+            route_projection = (route_points - center) @ direction
+            route_fit = float(
+                np.mean(
+                    np.linalg.norm(
+                        (route_points - center)
+                        - np.outer(route_projection, direction),
+                        axis=1,
+                    )
+                )
+            )
+            if route_fit > fit_error + spacing * 0.30:
+                continue
+            endpoint_distance = max(
+                min(float(np.linalg.norm(point(route_vertices[0]) - point(value))) for value in endpoints),
+                min(float(np.linalg.norm(point(route_vertices[-1]) - point(value))) for value in endpoints),
+            )
+            # The replacement route may sit one local row away from the
+            # current orange chain.  Treat that short offset as an implicit
+            # terminal connector; the long middle section is still required
+            # to be an existing mesh-edge route.
+            if endpoint_distance > spacing * 3.0:
+                continue
+            seed_matches = np.flatnonzero(local_global_ids == int(state.get("seed_local", -1)))
+            if len(seed_matches) == 0:
+                continue
+            seed_center = local["centers"][int(seed_matches[0])]
+            side = np.asarray(seed_center, dtype=np.float64) - center
+            side -= direction * np.dot(side, direction)
+            side_norm = float(np.linalg.norm(side))
+            if side_norm <= 1.0e-12:
+                continue
+            side /= side_norm
+            route_midpoints = np.asarray(
+                [(point(vertices_for_edge(edge)[0]) + point(vertices_for_edge(edge)[1])) * 0.5 for edge in route_edges]
+            )
+            route_level = float(np.median((route_midpoints - center) @ side))
+            seed_level = float(np.dot(seed_center - center, side))
+            if route_level <= spacing * 0.05 or seed_level <= route_level + spacing * 0.50:
+                continue
+            signed = (local["centers"] - center) @ side
+            local_projection = (local["centers"] - center) @ direction
+            # Distance-boundary faces are fixed for this radius.  Keep both
+            # sides of those crossings out of the local mask move so a nearby
+            # route cannot shorten or redraw the radial boundary.
+            distance_boundary = crossing & ~shape
+            distance_boundary_faces = np.zeros(count, dtype=bool)
+            if np.any(distance_boundary):
+                distance_boundary_faces[first[distance_boundary]] = True
+                distance_boundary_faces[second[distance_boundary]] = True
+            remove = selected & ~protected & (
+                signed < route_level + spacing * 0.25
+            ) & (signed > -band) & (
+                local_projection >= lower - spacing
+            ) & (local_projection <= upper + spacing)
+            remove &= neighborhood
+            remove &= ~distance_boundary_faces
+            if not np.any(remove) or bool(remove[int(seed_matches[0])]):
+                continue
+            candidate_mask = selected.copy()
+            candidate_mask[remove] = False
+            after_crossing = candidate_mask[first] != candidate_mask[second]
+            # A route may replace the shape crossing, but an existing distance
+            # boundary must remain a boundary at the same radius.
+            distance_boundary = crossing & ~shape
+            if np.any(~after_crossing[distance_boundary]):
+                continue
+            route_pairs = np.flatnonzero(np.isin(edge_indices, route_edges))
+            if not len(route_pairs) or not np.all(
+                after_crossing[route_pairs]
+            ):
+                continue
+            shape_pairs_component = component_pairs
+            if np.any(after_crossing[shape_pairs_component]):
+                continue
+            # A route one mesh row away can expose one short existing edge at
+            # each end between the route endpoint and the old interval end.
+            # Keep those terminal connectors in the same shape boundary so
+            # the final candidate and its orange classification agree.
+            route_boundary_edge_ids = set(int(edge) for edge in route_edges)
+            route_endpoint_vertices = {
+                int(route_vertices[0]), int(route_vertices[-1])
+            }
+            shape_endpoint_vertices = {int(vertex) for vertex in endpoints}
+            for pair in np.flatnonzero(after_crossing & (edge_indices >= 0)):
+                edge = int(edge_indices[pair])
+                values = vertices_for_edge(edge)
+                if values is None:
+                    continue
+                first_vertex, second_vertex = values
+                if (
+                    (
+                        first_vertex in route_endpoint_vertices
+                        and second_vertex in shape_endpoint_vertices
+                    )
+                    or (
+                        second_vertex in route_endpoint_vertices
+                        and first_vertex in shape_endpoint_vertices
+                    )
+                ):
+                    route_boundary_edge_ids.add(edge)
+            connected = np.zeros(count, dtype=bool)
+            seed_local = int(seed_matches[0])
+            connected[seed_local] = True
+            pending_faces = [seed_local]
+            while pending_faces:
+                face = pending_faces.pop()
+                for neighbor in neighbors[int(offsets[face]) : int(offsets[face + 1])]:
+                    neighbor = int(neighbor)
+                    if candidate_mask[neighbor] and not connected[neighbor]:
+                        connected[neighbor] = True
+                        pending_faces.append(neighbor)
+            if not np.all(connected[candidate_mask]):
+                continue
+            corrected_geometry_ids = local_global_ids[np.flatnonzero(candidate_mask)].astype(
+                np.int32
+            )
+            new_gap_ids, _gap_metrics = _fill_preview_enclosed_gap_faces(
+                geometry, distances, radius, corrected_geometry_ids
+            )
+            if len(new_gap_ids):
+                continue
+            if best is None or route_turn < best[0]:
+                best = (
+                    route_turn,
+                    candidate_mask,
+                    len(route_edges),
+                    len(np.flatnonzero(selected & ~candidate_mask)),
+                    shape_turn,
+                    route_fit,
+                    fit_error,
+                    tuple(sorted(route_boundary_edge_ids)),
+                )
+        if best is None:
+            fallback["boundary_route_reason"] = "no-clear-route"
+            return original_preview_ids, fallback
+        (
+            _route_turn,
+            candidate_mask,
+            route_count,
+            changed,
+            before_turn,
+            route_fit,
+            fit_error,
+            route_boundary_edge_ids,
+        ) = best
+        corrected = local_global_ids[np.flatnonzero(candidate_mask)].astype(np.int32)
+        fallback.update(
+            {
+                "boundary_route_applied": True,
+                "boundary_route_reason": "applied",
+                "boundary_route_edges": int(route_count),
+                "boundary_route_changed_faces": int(changed),
+                "_boundary_route_edge_indices": tuple(
+                    int(edge) for edge in route_boundary_edge_ids
+                ),
+                "boundary_route_before_turn": float(before_turn),
+                "boundary_route_after_turn": float(_route_turn),
+                "boundary_route_fit_error": float(fit_error),
+                "boundary_route_route_fit": float(route_fit),
+            }
+        )
+        return corrected, fallback
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError, RuntimeError):
+        fallback["boundary_route_reason"] = "error-fallback"
+        return original_preview_ids, fallback
+
+
+def _fill_preview_boundary_one_hop(
+    state, geometry, local, distances, analysis_ids, radius,
+    preview_local_ids, protected_geometry_ids=(),
+):
+    """Add at most one current shape-boundary face row, with gap fallback.
+
+    This is a bounded post-pass over the candidate already produced for this
+    radius.  It does not expand from an added face, and it never adds a face
+    outside the current distance domain.  If local topological completion
+    finds a newly enclosed gap, only the newly added faces adjacent to that
+    gap are removed for up to three passes; an unresolved gap restores the
+    original candidate.
+    """
+    import numpy as np
+
+    original_ids = np.asarray(preview_local_ids, dtype=np.int32).reshape(-1)
+    fallback = {
+        "one_hop_applied": False,
+        "one_hop_reason": "not-run",
+        "one_hop_added_faces": 0,
+        "one_hop_removed_faces": 0,
+        "one_hop_gap_passes": 0,
+        "one_hop_gap_faces": 0,
+        "one_hop_distance_boundary_kept": True,
+        "one_hop_radius_outside_faces": 0,
+    }
+    try:
+        count = int(local["count"])
+        first = np.asarray(local["first"], dtype=np.int32)
+        second = np.asarray(local["second"], dtype=np.int32)
+        edge_indices = np.asarray(local.get("pair_edge_indices", ()), dtype=np.int32)
+        local_global_ids = np.asarray(local.get("_global_face_ids", ()), dtype=np.int32)
+        analysis_ids = np.asarray(analysis_ids, dtype=np.int32)
+        distances = np.asarray(distances, dtype=np.float64)
+        if (
+            count <= 0
+            or len(first) == 0
+            or len(first) != len(second)
+            or len(first) != len(edge_indices)
+            or len(local_global_ids) != count
+            or len(analysis_ids) != count
+            or len(distances) <= int(np.max(analysis_ids))
+        ):
+            fallback["one_hop_reason"] = "edge-data-unavailable"
+            return original_ids, fallback
+        selected = np.isin(local_global_ids, original_ids)
+        local_distances = distances[analysis_ids]
+        crossing = selected[first] != selected[second]
+        outside = np.where(selected[first], second, first)
+        shape = _fill_preview_shape_boundary_mask(
+            crossing,
+            local_distances[outside],
+            float(radius),
+            edge_indices,
+        )
+        shape_pairs = np.flatnonzero(shape & (edge_indices >= 0)).astype(np.int32)
+        fallback["one_hop_shape_pairs"] = int(len(shape_pairs))
+        if len(shape_pairs) == 0:
+            fallback["one_hop_reason"] = "shape-interval-short"
+            return original_ids, fallback
+
+        hidden = np.asarray(
+            local.get("hidden", np.zeros(count, dtype=bool)), dtype=bool
+        )
+        mesh = state["obj"].data
+        geometry_face_ids = np.asarray(geometry["face_ids"], dtype=np.int32)
+        outside_shape = outside[shape_pairs]
+        visible = np.asarray(
+            [
+                not bool(
+                    mesh.polygons[
+                        int(geometry_face_ids[int(local_global_ids[int(face_id)])])
+                    ].hide
+                )
+                for face_id in outside_shape
+            ],
+            dtype=bool,
+        )
+        tolerance = max(float(radius) * 1.0e-8, 1.0e-9)
+        eligible = shape_pairs[
+            (~selected[outside_shape])
+            & np.isfinite(local_distances[outside_shape])
+            & (local_distances[outside_shape] <= float(radius) + tolerance)
+            & ~hidden[outside_shape]
+            & visible
+        ]
+        added_local = np.unique(outside[eligible]).astype(np.int32)
+        fallback["one_hop_eligible_pairs"] = int(len(eligible))
+        if len(added_local) == 0:
+            fallback["one_hop_reason"] = "no-eligible-face"
+            return original_ids, fallback
+        fallback["one_hop_radius_outside_faces"] = int(
+            np.count_nonzero(
+                ~np.isfinite(local_distances[added_local])
+                | (local_distances[added_local] > float(radius) + tolerance)
+            )
+        )
+        if fallback["one_hop_radius_outside_faces"]:
+            fallback["one_hop_reason"] = "radius-outside"
+            return original_ids, fallback
+
+        neighbors = np.asarray(local["neighbors"], dtype=np.int32)
+        offsets = np.asarray(local["offsets"], dtype=np.int64)
+        added_mask = np.zeros(count, dtype=bool)
+        added_mask[added_local] = True
+        working = selected.copy()
+        working[added_local] = True
+        geometry_neighbors = np.asarray(geometry["neighbors"], dtype=np.int32)
+        geometry_offsets = np.asarray(geometry["offsets"], dtype=np.int64)
+        id_to_local = {int(value): index for index, value in enumerate(local_global_ids)}
+        gap_passes = 0
+        removed_faces = 0
+        final_gap_count = None
+        for _pass in range(3):
+            selected_ids = local_global_ids[np.flatnonzero(working)].astype(np.int32)
+            gap_ids, _gap_metrics = _fill_preview_enclosed_gap_faces(
+                geometry, distances, radius, selected_ids
+            )
+            if len(gap_ids) == 0:
+                final_gap_count = 0
+                break
+            gap_passes += 1
+            remove = set()
+            for gap_id in np.asarray(gap_ids, dtype=np.int32):
+                gap_id = int(gap_id)
+                if gap_id < 0 or gap_id + 1 >= len(geometry_offsets):
+                    continue
+                for neighbor in geometry_neighbors[
+                    int(geometry_offsets[gap_id]) : int(geometry_offsets[gap_id + 1])
+                ]:
+                    local_neighbor = id_to_local.get(int(neighbor))
+                    if (
+                        local_neighbor is not None
+                        and added_mask[local_neighbor]
+                        and working[local_neighbor]
+                    ):
+                        remove.add(int(local_neighbor))
+            if not remove:
+                final_gap_count = int(len(gap_ids))
+                break
+            remove_ids = np.asarray(sorted(remove), dtype=np.int32)
+            working[remove_ids] = False
+            removed_faces += int(len(remove_ids))
+        if final_gap_count is None:
+            selected_ids = local_global_ids[np.flatnonzero(working)].astype(np.int32)
+            final_gap_ids, _gap_metrics = _fill_preview_enclosed_gap_faces(
+                geometry, distances, radius, selected_ids
+            )
+            final_gap_count = int(len(final_gap_ids))
+        fallback["one_hop_gap_passes"] = int(gap_passes)
+        fallback["one_hop_gap_faces"] = int(final_gap_count)
+        fallback["one_hop_removed_faces"] = int(removed_faces)
+        if final_gap_count:
+            fallback["one_hop_reason"] = "gap-fallback"
+            return original_ids, fallback
+
+        base_distance = crossing & ~shape
+        after_crossing = working[first] != working[second]
+        distance_kept = bool(np.all(after_crossing[base_distance]))
+        fallback["one_hop_distance_boundary_kept"] = distance_kept
+        if not distance_kept:
+            fallback["one_hop_reason"] = "distance-boundary"
+            return original_ids, fallback
+
+        seed_matches = np.flatnonzero(
+            local_global_ids == int(state.get("seed_local", -1))
+        )
+        if len(seed_matches) == 0:
+            fallback["one_hop_reason"] = "seed-missing"
+            return original_ids, fallback
+        seed_local = int(seed_matches[0])
+        connected = np.zeros(count, dtype=bool)
+        connected[seed_local] = True
+        pending = [seed_local]
+        while pending:
+            face = pending.pop()
+            for neighbor in neighbors[int(offsets[face]) : int(offsets[face + 1])]:
+                neighbor = int(neighbor)
+                if working[neighbor] and not connected[neighbor]:
+                    connected[neighbor] = True
+                    pending.append(neighbor)
+        if not np.all(connected[working]):
+            fallback["one_hop_reason"] = "disconnected"
+            return original_ids, fallback
+
+        corrected = local_global_ids[np.flatnonzero(working)].astype(np.int32)
+        fallback.update(
+            {
+                "one_hop_applied": True,
+                "one_hop_reason": "applied",
+                "one_hop_added_faces": int(np.count_nonzero(working & ~selected)),
+            }
+        )
+        return corrected, fallback
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError, RuntimeError):
+        fallback["one_hop_reason"] = "error-fallback"
+        return original_ids, fallback
+
+
 def _fill_preview_make_result(state, radius):
     """Compute one immutable candidate result for the current wheel distance."""
     import numpy as np
@@ -8292,27 +9007,82 @@ def _fill_preview_make_result(state, radius):
             _unused_region, partition = _fill_preview_region(
                 local, seed_local, bool(state["strict_mode"])
             )
+    boundary_route_metrics = {}
+    if geometry.get("shading_approx"):
+        preview_local_ids, boundary_route_metrics = _fill_preview_boundary_route(
+            state,
+            geometry,
+            local,
+            distances,
+            analysis_ids,
+            radius,
+            preview_local_ids,
+            partition,
+            enclosed_gap_ids,
+        )
+        preview_local_ids, one_hop_metrics = _fill_preview_boundary_one_hop(
+            state,
+            geometry,
+            local,
+            distances,
+            analysis_ids,
+            radius,
+            preview_local_ids,
+            enclosed_gap_ids,
+        )
+        boundary_route_metrics.update(one_hop_metrics)
+    route_edge_indices = frozenset(
+        int(edge)
+        for edge in boundary_route_metrics.pop("_boundary_route_edge_indices", ())
+    )
     preview_faces = preview_local_ids
     face_ids = geometry.get("face_ids")
     if face_ids is not None:
         preview_faces = face_ids[preview_faces].astype(np.int32, copy=False)
     if len(preview_faces) == 0:
         raise RuntimeError("preview produced no visible candidate faces")
-    preview_set = np.isin(analysis_ids, preview_local_ids)
-    first, second = local["first"], local["second"]
     shape_segments = []
     distance_segments = []
     mesh = state["obj"].data
-    boundary = preview_set[first] != preview_set[second]
+    draw_full_geometry = bool(
+        geometry.get("shading_approx")
+        and len(geometry.get("first", ())) == len(geometry.get("second", ()))
+        and len(geometry.get("first", ())) == len(geometry.get("pair_edge_indices", ()))
+        and len(distances) >= int(geometry.get("count", 0))
+    )
+    if draw_full_geometry:
+        draw_first = np.asarray(geometry["first"], dtype=np.int32)
+        draw_second = np.asarray(geometry["second"], dtype=np.int32)
+        pair_edge_indices = np.asarray(geometry["pair_edge_indices"], dtype=np.int32)
+        draw_ids = np.arange(int(geometry["count"]), dtype=np.int32)
+        draw_selected = np.isin(draw_ids, preview_local_ids)
+        draw_outside = np.where(
+            draw_selected[draw_first], draw_second, draw_first
+        )
+        draw_outside_distances = distances[draw_outside]
+    else:
+        draw_first = np.asarray(local["first"], dtype=np.int32)
+        draw_second = np.asarray(local["second"], dtype=np.int32)
+        draw_selected = np.isin(analysis_ids, preview_local_ids)
+        pair_edge_indices = local.get("pair_edge_indices")
+        draw_outside = np.where(
+            draw_selected[draw_first], draw_second, draw_first
+        )
+        draw_outside_distances = distances[analysis_ids[draw_outside]]
+    if pair_edge_indices is None:
+        pair_edge_indices = np.full(len(draw_first), -1, dtype=np.int32)
+    else:
+        pair_edge_indices = np.asarray(pair_edge_indices, dtype=np.int32).reshape(-1)
+        if len(pair_edge_indices) != len(draw_first):
+            pair_edge_indices = np.full(len(draw_first), -1, dtype=np.int32)
+    boundary = draw_selected[draw_first] != draw_selected[draw_second]
+    shape_boundary_mask = _fill_preview_shape_boundary_mask(
+        boundary, draw_outside_distances, radius, pair_edge_indices
+    )
     for edge in np.flatnonzero(boundary):
-        left, right = int(first[edge]), int(second[edge])
-        inside = left if preview_set[left] else right
-        outside = right if preview_set[left] else left
-        v0 = int(local["pair_v0"][edge])
-        v1 = int(local["pair_v1"][edge])
-        edge_indices = local.get("pair_edge_indices")
-        if edge_indices is not None and int(edge_indices[edge]) >= 0:
-            edge_index = int(edge_indices[edge])
+        edge_index = -1
+        if int(pair_edge_indices[edge]) >= 0:
+            edge_index = int(pair_edge_indices[edge])
             edge_vertices = tuple(int(value) for value in mesh.edges[edge_index].vertices)
             matrix = state["obj"].matrix_world
             segment = tuple(
@@ -8320,17 +9090,17 @@ def _fill_preview_make_result(state, radius):
                 for vertex in edge_vertices
             )
         else:
+            if draw_full_geometry:
+                continue
+            v0 = int(local["pair_v0"][edge])
+            v1 = int(local["pair_v1"][edge])
             segment = (
                 tuple(float(value) for value in geometry["world_vertices"][v0]),
                 tuple(float(value) for value in geometry["world_vertices"][v1]),
             )
-        outside_distance = float(distances[analysis_ids[outside]])
         shape_boundary = (
-            np.isfinite(outside_distance)
-            and outside_distance < float(radius) - max(radius * 0.01, 1.e-8)
-            and bool(
-                partition["barrier"][inside] or partition["barrier"][outside]
-            )
+            edge_index in route_edge_indices
+            or bool(shape_boundary_mask[edge])
         )
         (shape_segments if shape_boundary else distance_segments).append(segment)
     patch_edge_reached = bool(
@@ -8354,6 +9124,7 @@ def _fill_preview_make_result(state, radius):
         "partition": partition,
         "created_generation": int(state["generation"]),
         **enclosed_gap_metrics,
+        **boundary_route_metrics,
         **proxy_metrics_for_result,
     }
 
