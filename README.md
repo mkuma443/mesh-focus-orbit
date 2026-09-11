@@ -2,14 +2,14 @@
 
 Blender 5.2 用のリトポロジー支援アドオンです。
 
-現在のアドオンバージョン: **3.2.23**
+現在のアドオンバージョン: **3.2.24**
 
 主な機能:
 
 - **通常 MFO**: Object / Edit / Sculpt Mode で、画面中央の Reference Object 表面を一時 Orbit 中心にする
 - **Face Set MFO (FSMFO)**: Reference Object の対象 Face Set と、対応する Retopo island だけを一時表示する
-- **Smart Face Set Fill**: Sculpt Mode でカーソル直下の局所候補をプレビューし、E再押下またはEnterで表示面だけを Face Set 化する
-- Smart Face Set Fill の形状境界は、現在の候補に接続する既存 edge の1-hop外側を必要な場合だけ一度評価し、距離境界・閉鎖gap・seed接続を保護する。補正後の表示境界はfull geometryの実edgeから描画する
+- **Smart Face Set Fill**: Sculpt Mode でカーソル直下の外周境界だけをプレビューし、E再押下またはEnterで外周内のseed接続面を Face Set 化する
+- Smart Face Set Fill の予測は境界 edge の線だけを描画する。確定時に世代固定したcompact graphの外周境界を越えず、seed接続面を一括で復元して書き込む
 - **Topology Colors**: 編集中の選択面へ6色の半透明ガイドを割り当てる
 
 ## インストール
@@ -111,9 +111,9 @@ Sculpt Mode でカーソルを Face Set 上へ置き、`E` を押すと局所プ
 - 固定した複数方向の Lambert 照度近似を使い、まず指定距離の局所 patch を取得してから谷の符号付き変化を検出する。実影や AO、画面の照明は使わず、谷barrierでseed側の元face成分を選び、その周囲を元の面で補正する。半径変更ごとに現在patchから再判定するため、有限長の谷端での正当な再加入を妨げない
 - 指定距離内の可視面graphで候補に囲まれた未選択成分だけを補完する。距離境界、欠落edge（crop/メッシュ境界、非多様体、hidden、未接続seam）へつながる成分や別sheetは補完しない
 - 現在半径の候補距離内にある有効な共有辺crossingはshape/領域境界（orange）として扱い、fine partition barrierの有無で距離境界（cyan）へ戻さない。距離外または未探索のcrossingは距離境界のままにする
-- shape境界が大きすぎる場合は、固定した面辺数・成分数・候補辺数の予算内だけで既存route補正を試し、超過時は補正を見送る。境界の色分類はそのまま行い、応答時間を無制限に延ばさない
-- 境界分類では選択側ではなく隣接する非選択側の距離を使い、route入口と最終描画のoutside面を一致させる
-- 予測で表示した面集合をそのまま確定に使う。履歴は現在と直前2段階、GPU描画 batch は最大3候補まで保持し、ready中に再生成しない
+- 外周境界は現在のcompact radius domainから作り、内部閉ループを外部到達ラベルで除外する。外へ開く細い溝、crop/mesh境界、非多様体edge、hidden隣接、未接続seam、別sheetは外周側として保持する
+- 境界分類では選択側ではなく隣接する非選択側の距離を使い、seed floodと最終描画のoutside面を一致させる
+- 予測は外周境界線だけを表示し、面のtriangulationや面GPU batchを作らない。E再押下またはEnterで世代固定snapshotをseedからfloodし、その面集合を一度だけFace Setへ書き込む。履歴は現在と直前2段階を保持する
 - 同期計算中と最新結果の実描画前後に届いたwheel入力は捨て、最新結果の描画後に短い排出区間を経た次のwheelだけを1段階として受け付ける。Escとready済み結果のE/Enter確定は維持する
 
 初回準備では Edit Mode へ切り替えず、全 Face の center と全 loop の edge 次数だけを読み取ります。そこからカーソル seed の Euclidean 範囲と解析用 halo を切り出し、範囲内の polygon の edge、法線、非表示状態だけで局所 CSR、距離、谷・境界判定を作ります。全体の曲率や partition を先に作ってから切り出す処理は行いません。edge の全体次数が2の共有だけを通常接続とし、次数1の継ぎ目は両端点の一致と逆向き、法線の互換性を確認した場合だけ橋渡しします。局所切断境界や非多様体 edge は継ぎ目として扱いません。ホイールで範囲を広げた場合は保持済み配列・面 record を使いながら要求された局所 crop と record を再構築し、縮小と同じ半径への再訪では準備済みの結果を再利用します。
@@ -162,14 +162,14 @@ Blender同梱のNumPyを使用します。大規模メッシュでは初回の�
 
 A Blender 5.2 add-on for manual retopology workflows.
 
-Current add-on version: **3.2.23**
+Current add-on version: **3.2.24**
 
 Main features:
 
 - **Normal MFO**: in Object, Edit, or Sculpt Mode, temporarily orbits around the surface point at the center of the viewport
 - **Face Set MFO (FSMFO)**: temporarily shows one Reference Face Set and its matching Retopo island
-- **Smart Face Set Fill**: previews a local geometry-aware region under the cursor and applies only the displayed faces after a second E press or Enter
-- Smart Face Set Fill may evaluate one existing-edge hop outside the current connected shape boundary once, while preserving distance boundaries, enclosed gaps, and seed connectivity; corrected boundaries are drawn from the full geometry edge graph
+- **Smart Face Set Fill**: previews only the outer boundary under the cursor and applies the seed-connected faces inside it after a second E press or Enter
+- Smart Face Set Fill draws boundary lines during prediction and resolves the generation snapshot into one seed flood at confirmation, preserving distance, hidden, crop, and mesh-domain limits
 - **Topology Colors**: assigns six translucent topology guide colors to selected Edit Mesh faces
 
 ## Installation
@@ -269,11 +269,9 @@ The algorithm:
 - Skips hidden faces and non-manifold boundaries; a ray that first reaches a hidden face continues to the first visible face. There is no fixed 100,000-face cutoff; wheel-adjusted search distance is capped at 16 times the initial radius
 - Writes the existing seed Face Set ID directly to the accepted faces
 - Uses fixed view-independent multi-direction Lambert illumination as an approximation, not real shadows or ambient occlusion. It acquires the requested local distance patch first, detects signed valley changes there, keeps the seed-side original-face component across valley barriers, and corrects its surrounding band against original faces. Each radius is reevaluated from the current patch so a finite valley may reconnect naturally at its end.
-- Fills only visible unselected face components enclosed by the candidate in the requested-distance mesh graph. Components reaching the distance boundary or an unpaired edge (crop or mesh boundary, non-manifold edge, hidden neighbor, unmatched seam), and separate sheets, remain unfilled.
+- Labels one compact radius domain from its outside openings to remove inner boundary loops. Open U grooves, crop or mesh boundaries, non-manifold edges, hidden neighbors, unmatched seams, and separate sheets remain outside; a closed pocket connected to the candidate is included.
 - Treats a valid shared-edge crossing whose outside face is within the current candidate distance as a shape/region boundary (orange); the fine partition barrier does not demote it to the distance boundary (cyan). Crossings outside the distance or beyond the explored patch remain distance boundaries.
-- Bounds the optional route correction by fixed shape-edge, component, per-component candidate-edge, and total candidate-edge budgets; oversized boundaries keep their classification while route correction is skipped to bound response time.
-- Uses the non-selected adjacent face for the boundary distance in both route input and final drawing, keeping their outside-face classification consistent.
-- The displayed prediction is the exact face set written on confirmation. History keeps the current and two previous stages, and GPU draw batches are retained for up to three candidates instead of being rebuilt while Ready.
+- Uses the non-selected adjacent face for boundary distance and draws only copied boundary lines. No prediction triangulation or face GPU batch is created; confirmation floods the generation-fixed compact graph without crossing its stored outer boundary. History keeps the current and two previous stages.
 - Wheel input received during synchronous computation and around the first draw of the latest result is discarded. After the draw callback and a short drain interval, the next wheel is accepted as one stage; Esc and E/Enter confirmation of a ready result remain available.
 
 The first preparation stays in Sculpt Mode. It reads only all face centers and the global degree of every loop edge, then crops a cursor-centered Euclidean range with an analysis halo. Polygon edges, normals, and hidden flags are read only inside that range to build the local CSR, surface distances, valley bands, and boundaries. It does not build full-mesh curvature or partition data and crop it afterward. A normal shared edge is connected only when its global degree is two. A degree-one seam is bridged only after coincident endpoints, reverse winding, and compatible normals are confirmed. Crop boundaries and non-manifold edges are never treated as seams. Wheel expansion reuses retained arrays and face records while rebuilding the requested local crop and records; shrink and revisiting a prepared radius reuse the local data.

@@ -9,7 +9,7 @@ rotating the view.
 bl_info = {
     "name": "Mesh Focus Orbit",
     "author": "OpenAI",
-    "version": (3, 2, 23),
+    "version": (3, 2, 24),
     "blender": (5, 2, 0),
     "location": "3D View",
     "description": "Temporary mesh-centered orbit and local Smart Face Set Fill preview",
@@ -7798,6 +7798,76 @@ def _fill_preview_shading_proxy(geometry, patch_ids, distances, target_radius, s
     if not np.any(candidate):
         candidate[seed_local] = True
 
+    # A valley strip may be isolated as a barrier band even after its finite
+    # end has wrapped around.  Admit only a local cross-section face when two
+    # selected, non-valley contacts lie on opposite sides of that same face.
+    # This intentionally avoids PCA over a curved valley component: one local
+    # proof can add one local face, never the entire component.
+    valley_merge = np.zeros(count, dtype=bool)
+    valley_merge_evidence = []
+    valley_faces = face_valley >= valley_threshold
+    incidence_sources = np.r_[first, second]
+    incidence_edges = np.r_[
+        np.arange(len(first), dtype=np.int32),
+        np.arange(len(first), dtype=np.int32),
+    ]
+    incidence_order = np.argsort(incidence_sources, kind="stable")
+    incidence_faces = incidence_sources[incidence_order]
+    incidence_edges = incidence_edges[incidence_order]
+    for valley_face in np.flatnonzero(valley_faces & target_mask):
+        valley_face = int(valley_face)
+        contacts = []
+        tangent_neighbors = []
+        incidence_start = int(
+            np.searchsorted(incidence_faces, valley_face, side="left")
+        )
+        incidence_end = int(
+            np.searchsorted(incidence_faces, valley_face, side="right")
+        )
+        for edge in incidence_edges[incidence_start:incidence_end]:
+            edge = int(edge)
+            left = int(first[edge])
+            right = int(second[edge])
+            other = right if left == valley_face else left
+            if valley_faces[other]:
+                tangent_neighbors.append(other)
+            elif candidate[other] and target_mask[other]:
+                contacts.append(other)
+        if len(contacts) < 2 or not tangent_neighbors:
+            continue
+        center = centers[valley_face]
+        for contact_index, first_contact in enumerate(contacts):
+            for second_contact in contacts[contact_index + 1:]:
+                cross = centers[second_contact] - centers[first_contact]
+                cross_length = float(np.linalg.norm(cross))
+                if not (0.60 * local_scale <= cross_length <= 2.10 * local_scale):
+                    continue
+                tangent = centers[int(tangent_neighbors[0])] - center
+                tangent_length = max(float(np.linalg.norm(tangent)), 1.0e-20)
+                if abs(float(np.dot(tangent, cross))) / (
+                    tangent_length * cross_length
+                ) > 0.72:
+                    continue
+                side_first = float(np.dot(centers[first_contact] - center, cross))
+                side_second = float(np.dot(centers[second_contact] - center, cross))
+                if side_first * side_second >= 0.0:
+                    continue
+                if min(abs(side_first), abs(side_second)) < 0.20 * cross_length * cross_length:
+                    continue
+                valley_merge[valley_face] = True
+                valley_merge_evidence.append(
+                    (
+                        int(patch_ids[valley_face]),
+                        int(patch_ids[first_contact]),
+                        int(patch_ids[second_contact]),
+                    )
+                )
+                break
+            if valley_merge[valley_face]:
+                break
+    if np.any(valley_merge):
+        candidate |= valley_merge
+
     # One unrestricted ring supplies the fine correction band.  The band may
     # contain the opposite side so the exact local routine can inspect the
     # original faces, but the final candidate ids stay in the seed component.
@@ -7816,6 +7886,9 @@ def _fill_preview_shading_proxy(geometry, patch_ids, distances, target_radius, s
     band |= frontier
     selected = np.flatnonzero(band).astype(np.int32)
     proxy_candidate_ids = patch_ids[np.flatnonzero(candidate)].astype(np.int32, copy=False)
+    proxy_valley_merge_ids = patch_ids[np.flatnonzero(valley_merge)].astype(
+        np.int32, copy=False
+    )
     return patch_ids[selected], {
         "proxy_seconds": float(time.perf_counter() - started),
         "proxy_nodes": count,
@@ -7825,6 +7898,9 @@ def _fill_preview_shading_proxy(geometry, patch_ids, distances, target_radius, s
         "proxy_band_faces": int(len(selected)),
         "proxy_barrier_edges": int(np.count_nonzero(barrier)),
         "proxy_valley_threshold": float(valley_threshold),
+        "proxy_valley_merge_faces": int(np.count_nonzero(valley_merge)),
+        "proxy_valley_merge_ids": proxy_valley_merge_ids,
+        "proxy_valley_merge_evidence": tuple(valley_merge_evidence),
         "proxy_candidate_ids": proxy_candidate_ids,
     }
 
@@ -8247,6 +8323,121 @@ def _fill_preview_shape_boundary_mask(crossing, outside_distance, radius, edge_i
         & np.isfinite(outside_distance)
         & (outside_distance <= float(radius) + tolerance)
     )
+
+
+def _fill_preview_compact_external_faces(geometry, distances, radius, selected_ids):
+    """Label unselected compact-domain faces reachable from the outside.
+
+    This is the single topology assist used by an edge-only preview.  It is
+    intentionally limited to the already prepared cursor crop and current
+    radius domain.  A missing graph pair, hidden/crop edge, or face beyond the
+    radius is an outside opening.  Unselected components that cannot reach
+    one of those openings are enclosed pockets and are returned for inclusion;
+    no route, one-hop, or repeated global gap search is performed here.
+    """
+    import numpy as np
+
+    count = int(geometry.get("count", 0))
+    distances = np.asarray(distances, dtype=np.float64).reshape(-1)
+    if count <= 0 or len(distances) < count:
+        return np.empty(0, dtype=np.int32), {
+            "compact_external_faces": 0,
+            "compact_enclosed_faces": 0,
+            "compact_external_seed_faces": 0,
+            "compact_external_reason": "distance-size",
+        }
+    edge_counts = geometry.get("face_edge_counts")
+    if edge_counts is None or len(edge_counts) != count:
+        return np.empty(0, dtype=np.int32), {
+            "compact_external_faces": 0,
+            "compact_enclosed_faces": 0,
+            "compact_external_seed_faces": 0,
+            "compact_external_reason": "edge-counts-unavailable",
+        }
+    hidden = np.asarray(
+        geometry.get("hidden", np.zeros(count, dtype=bool)), dtype=bool
+    )
+    tolerance = max(float(radius) * 1.0e-8, 1.0e-9)
+    domain = np.isfinite(distances[:count]) & (
+        distances[:count] <= float(radius) + tolerance
+    ) & ~hidden
+    selected = np.zeros(count, dtype=bool)
+    selected_ids = np.asarray(selected_ids, dtype=np.int32).reshape(-1)
+    selected_ids = selected_ids[
+        (selected_ids >= 0) & (selected_ids < count)
+    ]
+    selected[selected_ids] = True
+    missing = domain & ~selected
+    if not np.any(missing):
+        return np.empty(0, dtype=np.int32), {
+            "compact_external_faces": 0,
+            "compact_enclosed_faces": 0,
+            "compact_external_seed_faces": 0,
+        }
+
+    offsets = np.asarray(geometry["offsets"], dtype=np.int64)
+    neighbors = np.asarray(geometry["neighbors"], dtype=np.int32)
+    degree = np.diff(offsets)
+    outside = missing & (degree < np.asarray(edge_counts, dtype=np.int32))
+    missing_ids = np.flatnonzero(missing)
+    for face in missing_ids:
+        start, end = int(offsets[face]), int(offsets[face + 1])
+        for neighbor in neighbors[start:end]:
+            neighbor = int(neighbor)
+            if not domain[neighbor]:
+                outside[face] = True
+                break
+
+    external = np.zeros(count, dtype=bool)
+    pending = deque(int(face) for face in np.flatnonzero(outside))
+    external[outside] = True
+    while pending:
+        face = pending.popleft()
+        start, end = int(offsets[face]), int(offsets[face + 1])
+        for neighbor in neighbors[start:end]:
+            neighbor = int(neighbor)
+            if missing[neighbor] and not external[neighbor]:
+                external[neighbor] = True
+                pending.append(neighbor)
+
+    enclosed = missing & ~external
+    # Keep only pockets belonging to the current candidate.  A disconnected
+    # closed sheet inside the crop is not a hole in the seed region and must
+    # remain untouched.  This visits each enclosed component once while
+    # collecting the outer-boundary decision above; it is still one compact
+    # domain assist, not the retired repeated global gapfill.
+    fills = []
+    visited = np.zeros(count, dtype=bool)
+    enclosed_components = 0
+    for start_face in np.flatnonzero(enclosed):
+        start_face = int(start_face)
+        if visited[start_face]:
+            continue
+        pending = [start_face]
+        visited[start_face] = True
+        component = []
+        touches_selected = False
+        while pending:
+            face = pending.pop()
+            component.append(face)
+            start, end = int(offsets[face]), int(offsets[face + 1])
+            for neighbor in neighbors[start:end]:
+                neighbor = int(neighbor)
+                if selected[neighbor]:
+                    touches_selected = True
+                elif enclosed[neighbor] and not visited[neighbor]:
+                    visited[neighbor] = True
+                    pending.append(neighbor)
+        if touches_selected:
+            fills.extend(component)
+            enclosed_components += 1
+    fills = np.asarray(fills, dtype=np.int32)
+    return np.unique(fills), {
+        "compact_external_faces": int(np.count_nonzero(external)),
+        "compact_enclosed_faces": int(len(fills)),
+        "compact_external_seed_faces": int(np.count_nonzero(outside)),
+        "compact_enclosed_components": int(enclosed_components),
+    }
 
 
 def _fill_preview_boundary_route(
@@ -8981,60 +9172,46 @@ def _fill_preview_make_result(state, radius):
         allowed_local = np.isin(analysis_ids, coarse_candidate_ids)
         local_region = local_region[allowed_local[local_region]]
         local_region = np.unique(local_region).astype(np.int32)
+    valley_merge_evidence = proxy_metrics.get("proxy_valley_merge_evidence", ())
+    if valley_merge_evidence:
+        # A coarse valley proof is accepted only when the fine partition kept
+        # the same valley face and both opposing contact faces.  This prevents
+        # a fine/strict decision that rejects one shore from being overridden.
+        fine_global_ids = analysis_ids[local_region]
+        accepted_valley_faces = []
+        for valley_id, first_contact_id, second_contact_id in valley_merge_evidence:
+            if np.all(
+                np.isin(
+                    np.asarray(
+                        (valley_id, first_contact_id, second_contact_id),
+                        dtype=np.int32,
+                    ),
+                    fine_global_ids,
+                )
+            ):
+                valley_matches = np.flatnonzero(analysis_ids == int(valley_id))
+                if len(valley_matches):
+                    accepted_valley_faces.append(int(valley_matches[0]))
+        if accepted_valley_faces:
+            local_region = np.unique(
+                np.r_[local_region, np.asarray(accepted_valley_faces, dtype=np.int32)]
+            ).astype(np.int32)
     local_global = analysis_ids[local_region]
     candidate_mask = (
         (distances[local_global] <= float(radius) + max(radius * 1.e-8, 1.e-9))
         & ~geometry["hidden"][local_global]
     )
     preview_local_ids = local_global[candidate_mask].astype(np.int32, copy=False)
-    enclosed_gap_ids, enclosed_gap_metrics = _fill_preview_enclosed_gap_faces(
+    # A single compact-domain external label removes inner loops (including a
+    # closed pocket) before extracting the outer boundary.  This replaces the
+    # old global gapfill, route, and one-hop re-search passes for prediction.
+    enclosed_gap_ids, compact_external_metrics = _fill_preview_compact_external_faces(
         geometry, distances, radius, preview_local_ids
     )
     if len(enclosed_gap_ids):
         preview_local_ids = np.unique(
             np.r_[preview_local_ids, enclosed_gap_ids]
         ).astype(np.int32, copy=False)
-        expanded_analysis_ids = np.unique(
-            np.r_[analysis_ids, enclosed_gap_ids]
-        ).astype(np.int32, copy=False)
-        if len(expanded_analysis_ids) != len(analysis_ids):
-            analysis_ids = expanded_analysis_ids
-            local = _fill_preview_local_geometry(geometry, analysis_ids)
-            seed_local = int(np.flatnonzero(analysis_ids == seed_face)[0])
-            # Recompute only the local partition metadata used for boundary
-            # classification.  The selected mask below remains the exact
-            # candidate plus the enclosed components found above.
-            _unused_region, partition = _fill_preview_region(
-                local, seed_local, bool(state["strict_mode"])
-            )
-    boundary_route_metrics = {}
-    if geometry.get("shading_approx"):
-        preview_local_ids, boundary_route_metrics = _fill_preview_boundary_route(
-            state,
-            geometry,
-            local,
-            distances,
-            analysis_ids,
-            radius,
-            preview_local_ids,
-            partition,
-            enclosed_gap_ids,
-        )
-        preview_local_ids, one_hop_metrics = _fill_preview_boundary_one_hop(
-            state,
-            geometry,
-            local,
-            distances,
-            analysis_ids,
-            radius,
-            preview_local_ids,
-            enclosed_gap_ids,
-        )
-        boundary_route_metrics.update(one_hop_metrics)
-    route_edge_indices = frozenset(
-        int(edge)
-        for edge in boundary_route_metrics.pop("_boundary_route_edge_indices", ())
-    )
     preview_faces = preview_local_ids
     face_ids = geometry.get("face_ids")
     if face_ids is not None:
@@ -9043,6 +9220,7 @@ def _fill_preview_make_result(state, radius):
         raise RuntimeError("preview produced no visible candidate faces")
     shape_segments = []
     distance_segments = []
+    boundary_records = []
     mesh = state["obj"].data
     draw_full_geometry = bool(
         geometry.get("shading_approx")
@@ -9098,89 +9276,93 @@ def _fill_preview_make_result(state, radius):
                 tuple(float(value) for value in geometry["world_vertices"][v0]),
                 tuple(float(value) for value in geometry["world_vertices"][v1]),
             )
-        shape_boundary = (
-            edge_index in route_edge_indices
-            or bool(shape_boundary_mask[edge])
+        shape_boundary = bool(shape_boundary_mask[edge])
+        geometry_face_a = int(
+            draw_first[edge]
+            if draw_full_geometry
+            else analysis_ids[int(draw_first[edge])]
+        )
+        geometry_face_b = int(
+            draw_second[edge]
+            if draw_full_geometry
+            else analysis_ids[int(draw_second[edge])]
+        )
+        boundary_records.append(
+            {
+                "geometry_face_a": geometry_face_a,
+                "geometry_face_b": geometry_face_b,
+                "mesh_face_a": int(
+                    geometry["face_ids"][geometry_face_a]
+                ) if geometry.get("face_ids") is not None else -1,
+                "mesh_face_b": int(
+                    geometry["face_ids"][geometry_face_b]
+                ) if geometry.get("face_ids") is not None else -1,
+                "mesh_edge": int(edge_index),
+                "shape": bool(shape_boundary),
+            }
         )
         (shape_segments if shape_boundary else distance_segments).append(segment)
     patch_edge_reached = bool(
         len(patch_ids)
         and np.any(distances[patch_ids] >= patch_radius - max(patch_radius * 0.01, 1.e-8))
     )
+    confirm_snapshot, confirm_domain_ids = _fill_preview_confirm_graph_snapshot(
+        geometry, distances, radius
+    )
+    if confirm_snapshot is None or len(confirm_domain_ids) == 0:
+        raise RuntimeError("preview confirmation graph is unavailable")
     elapsed = time.perf_counter() - started
     proxy_metrics_for_result = dict(proxy_metrics)
     proxy_metrics_for_result.pop("proxy_candidate_ids", None)
+    proxy_metrics_for_result.pop("proxy_valley_merge_ids", None)
+    proxy_metrics_for_result.pop("proxy_valley_merge_evidence", None)
     return {
         "radius": float(radius),
         "faces": preview_faces,
         "candidate_count": int(len(preview_faces)),
+        "boundary_edge_count": int(len(boundary_records)),
         "analysis_faces": int(len(analysis_ids)),
         "popped_faces": int(popped),
         "shape_segments": shape_segments,
         "distance_segments": distance_segments,
+        "boundary_records": tuple(boundary_records),
+        "confirm_geometry": confirm_snapshot,
+        "confirm_seed_local": int(seed_face),
+        "confirm_domain_ids": confirm_domain_ids,
+        "confirm_signature": state["signature"],
         "patch_edge_reached": patch_edge_reached,
         "compute_seconds": float(elapsed),
         "geometry": local,
         "partition": partition,
         "created_generation": int(state["generation"]),
-        **enclosed_gap_metrics,
-        **boundary_route_metrics,
+        **compact_external_metrics,
         **proxy_metrics_for_result,
     }
 
 
 def _fill_preview_build_draw_batches(state, result):
-    """Create copied vertices and GPU batches once for one candidate result."""
+    """Create copied boundary-line vertices and GPU batches once on draw.
+
+    Preview candidates are boundary-first: no face tessellation or face GPU
+    batch is created.  The draw handler may create the two line batches lazily
+    after the compute timer has produced the immutable boundary snapshot.
+    """
     import numpy as np
 
-    if result.get("triangles") is not None and result.get("gpu_batches") is not None:
+    if result.get("line_geometry_ready") and result.get("gpu_batches") is not None:
         return
-    if result.get("triangles") is None:
-        obj = state["obj"]
-        mesh = obj.data
-        matrix = obj.matrix_world
-        triangles = []
-        try:
-            for face_index in result["faces"]:
-                polygon = mesh.polygons[int(face_index)]
-                points = [
-                    Vector(matrix @ mesh.vertices[int(vertex)].co)
-                    for vertex in polygon.vertices
-                ]
-                if len(points) < 3:
-                    continue
-                for triangle in tessellate_polygon([points]):
-                    if len(triangle) == 3:
-                        triangle_vertices = []
-                        for vertex in triangle:
-                            # Blender 5.2 returns polygon-local integer indices;
-                            # older builds returned Vector objects.
-                            if isinstance(vertex, (int, np.integer)):
-                                vertex = points[int(vertex)]
-                            triangle_vertices.append(
-                                tuple(float(value) for value in vertex)
-                            )
-                        # Some Sculpt viewport configurations cull the back side
-                        # of a face.  Keep the original coordinates and depth,
-                        # but submit the same triangle with both winding orders.
-                        triangles.extend(triangle_vertices)
-                        triangles.extend(reversed(triangle_vertices))
-        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError, IndexError):
-            triangles = []
-        result["triangles"] = triangles
+    if not result.get("line_geometry_ready"):
+        result["triangles"] = None
         result["shape_lines"] = [value for segment in result["shape_segments"] for value in segment]
         result["distance_lines"] = [value for segment in result["distance_segments"] for value in segment]
-        result["triangles_np"] = np.asarray(triangles, dtype=np.float32) if triangles else np.empty((0, 3), dtype=np.float32)
+        result["triangles_np"] = np.empty((0, 3), dtype=np.float32)
         result["shape_lines_np"] = np.asarray(result["shape_lines"], dtype=np.float32) if result["shape_lines"] else np.empty((0, 3), dtype=np.float32)
         result["distance_lines_np"] = np.asarray(result["distance_lines"], dtype=np.float32) if result["distance_lines"] else np.empty((0, 3), dtype=np.float32)
+        result["line_geometry_ready"] = True
     if result.get("gpu_batches") is None:
         shader = _fill_preview_shader_get()
         batches = {}
         if shader is not None:
-            if len(result["triangles_np"]):
-                batches["triangles"] = batch_for_shader(
-                    shader, "TRIS", {"pos": result["triangles_np"]}
-                )
             if len(result["distance_lines_np"]):
                 batches["distance_lines"] = batch_for_shader(
                     shader, "LINES", {"pos": result["distance_lines_np"]}
@@ -9190,6 +9372,131 @@ def _fill_preview_build_draw_batches(state, result):
                     shader, "LINES", {"pos": result["shape_lines_np"]}
                 )
         result["gpu_batches"] = batches
+
+
+def _fill_preview_confirm_flood(state, result):
+    """Resolve one generation's boundary snapshot into mesh-global faces.
+
+    Confirmation uses the compact graph captured by the ready result, never
+    the provisional ``result['faces']`` array.  The current mesh visibility is
+    checked against the same generation before the flood; any mismatch aborts
+    without a partial attribute write.
+    """
+    import numpy as np
+
+    geometry = result.get("confirm_geometry")
+    if geometry is None or result.get("confirm_signature") != state.get("signature"):
+        return None
+    count = int(geometry.get("count", 0))
+    if count <= 0:
+        return None
+    face_ids = geometry.get("face_ids")
+    if face_ids is None:
+        face_ids = np.arange(count, dtype=np.int32)
+    else:
+        face_ids = np.asarray(face_ids, dtype=np.int32).reshape(-1)
+    if len(face_ids) != count:
+        return None
+    try:
+        mesh = state["obj"].data
+        current_hidden = np.empty(len(mesh.polygons), dtype=bool)
+        mesh.polygons.foreach_get("hide", current_hidden)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+    snapshot_hidden = np.asarray(
+        geometry.get("hidden", np.zeros(count, dtype=bool)), dtype=bool
+    ).reshape(-1)
+    if len(snapshot_hidden) != count:
+        return None
+    if np.any(face_ids < 0) or np.any(face_ids >= len(current_hidden)):
+        return None
+    if not np.array_equal(current_hidden[face_ids], snapshot_hidden):
+        return None
+
+    domain_ids = np.asarray(
+        result.get("confirm_domain_ids", ()), dtype=np.int32
+    ).reshape(-1)
+    domain = np.zeros(count, dtype=bool)
+    domain_ids = domain_ids[(domain_ids >= 0) & (domain_ids < count)]
+    domain[domain_ids] = True
+    seed = int(result.get("confirm_seed_local", -1))
+    if seed < 0 or seed >= count or not domain[seed] or snapshot_hidden[seed]:
+        return None
+    boundary_pairs = set()
+    for record in result.get("boundary_records", ()):
+        try:
+            first = int(record["geometry_face_a"])
+            second = int(record["geometry_face_b"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if (
+            first < 0
+            or second < 0
+            or first >= count
+            or second >= count
+            or first == second
+        ):
+            return None
+        boundary_pairs.add((min(first, second), max(first, second)))
+
+    offsets = np.asarray(geometry.get("offsets"), dtype=np.int64)
+    neighbors = np.asarray(geometry.get("neighbors"), dtype=np.int32)
+    if len(offsets) != count + 1 or len(neighbors) != int(offsets[-1]):
+        return None
+    reached = np.zeros(count, dtype=bool)
+    reached[seed] = True
+    pending = [seed]
+    while pending:
+        face = pending.pop()
+        start, end = int(offsets[face]), int(offsets[face + 1])
+        for neighbor in neighbors[start:end]:
+            neighbor = int(neighbor)
+            if neighbor < 0 or neighbor >= count or not domain[neighbor]:
+                continue
+            if (min(face, neighbor), max(face, neighbor)) in boundary_pairs:
+                continue
+            if not reached[neighbor]:
+                reached[neighbor] = True
+                pending.append(neighbor)
+    return face_ids[np.flatnonzero(reached)].astype(np.int32, copy=False)
+
+
+def _fill_preview_confirm_graph_snapshot(geometry, distances, radius):
+    """Copy only the compact graph arrays needed by a later confirmation."""
+    import numpy as np
+
+    count = int(geometry.get("count", 0))
+    distances = np.asarray(distances, dtype=np.float64).reshape(-1)
+    if count <= 0 or len(distances) < count:
+        return None, np.empty(0, dtype=np.int32)
+    hidden = np.asarray(
+        geometry.get("hidden", np.zeros(count, dtype=bool)), dtype=bool
+    ).reshape(-1)
+    if len(hidden) != count:
+        return None, np.empty(0, dtype=np.int32)
+    domain_ids = np.flatnonzero(
+        np.isfinite(distances[:count])
+        & (
+            distances[:count]
+            <= float(radius) + max(float(radius) * 1.0e-8, 1.0e-9)
+        )
+        & ~hidden
+    ).astype(np.int32)
+    face_ids = geometry.get("face_ids")
+    if face_ids is None:
+        face_ids = np.arange(count, dtype=np.int32)
+    else:
+        face_ids = np.asarray(face_ids, dtype=np.int32).reshape(-1)
+    if len(face_ids) != count:
+        return None, domain_ids
+    snapshot = {
+        "count": count,
+        "face_ids": np.array(face_ids, dtype=np.int32, copy=True),
+        "hidden": np.array(hidden, dtype=bool, copy=True),
+        "offsets": np.array(geometry.get("offsets"), dtype=np.int64, copy=True),
+        "neighbors": np.array(geometry.get("neighbors"), dtype=np.int32, copy=True),
+    }
+    return snapshot, np.array(domain_ids, dtype=np.int32, copy=True)
 
 
 def _fill_preview_draw_text(state, result):
@@ -9226,7 +9533,7 @@ def _fill_preview_draw_text(state, result):
                 edge += " / analysis limit"
             lines = [
                 "Smart Fill Preview",
-                f"Distance {float(result['radius']):.4g} m  Candidates {int(result['candidate_count'])}",
+                f"Distance {float(result['radius']):.4g} m  Boundary edges {int(result.get('boundary_edge_count', 0))}",
                 f"Ready - {edge}  Prep {float(state.get('prepare_seconds', 0.0)):.2f}s",
                 "E again: apply   Enter: apply   Esc: cancel",
             ]
@@ -10051,7 +10358,6 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
                 if int(cached.get("created_generation", -1)) != int(state["generation"]):
                     cached = dict(cached)
                     cached["created_generation"] = int(state["generation"])
-                _fill_preview_build_draw_batches(state, cached)
                 state["last_tick_seconds"] = float(cached.get("compute_seconds", 0.0))
                 state["max_tick_seconds"] = max(
                     float(state["max_tick_seconds"]),
@@ -10103,9 +10409,15 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
             _fill_preview_cancel(state, "face-set-layer")
             return {"CANCELLED"}
         try:
+            # Resolve the generation's immutable outer-boundary snapshot only
+            # after the second E/Enter.  The provisional face array is never a
+            # write source; an incomplete flood aborts before attr mutation.
+            faces = _fill_preview_confirm_flood(state, result)
+            if faces is None or len(faces) == 0:
+                _fill_preview_cancel(state, "confirm-graph")
+                return {"CANCELLED"}
             values = np.empty(len(attr.data), dtype=np.int32)
             attr.data.foreach_get("value", values)
-            faces = np.asarray(result["faces"], dtype=np.int32)
             changed = int(np.count_nonzero(values[faces] != int(state["seed_face_set"])))
             if changed:
                 values[faces] = int(state["seed_face_set"])
