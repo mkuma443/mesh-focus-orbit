@@ -2,24 +2,25 @@
 
 Blender 5.2 用のリトポロジー支援アドオンです。
 
-現在のアドオンバージョン: **3.2.24**
+現在のアドオンバージョン: **3.2.28**
 
 主な機能:
 
-- **通常 MFO**: Object / Edit / Sculpt Mode で、画面中央の Reference Object 表面を一時 Orbit 中心にする
-- **Face Set MFO (FSMFO)**: Reference Object の対象 Face Set と、対応する Retopo island だけを一時表示する
+- **通常 MFO**: Object / Edit / Sculpt Mode で、現在のビューポートに見えている MESH のうち画面中央レイで最も手前の面を一時 Orbit 中心にする
+- **Face Set MFO (FSMFO)**: 設定した Reference Object の対象 Face Set と、対応する Retopo island だけを一時表示する
 - **Smart Face Set Fill**: Sculpt Mode でカーソル直下の外周境界だけをプレビューし、E再押下またはEnterで外周内のseed接続面を Face Set 化する
 - Smart Face Set Fill の予測は境界 edge の線だけを描画する。確定時に世代固定したcompact graphの外周境界を越えず、seed接続面を一括で復元して書き込む
 - **Topology Colors**: 編集中の選択面へ6色の半透明ガイドを割り当てる
+- **Curved Face Set Tube Shape**: Sculpt Mode で seed Face Set の edge-connected tube を自動判別し、曲がった中心線を保ったまま均一化または先細り補正する
 
 ## インストール
 
 1. Blender の `Edit > Preferences > Add-ons > Install...` を開く
 2. `mesh_focus_orbit.py` を選択する
 3. `Mesh Focus Orbit` を有効にする
-4. Add-on Preferences の `Reference Object` に参照ハイポリメッシュを指定する
+4. Face Set MFO を使う場合は、Add-on Preferences の `Reference Object` に参照ハイポリメッシュを指定する
 
-Reference Object は、リトポロジー対象のハイポリメッシュです。通常 MFO と FSMFO はこのオブジェクトだけを Ray Cast 対象にします。Retopo mesh やその他の Scene mesh は Orbit 中心判定の対象になりません。
+Reference Object は、Face Set MFO が使うリトポロジー対象のハイポリメッシュです。通常 MFO は設定値を使わず、現在のビューポートに見えている MESH オブジェクト群を Ray Cast して最も手前の面を Orbit 中心にします。Retopo mesh やその他の Scene mesh も、表示中なら通常 MFO の対象になります。
 
 ## 基本操作
 
@@ -32,15 +33,16 @@ Reference Object は、リトポロジー対象のハイポリメッシュです
 | Smart Face Set Fill プレビュー | Sculpt Mode で `E`、開始Eのrelease後に `E` を再押下（または `Enter`）で確定、ホイールで距離変更、`Esc` で取消 |
 | Smart Face Set Fill 厳格プレビュー | Sculpt Mode で `Ctrl + E`、開始Eのrelease後に `E` を再押下（または `Enter`）で確定、ホイールで距離変更、`Esc` で取消 |
 | Topology Colors | 編集モードで `Ctrl + Alt + 1..6`（`0`で解除） |
+| Curved Face Set Tube Shape | Sculpt Mode で `Ctrl + Alt + T`、ホイールで半径/先細り、`Shift + ホイール`で補正強度、`T`/左クリック/Enterで確定、`Esc`で取消 |
 
 通常 MFO と FSMFO は別の KeyMap Item から直接起動します。FSMFO は外側の非 Undo Trigger を経由せず、Undo 対象の Activation Operator が直接起動し、その中から非 Undo Watcher を開始します。
 
 ## 通常 MFO
 
-1. Reference Object を画面中央に置く（Object / Edit / Sculpt Mode で利用できます）
+1. 対象メッシュを画面中央に置く（Object / Edit / Sculpt Mode で利用できます）
 2. 設定キーをダブルタップする
-3. 画面中央のスクリーン座標から Reference Object だけへ Ray Cast する
-4. 最初の交点を一時的な Orbit 中心にする
+3. 画面中央のスクリーン座標から、現在のビューポートに見えている MESH オブジェクト群へ Ray Cast する
+4. ワールドレイ距離が最小の面を一時的な Orbit 中心にする
 5. Navigation Gizmo または MMB で回転する
 6. もう一度設定キーをダブルタップして解除する
 
@@ -134,13 +136,21 @@ Blender同梱のNumPyを使用します。大規模メッシュでは初回の�
 
 色番号はマテリアルを作らず、active Edit Mesh の `mfo_topology_color` FACE 整数属性（0=解除、1〜6=色）へ保存します。.blend、Undo/Redoに含まれます。非表示面、未選択面、別オブジェクトの面、既存マテリアルは変更しません。面の境界と選択中の辺・頂点は読み分けられるように表示します。
 
+## Curved Face Set Tube Shape
+
+Sculpt Mode で Smart Face Set Fill で塗ったチューブへカーソルを置き、`Ctrl + Alt + T` を押します。seed Face Set ID の edge-connected 成分だけを解析し、外部 Face Set 境界が2つなら均一モード A、1つで閉じた尖りへ単調に細くなる場合だけ先細りモード B として予測します。中心線は局所断面から推定するため、曲がったチューブを一本の直線へ置き換えません。円形を前提にせず、カーソル下の実断面 profile（楕円、扁平、軽い不規則形状）を参照します。
+
+予測中は実メッシュを変更せず、実際の候補頂点から間引いた edge を表示します。A はカーソルの world hit 付近の断面形状とサイズを基準に、曲がった中心線へ profile を運びます。B も同じ profile の形を保ったまま根元から閉じた tip へ自然に縮小し、根元と tip の位置を固定します。端部、Face Set 外の頂点、境界共有頂点、hidden、完全 mask は固定し、部分 mask は重みで減衰します。ホイール変更は毎回起動時 snapshot から再計算します。
+
+真の mesh open edge、non-manifold edge、分岐、閉じた先端を一意に確認できない断面は理由を表示して無変更で終了します。Smart Face Set Fill の予測が表示中なら、先にその予測を確定または取消してください。`T` release 後の再押下、左クリック、Enter が一度だけ確定し、右クリックは消費します。`Esc`、mode/object/mesh/topology/visibility/transform の変更、Undo、ファイルロード、アドオン解除では無変更で cleanup します。
+
 ## Preferences
 
 `Edit > Preferences > Add-ons > Mesh Focus Orbit` にあります。
 
 - `Enable`: アドオンの有効/無効
 - `Activation Key`: 通常 MFO と FSMFO のダブルタップキー。左右の Ctrl / Shift / Alt を選択可能
-- `Reference Object`: 通常 MFO と FSMFO が Ray Cast する参照ハイポリメッシュ
+- `Reference Object`: Face Set MFO が Ray Cast する参照ハイポリメッシュ。通常 MFO はこの設定を使わない
 - `Focus Loss Behavior`: Blender がフォーカスを失ったときにモードを維持するか解除するか
 - `Double-tap Window`: ダブルタップと判定する時間幅
 - `Show Mode Indicator`: MFO/FSMFO の状態表示
@@ -150,8 +160,9 @@ Blender同梱のNumPyを使用します。大規模メッシュでは初回の�
 
 ## 制限と復旧
 
-- Reference Object が未指定の場合、通常 MFO と FSMFO は起動しません
-- 画面中央に Reference Object の表面がない場合は起動しません
+- 通常 MFO は Reference Object が未指定でも、表示中の MESH に画面中央レイが当たれば起動します
+- 通常 MFO は画面中央レイが表示中の MESH 群に当たらない場合は起動しません
+- FSMFO は表示中の Reference Object が未指定または中央レイを外れる場合は起動しません
 - FSMFO には Reference Object の `.sculpt_face_set` が必要です
 - RetopoFlow と PolyQuilt の連携機能は、それぞれのアドオンがインストールされている場合だけ有効になります
 - ファイルロード、アドオン無効化、ウィンドウ終了時には一時 Proxy、isolation、hook をクリーンアップします
@@ -162,24 +173,25 @@ Blender同梱のNumPyを使用します。大規模メッシュでは初回の�
 
 A Blender 5.2 add-on for manual retopology workflows.
 
-Current add-on version: **3.2.24**
+Current add-on version: **3.2.28**
 
 Main features:
 
-- **Normal MFO**: in Object, Edit, or Sculpt Mode, temporarily orbits around the surface point at the center of the viewport
-- **Face Set MFO (FSMFO)**: temporarily shows one Reference Face Set and its matching Retopo island
+- **Normal MFO**: in Object, Edit, or Sculpt Mode, temporarily orbits around the nearest surface hit on the center ray among visible MESH objects in the current viewport
+- **Face Set MFO (FSMFO)**: temporarily shows one Face Set from the configured Reference Object and its matching Retopo island
 - **Smart Face Set Fill**: previews only the outer boundary under the cursor and applies the seed-connected faces inside it after a second E press or Enter
 - Smart Face Set Fill draws boundary lines during prediction and resolves the generation snapshot into one seed flood at confirmation, preserving distance, hidden, crop, and mesh-domain limits
 - **Topology Colors**: assigns six translucent topology guide colors to selected Edit Mesh faces
+- **Curved Face Set Tube Shape**: classifies one connected Sculpt Face Set tube and previews curved uniform or tapered shaping
 
 ## Installation
 
 1. Open `Edit > Preferences > Add-ons > Install...` in Blender
 2. Select `mesh_focus_orbit.py`
 3. Enable `Mesh Focus Orbit`
-4. Set the retopology high-poly mesh in the add-on's `Reference Object` field
+4. If you use Face Set MFO, set the retopology high-poly mesh in the add-on's `Reference Object` field
 
-The Reference Object is the high-poly mesh used for retopology. Normal MFO and FSMFO ray-cast only this explicitly configured object. Retopo meshes and other scene meshes are not considered for the orbit-center ray cast.
+The Reference Object is the high-poly mesh used by Face Set MFO. Normal MFO ignores this setting and ray-casts the visible MESH objects in the current viewport, choosing the nearest surface along the center ray. Retopo meshes and other scene meshes are also considered when visible.
 
 ## Controls
 
@@ -192,15 +204,16 @@ The default Activation Key is `Right Shift`.
 | Smart Face Set Fill preview | `E` in Sculpt Mode; release and press `E` again (or press `Enter`) to apply, wheel changes distance, `Esc` cancels |
 | Strict Smart Face Set Fill preview | `Ctrl + E` in Sculpt Mode; release and press `E` again (or press `Enter`) to apply, wheel changes distance, `Esc` cancels |
 | Topology Colors | `Ctrl + Alt + 1..6` in Edit Mode (`0` clears) |
+| Curved Face Set Tube Shape | `Ctrl + Alt + T` in Sculpt Mode; wheel changes radius/taper, `Shift + wheel` changes strength, `T`/left click/Enter applies, `Esc` cancels |
 
 Normal MFO and FSMFO use separate KeyMap Items. FSMFO is started directly by its Undo-enabled Activation Operator; it does not pass through an outer non-Undo trigger. The Activation Operator starts the non-Undo Watcher and then finishes.
 
 ## Normal MFO
 
-1. Place the Reference Object at the center of the viewport (available in Object, Edit, and Sculpt Mode)
+1. Place the target mesh at the center of the viewport (available in Object, Edit, and Sculpt Mode)
 2. Double-tap the configured key
-3. Cast one ray from the viewport center to the Reference Object
-4. Use the first hit point as the temporary orbit center
+3. Cast one ray from the viewport center to the visible MESH objects in the current viewport
+4. Use the nearest hit along the world ray as the temporary orbit center
 5. Orbit with the Navigation Gizmo or MMB
 6. Double-tap the configured key again to exit
 
@@ -290,13 +303,21 @@ In Edit Mode, select faces and press the top-row `Ctrl + Alt + 1` through `6` to
 
 The color number is stored without creating materials, in the active Edit Mesh's `mfo_topology_color` FACE integer attribute (`0` cleared, `1` through `6` colored). It is included in `.blend` files and Blender Undo/Redo. Hidden faces, unselected faces, other objects, and existing materials are left unchanged. Face boundaries and selected edges and vertices remain distinguishable.
 
+## Curved Face Set Tube Shape
+
+In Sculpt Mode, place the cursor over a tube painted by Smart Face Set Fill and press `Ctrl + Alt + T`. Only the edge-connected component containing the hit Face Set ID is analyzed. Two external Face Set boundaries select uniform mode A; one external boundary selects tapered mode B only when a closed pointed tip and a monotone taper are both supported by the local section evidence. The centerline follows local connectivity and frames, so a curved tube is not flattened onto one straight axis. Circular sections are not required: the actual cursor section profile, including elliptical, flattened, and mildly irregular shapes, is used as the reference.
+
+The preview does not change the mesh. It draws a bounded sample of actual candidate edges from the shaped snapshot. Mode A transports the cursor section's shape and size along the curved centerline. Mode B preserves that profile while shrinking it naturally from the root to the fixed closed tip, with root and tip positions fixed. Boundary and outside vertices, hidden vertices, and fully masked vertices stay fixed; partial Sculpt masks attenuate the correction. Every wheel update is recomputed from the immutable activation snapshot.
+
+Open mesh edges, non-manifold edges, branches, and ambiguous sections are rejected with an explanation and no write. Finish or cancel Smart Face Set Fill before starting. Release the starting `T`, then press `T` again, click left, or press Enter to apply once. Right click is consumed. `Esc`, mode/object/mesh/topology/visibility/transform changes, Undo, file load, and add-on unload clean up without applying a prediction.
+
 ## Preferences
 
 Open `Edit > Preferences > Add-ons > Mesh Focus Orbit`.
 
 - `Enable`: Enable or disable the add-on
 - `Activation Key`: The double-tap key for Normal MFO and FSMFO; left/right Ctrl, Shift, and Alt are available
-- `Reference Object`: The high-poly object used by Normal MFO and FSMFO ray casts
+- `Reference Object`: The high-poly object used by Face Set MFO ray casts; Normal MFO ignores this setting
 - `Focus Loss Behavior`: Keep or exit the mode when Blender loses focus
 - `Double-tap Window`: Time window used to recognize a double-tap
 - `Show Mode Indicator`: Show the MFO/FSMFO status indicator
@@ -306,8 +327,9 @@ Open `Edit > Preferences > Add-ons > Mesh Focus Orbit`.
 
 ## Limitations and recovery
 
-- Normal MFO and FSMFO do not start without a configured Reference Object
-- They do not start when the viewport-center ray misses the Reference Object
+- Normal MFO can start without a configured Reference Object when the center ray hits a visible MESH
+- Normal MFO does not start when the viewport-center ray misses all visible MESH objects
+- FSMFO does not start without a visible configured Reference Object or when the center ray misses it
 - FSMFO requires the Reference Object's `.sculpt_face_set` attribute
 - RetopoFlow and PolyQuilt integration is enabled only when the corresponding add-ons are installed
 - Temporary Proxies, isolation state, and hooks are cleaned up during file loading, add-on disable, and window teardown
