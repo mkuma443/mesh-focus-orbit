@@ -1,0 +1,4 @@
+# This is an Asset Catalog Definition file for Blender.
+VERSION 1
+
+2c0f6e95-2f2a-4bd9-8b8f-3b8f741d8e3a:Brushes/MFO Local Feature:Brushes-MFO-Local-Feature

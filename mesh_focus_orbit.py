@@ -9,7 +9,7 @@ rotating the view.
 bl_info = {
     "name": "Mesh Focus Orbit",
     "author": "OpenAI",
-    "version": (3, 2, 28),
+    "version": (3, 3, 0),
     "blender": (5, 2, 0),
     "location": "3D View",
     "description": "Temporary mesh-centered orbit and local Smart Face Set Fill preview",
@@ -48,6 +48,19 @@ LOCAL_FACE_SET_GROW_OPERATOR_ID = "view3d.mesh_focus_local_face_set_grow_v2"
 LOCAL_FACE_SET_GROW_KEY = "E"
 TUBE_SHAPE_OPERATOR_ID = "view3d.mesh_focus_tube_shape"
 TUBE_SHAPE_KEY = "T"
+LOCAL_FEATURE_BRUSH_OPERATOR_ID = "view3d.mesh_focus_local_feature_brush"
+LOCAL_FEATURE_BRUSH_KEY = "F"
+# The local-feature implementation is selected as a normal Sculpt Brush
+# asset.  The marker is an ID property saved with the dedicated asset; its
+# name and datablock pointer are deliberately not part of the identity.
+LOCAL_FEATURE_BRUSH_MARKER_PROPERTY = "mfo_local_feature_marker"
+LOCAL_FEATURE_BRUSH_MARKER_VALUE = "local-feature-brush-v1"
+LOCAL_FEATURE_BRUSH_CATALOG_ID = "2c0f6e95-2f2a-4bd9-8b8f-3b8f741d8e3a"
+_FILL_PREVIEW_ANALYSIS_SHADER_PROFILE = {
+    "name": "MFO shadow analysis: toon_dark matcap",
+    "light": "MATCAP",
+    "matcap_candidates": ("toon_dark.exr", "basic_dark.exr"),
+}
 TOPOLOGY_COLOR_ASSIGN_OPERATOR_ID = "view3d.mesh_focus_topology_color_assign"
 TOPOLOGY_COLOR_ATTRIBUTE_NAME = "mfo_topology_color"
 TOPOLOGY_COLOR_PANEL_CATEGORY = "MFO"
@@ -61,6 +74,7 @@ TOPOLOGY_COLOR_PALETTE = (
 )
 
 _addon_keymaps = []
+_shadow_analysis_view_tokens = {}
 _active_states = {}
 _last_tap_times = {}
 _session_serial = 0
@@ -74,6 +88,7 @@ _local_face_set_adjacency_cache = {}
 _fill_preview_adjacency_cache = {}
 _fill_preview_cursor_cache = {}
 _fill_preview_state = None
+_fill_preview_last_confirm_metrics = {}
 _fill_preview_draw_handler = None
 _fill_preview_text_draw_handler = None
 _fill_preview_shader = None
@@ -81,6 +96,11 @@ _tube_preview_state = None
 _tube_preview_draw_handler = None
 _tube_preview_text_draw_handler = None
 _tube_preview_shader = None
+_local_feature_brush_states = {}
+_local_feature_brush_cache = {}
+_local_feature_brush_load_guard = False
+_local_feature_brush_pending_stroke = None
+_local_feature_brush_stroke_operator = None
 _FILL_PREVIEW_WHEEL_DRAIN_SECONDS = 0.12
 _FILL_PREVIEW_BOUNDARY_ROUTE_SHAPE_PAIR_BUDGET = 128
 _FILL_PREVIEW_BOUNDARY_ROUTE_COMPONENT_BUDGET = 8
@@ -159,6 +179,13 @@ _FILL_PREVIEW_HANDLER_NAMES = {
 _TUBE_PREVIEW_HANDLER_NAMES = {
     "_on_tube_preview_depsgraph_update",
 }
+_LOCAL_FEATURE_BRUSH_HANDLER_NAMES = {
+    "_on_local_feature_brush_depsgraph_update",
+    "_on_local_feature_brush_undo_post",
+    "_on_local_feature_brush_redo_post",
+    "_on_local_feature_brush_load_pre",
+    "_on_local_feature_brush_load_post",
+}
 for _handler_list_name in (
     "depsgraph_update_post",
     "undo_post",
@@ -173,6 +200,7 @@ for _handler_list_name in (
                 getattr(_old_handler, "__name__", "") in _TOPOLOGY_COLOR_HANDLER_NAMES
                 or getattr(_old_handler, "__name__", "") in _FILL_PREVIEW_HANDLER_NAMES
                 or getattr(_old_handler, "__name__", "") in _TUBE_PREVIEW_HANDLER_NAMES
+                or getattr(_old_handler, "__name__", "") in _LOCAL_FEATURE_BRUSH_HANDLER_NAMES
             ):
                 _handler_list.remove(_old_handler)
     except (AttributeError, RuntimeError, TypeError, ValueError):
@@ -6470,6 +6498,7 @@ def _on_undo_post(_dummy):
 def _on_load_pre(_dummy):
     """Clear viewport-bound state before Blender replaces the current file."""
     _fill_preview_cancel(reason="load")
+    _fill_preview_restore_manual_analysis_profiles()
     _tube_preview_cancel(reason="load")
     _finish_all_states()
     _cleanup_orphan_face_set_proxies()
@@ -6483,6 +6512,7 @@ def _on_load_pre(_dummy):
 def _on_load_post(_dummy):
     """Recover remnants loaded from a file saved during Face Set MFO."""
     _fill_preview_cancel(reason="load-post")
+    _fill_preview_restore_manual_analysis_profiles()
     _tube_preview_cancel(reason="load-post")
     _cleanup_orphan_face_set_proxies()
 
@@ -6947,6 +6977,1597 @@ def _raycast_sculpt_face_set(context, coord):
         return None
     except (AttributeError, RuntimeError, TypeError, ValueError):
         return None
+
+
+# ---------------------------------------------------------------------------
+# Local feature brush
+# ---------------------------------------------------------------------------
+
+def _local_feature_signature(obj):
+    """Return a cheap cache identity without hashing all vertex coordinates."""
+    try:
+        mesh = obj.data
+        matrix = tuple(
+            round(float(value), 12)
+            for row in obj.matrix_world
+            for value in row
+        )
+        return (
+            int(obj.as_pointer()),
+            int(mesh.as_pointer()),
+            int(len(mesh.vertices)),
+            int(len(mesh.edges)),
+            int(len(mesh.polygons)),
+            matrix,
+        )
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _local_feature_safety_reason(obj):
+    """Reject mesh states where direct geometry writes would be ambiguous."""
+    if obj is None or obj.type != "MESH":
+        return "active object is not a mesh"
+    try:
+        mesh = obj.data
+        if mesh is None or mesh.library is not None:
+            return "linked mesh is read-only"
+        if int(mesh.users) > 1:
+            return "shared mesh data is not supported"
+        if mesh.shape_keys is not None:
+            return "shape keys are not supported"
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return "mesh data is unavailable"
+    try:
+        for modifier in obj.modifiers:
+            if modifier.type == "MULTIRES":
+                return "Multires modifier is not supported"
+    except (AttributeError, ReferenceError, RuntimeError, TypeError):
+        return "modifier state is unavailable"
+    try:
+        if bool(getattr(obj, "use_dynamic_topology_sculpting", False)):
+            return "Dyntopo is not supported"
+    except (AttributeError, ReferenceError, RuntimeError, TypeError):
+        return "Dyntopo state is unavailable"
+    try:
+        linear = obj.matrix_world.to_3x3()
+        lengths = [float(linear.col[index].length) for index in range(3)]
+        scale = max(lengths)
+        if scale <= 1.0e-12 or max(lengths) - min(lengths) > max(scale * 1.0e-5, 1.0e-7):
+            return "non-uniform object scale is not supported"
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return "object transform is unavailable"
+    return None
+
+
+def _local_feature_brush_settings(context):
+    """Read brush diameter and pressure without changing the active brush."""
+    prefs = _addon_preferences()
+    tool_settings = getattr(context, "tool_settings", None)
+    sculpt = getattr(tool_settings, "sculpt", None)
+    brush = getattr(sculpt, "brush", None)
+    sculpt_unified = getattr(sculpt, "unified_paint_settings", None)
+    if brush is None:
+        return None
+    try:
+        use_unified_size = bool(getattr(sculpt_unified, "use_unified_size", False))
+        diameter = float(sculpt_unified.size if use_unified_size else brush.size)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+    if not math.isfinite(diameter) or diameter <= 0.0:
+        return None
+    return {
+        "diameter_px": max(1.0, diameter),
+        "strength": max(0.0, min(1.0, float(getattr(prefs, "local_feature_strength", 0.35))))
+        if prefs is not None else 0.35,
+        "feature_scale": max(0.10, min(1.0, float(getattr(prefs, "local_feature_scale", 0.35))))
+        if prefs is not None else 0.35,
+        "radius_factor": max(0.10, min(4.0, float(getattr(prefs, "local_feature_radius", 1.0))))
+        if prefs is not None else 1.0,
+        "pressure_enabled": bool(getattr(brush, "use_pressure_strength", False)),
+    }
+
+
+def _local_feature_brush_is_active(context):
+    """Return whether the selected Brush is the dedicated local asset.
+
+    A stable saved marker and AssetMetaData are required.  Name and pointer
+    comparisons are intentionally omitted because Asset Shelf activation
+    creates a new datablock and users may rename it.
+    """
+    try:
+        sculpt = context.tool_settings.sculpt
+        brush = getattr(sculpt, "brush", None)
+        asset_data = getattr(brush, "asset_data", None)
+        if brush is None or asset_data is None:
+            return False
+        if str(brush.get(LOCAL_FEATURE_BRUSH_MARKER_PROPERTY, "")) != (
+            LOCAL_FEATURE_BRUSH_MARKER_VALUE
+        ):
+            return False
+        description = str(getattr(asset_data, "description", ""))
+        catalog_id = str(getattr(asset_data, "catalog_id", ""))
+        return bool(
+            description == LOCAL_FEATURE_BRUSH_MARKER_VALUE
+            or catalog_id == LOCAL_FEATURE_BRUSH_CATALOG_ID
+        )
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def _local_feature_event_in_non_window_region(context, event):
+    """Reject screen points belonging to a sibling UI/Asset Shelf region."""
+    try:
+        area = context.area
+        x = int(getattr(event, "mouse_x", -1))
+        y = int(getattr(event, "mouse_y", -1))
+        if area is None or x < 0 or y < 0:
+            return False
+        for region in area.regions:
+            if region.type == "WINDOW":
+                continue
+            if (
+                int(region.x) <= x < int(region.x + region.width)
+                and int(region.y) <= y < int(region.y + region.height)
+            ):
+                return True
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        # A missing screen coordinate must not make the operator consume an
+        # unrelated UI event.  The keymap poll remains the primary boundary.
+        return False
+    return False
+
+
+def _local_feature_event_pressure(event):
+    """Read tablet pressure without converting a deliberate zero to one."""
+    try:
+        value = getattr(event, "pressure", None)
+        if value is None:
+            return 1.0
+        value = float(value)
+        return max(0.0, min(1.0, value)) if math.isfinite(value) else 1.0
+    except (AttributeError, TypeError, ValueError):
+        return 1.0
+
+
+def _local_feature_selection_signature(context):
+    """Identify the standard asset/tool that was active at selection time."""
+    try:
+        sculpt = context.tool_settings.sculpt
+        brush = sculpt.brush
+        tool = context.workspace.tools.from_space_view3d_mode(context.mode)
+        return (
+            int(brush.as_pointer()),
+            getattr(brush, "name", None),
+            getattr(tool, "idname", None),
+        )
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _local_feature_context_identity(context):
+    try:
+        return (
+            int(context.window.as_pointer()),
+            int(context.area.as_pointer()),
+        )
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return (id(getattr(context, "window", None)), id(getattr(context, "area", None)))
+
+
+def _local_feature_drop_cache(state):
+    """Drop cache references after restore or a mesh lifecycle boundary."""
+    if state is None:
+        return
+    cache = state.get("cache")
+    selector = state.get("selector")
+    if cache is None and selector is not None:
+        cache = selector.get("cache")
+    if cache is not None:
+        for signature, candidate in list(_local_feature_brush_cache.items()):
+            if candidate is cache:
+                _local_feature_brush_cache.pop(signature, None)
+    state["cache"] = None
+    state["cache_invalidated"] = True
+    if selector is not None:
+        selector["cache"] = None
+
+
+def _local_feature_notify_owned_update(state):
+    """Publish a custom write while marking its depsgraph update as owned."""
+    obj = state.get("obj")
+    if obj is None or obj.type != "MESH":
+        return
+    state["owned_update_pending"] = True
+    state["owned_update_serial"] = int(state.get("owned_update_serial", 0)) + 1
+    try:
+        obj.data.update(calc_edges=False, calc_edges_loose=False)
+        obj.update_tag(refresh={"DATA"})
+        view_layer = bpy.context.view_layer
+        if view_layer is not None:
+            # Force the owner boundary through Blender's normal dependency
+            # update path.  The handler consumes only this marked update;
+            # external updates take the invalidation path below.
+            view_layer.update()
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        pass
+    finally:
+        # Ownership is valid only for this synchronous update boundary.  A
+        # later depsgraph update is external and must invalidate the cache.
+        state["owned_update_pending"] = False
+    try:
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type == "VIEW_3D":
+                    area.tag_redraw()
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        pass
+
+
+def _local_feature_mesh_identity(state, obj):
+    try:
+        return (
+            int(obj.data.as_pointer()) == int(state.get("mesh_ptr", -1))
+            and _local_feature_signature(obj) == state.get("signature")
+        )
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+_LOCAL_FEATURE_NATIVE_BRUSH_FIELDS = (
+    "sculpt_brush_type",
+    "size",
+    "strength",
+    "auto_smooth_factor",
+    "deform_target",
+    "use_pressure_strength",
+    "use_pressure_size",
+    "use_pressure_masking",
+    "use_smooth_stroke",
+    "use_space_attenuation",
+    "use_inverse_smooth_pressure",
+    "use_frontface",
+    "use_frontface_falloff",
+    "gravity",
+    "gravity_factor",
+    "use_gravity",
+    "use_locked_size",
+    "unprojected_size",
+)
+_LOCAL_FEATURE_NATIVE_SCULPT_FIELDS = ("gravity",)
+_LOCAL_FEATURE_NATIVE_AUTOMASK_FIELDS = (
+    "use_automasking_topology",
+    "use_automasking_face_sets",
+    "use_automasking_boundary_edges",
+    "use_automasking_boundary_face_sets",
+    "use_automasking_cavity",
+    "use_automasking_cavity_inverted",
+    "use_automasking_custom_cavity_curve",
+    "use_automasking_start_normal",
+    "use_automasking_view_normal",
+    "use_automasking_view_occlusion",
+)
+_LOCAL_FEATURE_NATIVE_UNIFIED_FIELDS = (
+    "use_unified_size",
+    "use_unified_strength",
+    "size",
+    "strength",
+    "use_locked_size",
+    "unprojected_size",
+)
+_LOCAL_FEATURE_NATIVE_STROKE_FIELDS = (
+    ("name", "STRING", 0),
+    ("location", "FLOAT", 3),
+    ("mouse", "FLOAT", 2),
+    ("mouse_event", "FLOAT", 2),
+    ("pressure", "FLOAT", 0),
+    ("size", "FLOAT", 0),
+    ("x_tilt", "FLOAT", 0),
+    ("y_tilt", "FLOAT", 0),
+    ("time", "FLOAT", 0),
+    ("is_start", "BOOLEAN", 0),
+)
+
+
+def _local_feature_native_rna_property(owner, name, required=True):
+    try:
+        prop = owner.bl_rna.properties.get(name)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError):
+        prop = None
+    if prop is None and required:
+        raise RuntimeError(f"native Sculpt RNA property is unavailable: {name}")
+    return prop
+
+
+def _local_feature_native_rna_snapshot(owner, names):
+    values = {}
+    for name in names:
+        prop = _local_feature_native_rna_property(owner, name, required=False)
+        if prop is None:
+            continue
+        try:
+            value = getattr(owner, name)
+            values[name] = tuple(value) if bool(getattr(prop, "is_array", False)) else value
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError) as error:
+            raise RuntimeError(f"native Sculpt setting read failed: {name}: {error}")
+    return values
+
+
+def _local_feature_native_rna_set(owner, name, value, required=True):
+    prop = _local_feature_native_rna_property(owner, name, required=required)
+    if prop is None:
+        return False
+    if bool(getattr(prop, "is_readonly", False)):
+        raise RuntimeError(f"native Sculpt setting is read-only: {name}")
+    try:
+        setattr(owner, name, value)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError) as error:
+        raise RuntimeError(f"native Sculpt setting write failed: {name}: {error}")
+    return True
+
+
+def _local_feature_native_rna_restore(owner, values):
+    errors = []
+    for name, value in values.items():
+        try:
+            _local_feature_native_rna_set(owner, name, value)
+        except (RuntimeError, TypeError, ValueError) as error:
+            errors.append(f"{name}: {error}")
+    return errors
+
+
+def _local_feature_native_schema():
+    """Validate the public 5.2 brush_stroke and OperatorStrokeElement RNA."""
+    operator_rna = bpy.ops.sculpt.brush_stroke.get_rna_type()
+    operator_props = {}
+    for name, expected_type in (
+        ("stroke", "COLLECTION"),
+        ("mode", "ENUM"),
+        ("brush_toggle", "ENUM"),
+        ("pen_flip", "BOOLEAN"),
+        ("override_location", "BOOLEAN"),
+    ):
+        prop = _local_feature_native_rna_property(operator_rna, name)
+        if prop.type != expected_type:
+            raise RuntimeError(f"native Sculpt RNA type mismatch: {name}={prop.type}")
+        operator_props[name] = prop
+    for name, expected in (("mode", "NORMAL"), ("brush_toggle", "None")):
+        items = getattr(operator_props[name], "enum_items", ())
+        if not any(getattr(item, "identifier", None) == expected for item in items):
+            raise RuntimeError(f"native Sculpt enum is unavailable: {name}={expected}")
+    element_rna = getattr(operator_props["stroke"], "fixed_type", None)
+    if element_rna is None:
+        raise RuntimeError("native Sculpt OperatorStrokeElement RNA is unavailable")
+    element_props = {}
+    for name, expected_type, expected_length in _LOCAL_FEATURE_NATIVE_STROKE_FIELDS:
+        prop = _local_feature_native_rna_property(element_rna, name)
+        if prop.type != expected_type:
+            raise RuntimeError(f"OperatorStrokeElement type mismatch: {name}={prop.type}")
+        actual_length = int(getattr(prop, "array_length", 0) or 0)
+        if actual_length != expected_length:
+            raise RuntimeError(
+                f"OperatorStrokeElement array mismatch: {name}={actual_length}, expected={expected_length}"
+            )
+        element_props[name] = prop
+    return {"operator": operator_props, "element": element_props}
+
+
+def _local_feature_native_stroke_points(coord, hit_location, size_value, schema):
+    try:
+        x = float(coord.x)
+        y = float(coord.y)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise RuntimeError(f"native Sculpt stroke coordinate is invalid: {error}")
+    location = tuple(float(value) for value in hit_location)
+    if len(location) != 3 or not all(math.isfinite(value) for value in location):
+        raise RuntimeError("native Sculpt stroke hit location is not finite")
+    common = {
+        "location": location,
+        "mouse": (x, y),
+        "mouse_event": (x, y),
+        "pressure": 1.0,
+        "size": float(size_value),
+        "x_tilt": 0.0,
+        "y_tilt": 0.0,
+        "time": 0.0,
+    }
+    points = []
+    for index, is_start in enumerate((True, False)):
+        point = dict(common)
+        point["name"] = "MFO_LOCAL_FEATURE_PREP_START" if is_start else "MFO_LOCAL_FEATURE_PREP_END"
+        point["is_start"] = is_start
+        for name, expected_type, expected_length in _LOCAL_FEATURE_NATIVE_STROKE_FIELDS:
+            value = point.get(name)
+            if value is None:
+                raise RuntimeError(f"native Sculpt stroke field is missing: {name}")
+            values = value if expected_length else (value,)
+            if expected_length and len(values) != expected_length:
+                raise RuntimeError(f"native Sculpt stroke field length is invalid: {name}")
+            prop = schema["element"][name]
+            for component in values:
+                if expected_type == "BOOLEAN":
+                    if not isinstance(component, bool):
+                        raise RuntimeError(f"native Sculpt stroke boolean is invalid: {name}")
+                elif expected_type == "STRING":
+                    if not isinstance(component, str):
+                        raise RuntimeError(f"native Sculpt stroke string is invalid: {name}")
+                else:
+                    checked = float(component)
+                    if not math.isfinite(checked):
+                        raise RuntimeError(f"native Sculpt stroke float is not finite: {name}")
+                    lower = getattr(prop, "hard_min", None)
+                    upper = getattr(prop, "hard_max", None)
+                    if lower is not None and checked < float(lower) - 1.0e-6:
+                        raise RuntimeError(f"native Sculpt stroke value is below range: {name}")
+                    if upper is not None and checked > float(upper) + 1.0e-6:
+                        raise RuntimeError(f"native Sculpt stroke value is above range: {name}")
+        points.append(point)
+    return points
+
+
+def _local_feature_native_geometry_guard(obj):
+    """Use a bounded sample and topology counts, not a full mesh hash."""
+    mesh = obj.data
+    count = len(mesh.vertices)
+    if count <= 0:
+        raise RuntimeError("native Sculpt prep requires at least one vertex")
+    indices = sorted({0, count - 1, count // 2, count // 3, (2 * count) // 3})
+    samples = {
+        int(index): tuple(float(value) for value in mesh.vertices[index].co)
+        for index in indices
+    }
+    return {
+        "mesh_ptr": int(mesh.as_pointer()),
+        "vertex_count": int(count),
+        "edge_count": int(len(mesh.edges)),
+        "polygon_count": int(len(mesh.polygons)),
+        "samples": samples,
+    }
+
+
+def _local_feature_native_coverage(
+    obj,
+    world_hit,
+    width,
+    height,
+    coord,
+    diameter_px,
+    radius_factor,
+    hard_min,
+    hard_max,
+):
+    """Return a finite world-space sphere plus a viewport contract."""
+    try:
+        width = max(1.0, float(width))
+        height = max(1.0, float(height))
+        cx = float(coord.x)
+        cy = float(coord.y)
+        diameter_px = float(diameter_px)
+        radius_factor = max(0.10, float(radius_factor))
+        hard_min = float(hard_min)
+        hard_max = float(hard_max)
+        center = Vector(tuple(float(value) for value in world_hit))
+    except (AttributeError, TypeError, ValueError) as error:
+        raise RuntimeError(f"native Sculpt coverage projection failed: {error}")
+    if not all(math.isfinite(value) for value in (cx, cy, diameter_px, radius_factor, *center)):
+        raise RuntimeError("native Sculpt coverage contains a non-finite value")
+    if diameter_px <= 0.0 or hard_max <= 0.0:
+        raise RuntimeError("native Sculpt coverage has an invalid brush range")
+    custom_radius_px = max(0.5, 0.5 * diameter_px * radius_factor)
+    try:
+        world_corners = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError) as error:
+        raise RuntimeError(f"native Sculpt object bounds are unavailable: {error}")
+    if len(world_corners) != 8:
+        raise RuntimeError("native Sculpt object bounds do not contain eight corners")
+    world_radius = max(float((corner - center).length) for corner in world_corners)
+    if not math.isfinite(world_radius) or world_radius <= 1.0e-12:
+        raise RuntimeError("native Sculpt object bounds are degenerate")
+    world_margin = max(1.0e-7, world_radius * 1.0e-6)
+    native_size = max(int(math.ceil(diameter_px)), int(math.ceil(hard_min)))
+    if native_size > hard_max:
+        raise RuntimeError(
+            "native Sculpt coverage exceeds Brush.size hard limit "
+            f"({native_size} > {hard_max:g})"
+        )
+    return {
+        "diameter_px": int(native_size),
+        "radius_px": float(native_size) * 0.5,
+        "custom_radius_px": float(custom_radius_px),
+        "origin_coord": (cx, cy),
+        "region_size": (width, height),
+        "world_center": tuple(float(value) for value in center),
+        "world_radius": float(world_radius + world_margin),
+        "world_bounds_corners": int(len(world_corners)),
+        "projection_contract": "all mesh points inside the world-space bounds sphere; cursor/view remain in this unchanged VIEW_3D region",
+    }
+
+
+def _local_feature_native_view_signature(context):
+    try:
+        region_3d = context.space_data.region_3d
+        values = []
+        for matrix_name in ("view_matrix", "perspective_matrix"):
+            matrix = getattr(region_3d, matrix_name)
+            values.extend(round(float(value), 12) for row in matrix for value in row)
+        values.extend(
+            round(float(value), 12)
+            for value in tuple(region_3d.view_location)
+        )
+        values.append(round(float(region_3d.view_distance), 12))
+        return tuple(values)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _local_feature_native_coverage_valid(state, context, coord):
+    coverage = state.get("native_prep", {}).get("coverage")
+    if not coverage:
+        return True
+    try:
+        width, height = coverage["region_size"]
+        x = float(coord.x)
+        y = float(coord.y)
+        if not (0.0 <= x <= float(width) and 0.0 <= y <= float(height)):
+            return False
+        settings = state["settings"]
+        expected_view = state.get("native_prep", {}).get("view_signature")
+        if expected_view is not None and _local_feature_native_view_signature(context) != expected_view:
+            return False
+        return True
+    except (AttributeError, KeyError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def _local_feature_native_world_coverage_valid(state, world_hit):
+    try:
+        coverage = state.get("native_prep", {}).get("coverage") or {}
+        center = Vector(coverage["world_center"])
+        radius = float(coverage["world_radius"])
+        hit = Vector(tuple(float(value) for value in world_hit))
+        return math.isfinite(radius) and radius > 0.0 and float((hit - center).length) <= radius + 1.0e-7
+    except (AttributeError, KeyError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def _local_feature_native_undo_prep(context, state, coord, world_hit):
+    """Create one public native Sculpt Undo step before Python setters."""
+    obj = state.get("obj")
+    if obj is None or obj.type != "MESH":
+        raise RuntimeError("native Sculpt prep has no active mesh")
+    if context.area is None or context.area.type != "VIEW_3D" or context.region.type != "WINDOW":
+        raise RuntimeError("native Sculpt prep requires a VIEW_3D WINDOW context")
+    if context.window is None:
+        raise RuntimeError("native Sculpt prep requires a window context")
+    tool_settings = getattr(context, "tool_settings", None)
+    sculpt = getattr(tool_settings, "sculpt", None)
+    brush = getattr(sculpt, "brush", None)
+    unified = getattr(sculpt, "unified_paint_settings", None)
+    if sculpt is None or brush is None or unified is None:
+        raise RuntimeError("native Sculpt brush settings are unavailable")
+    schema = _local_feature_native_schema()
+    settings = state.get("settings") or {}
+    diameter_px = float(settings.get("diameter_px", 0.0))
+    radius_factor = float(state.get("radius_factor", settings.get("radius_factor", 1.0)))
+    if not math.isfinite(diameter_px) or diameter_px <= 0.0:
+        raise RuntimeError("native Sculpt coverage has invalid brush diameter")
+    region = context.region
+    try:
+        width = max(1.0, float(region.width))
+        height = max(1.0, float(region.height))
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError) as error:
+        raise RuntimeError(f"native Sculpt coverage projection failed: {error}")
+    size_prop = _local_feature_native_rna_property(brush, "size")
+    hard_min = float(getattr(size_prop, "hard_min", 1.0))
+    hard_max = float(getattr(size_prop, "hard_max", 0.0))
+    coverage = _local_feature_native_coverage(
+        obj,
+        world_hit,
+        width,
+        height,
+        coord,
+        diameter_px,
+        radius_factor,
+        hard_min,
+        hard_max,
+    )
+    native_size = coverage["diameter_px"]
+    before = _local_feature_native_geometry_guard(obj)
+    brush_saved = _local_feature_native_rna_snapshot(brush, _LOCAL_FEATURE_NATIVE_BRUSH_FIELDS)
+    sculpt_saved = _local_feature_native_rna_snapshot(sculpt, _LOCAL_FEATURE_NATIVE_SCULPT_FIELDS)
+    unified_saved = _local_feature_native_rna_snapshot(unified, _LOCAL_FEATURE_NATIVE_UNIFIED_FIELDS)
+    automask = getattr(brush, "mesh_automasking_settings", None)
+    if automask is None:
+        automask = getattr(sculpt, "mesh_automasking_settings", None)
+    if automask is None:
+        raise RuntimeError("native Sculpt automasking settings are unavailable")
+    automask_saved = _local_feature_native_rna_snapshot(automask, _LOCAL_FEATURE_NATIVE_AUTOMASK_FIELDS)
+    restore_errors = []
+    result = None
+    try:
+        draw_prop = _local_feature_native_rna_property(brush, "sculpt_brush_type")
+        if not any(getattr(item, "identifier", None) == "DRAW" for item in getattr(draw_prop, "enum_items", ())):
+            raise RuntimeError("active Sculpt brush RNA does not expose DRAW")
+        _local_feature_native_rna_set(brush, "sculpt_brush_type", "DRAW")
+        _local_feature_native_rna_set(brush, "size", native_size)
+        _local_feature_native_rna_set(brush, "use_locked_size", "SCENE")
+        world_diameter = float(coverage["world_radius"]) * 2.0
+        unprojected_prop = _local_feature_native_rna_property(brush, "unprojected_size")
+        unprojected_max = float(getattr(unprojected_prop, "hard_max", 0.0))
+        if unprojected_max <= 0.0 or world_diameter > unprojected_max:
+            raise RuntimeError("native Sculpt world coverage exceeds unprojected_size range")
+        _local_feature_native_rna_set(brush, "unprojected_size", world_diameter)
+        _local_feature_native_rna_set(brush, "strength", 0.0)
+        _local_feature_native_rna_set(brush, "auto_smooth_factor", 0.0)
+        _local_feature_native_rna_set(brush, "deform_target", "GEOMETRY")
+        for name in (
+            "use_pressure_strength",
+            "use_pressure_size",
+            "use_pressure_masking",
+            "use_smooth_stroke",
+            "use_space_attenuation",
+            "use_inverse_smooth_pressure",
+            "use_frontface",
+            "use_frontface_falloff",
+            "use_gravity",
+        ):
+            prop = _local_feature_native_rna_property(brush, name, required=False)
+            if prop is None:
+                continue
+            if getattr(prop, "type", None) == "ENUM":
+                disabled = next(
+                    (
+                        getattr(item, "identifier", None)
+                        for item in getattr(prop, "enum_items", ())
+                        if getattr(item, "identifier", None) in {"NONE", "OFF", "DISABLED"}
+                    ),
+                    None,
+                )
+                if disabled is None:
+                    continue
+                _local_feature_native_rna_set(brush, name, disabled, required=False)
+            else:
+                _local_feature_native_rna_set(brush, name, False, required=False)
+        for name in ("gravity", "gravity_factor"):
+            _local_feature_native_rna_set(brush, name, 0.0, required=False)
+        _local_feature_native_rna_set(sculpt, "gravity", 0.0, required=False)
+        _local_feature_native_rna_set(unified, "use_unified_size", False)
+        _local_feature_native_rna_set(unified, "use_unified_strength", False)
+        _local_feature_native_rna_set(unified, "use_locked_size", "SCENE", required=False)
+        _local_feature_native_rna_set(unified, "unprojected_size", world_diameter, required=False)
+        for name in _LOCAL_FEATURE_NATIVE_AUTOMASK_FIELDS:
+            _local_feature_native_rna_set(automask, name, False, required=False)
+        stroke = _local_feature_native_stroke_points(coord, world_hit, native_size, schema)
+        with bpy.context.temp_override(
+            window=context.window,
+            area=context.area,
+            region=context.region,
+            space_data=context.space_data,
+        ):
+            # The strength-zero native preparation itself publishes a
+            # synchronous mesh/depsgraph update in Blender 5.2.  Keep the
+            # existing cache owned only for this nested call so the handler
+            # cannot mistake that preparation for an external edit.  The
+            # handler consumes the marker at its update boundary; the
+            # finally clause clears it when no callback was delivered.
+            state["owned_update_pending"] = True
+            try:
+                result = bpy.ops.sculpt.brush_stroke(
+                    "EXEC_DEFAULT",
+                    stroke=stroke,
+                    mode="NORMAL",
+                    brush_toggle="None",
+                    pen_flip=False,
+                    override_location=False,
+                )
+            finally:
+                if state.get("owned_update_pending"):
+                    state["owned_update_pending"] = False
+        if list(result) != ["FINISHED"]:
+            raise RuntimeError(f"native Sculpt prep did not finish: {list(result)}")
+    finally:
+        restore_errors.extend(_local_feature_native_rna_restore(brush, brush_saved))
+        restore_errors.extend(_local_feature_native_rna_restore(sculpt, sculpt_saved))
+        restore_errors.extend(_local_feature_native_rna_restore(unified, unified_saved))
+        restore_errors.extend(_local_feature_native_rna_restore(automask, automask_saved))
+    if restore_errors:
+        raise RuntimeError("native Sculpt prep settings restore failed: " + "; ".join(restore_errors))
+    after = _local_feature_native_geometry_guard(obj)
+    if before != after:
+        raise RuntimeError("native Sculpt prep changed bounded geometry/topology guard")
+    return {
+        "nested_operator": "bpy.ops.sculpt.brush_stroke",
+        "nested_context": "EXEC_DEFAULT",
+        "nested_call_count": 1,
+        "result": list(result),
+        "schema_verified": True,
+        "settings_restored": True,
+        "geometry_guard": True,
+        "coverage": coverage,
+        "view_signature": _local_feature_native_view_signature(context),
+        "mesh_counts": before,
+    }
+
+
+def _local_feature_raycast(context, coord):
+    """Return an active-mesh visible hit and a world-space surface normal."""
+    obj = getattr(context, "active_object", None)
+    if obj is None or obj.type != "MESH":
+        return None
+    try:
+        region = context.region
+        rv3d = context.space_data.region_3d
+        origin = view3d_utils.region_2d_to_origin_3d(region, rv3d, coord)
+        direction = view3d_utils.region_2d_to_vector_3d(region, rv3d, coord)
+        if direction.length_squared <= 1.0e-20:
+            return None
+        direction.normalize()
+        inverse = obj.matrix_world.inverted_safe()
+        local_origin = inverse @ origin
+        local_direction = inverse.to_3x3() @ direction
+        if local_direction.length_squared <= 1.0e-20:
+            return None
+        local_direction.normalize()
+        for _attempt in range(256):
+            hit, location, local_normal, face_index = obj.ray_cast(
+                local_origin, local_direction
+            )
+            if not hit or face_index < 0 or face_index >= len(obj.data.polygons):
+                return None
+            polygon = obj.data.polygons[int(face_index)]
+            if not bool(polygon.hide):
+                hidden_vertex = False
+                try:
+                    hidden_vertex = any(
+                        bool(obj.data.vertices[int(index)].hide)
+                        for index in polygon.vertices
+                    )
+                except (AttributeError, ReferenceError, RuntimeError, TypeError):
+                    hidden_vertex = False
+                if not hidden_vertex:
+                    world_location = obj.matrix_world @ location
+                    world_normal = obj.matrix_world.to_3x3().inverted().transposed() @ local_normal
+                    if world_normal.length_squared <= 1.0e-20:
+                        return None
+                    world_normal.normalize()
+                    return obj, int(face_index), world_location, world_normal
+            advance = min(max((location - local_origin).length * 1.0e-6, 1.0e-7), 1.0e-3)
+            local_origin = location + local_direction * advance
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+    return None
+
+
+def _local_feature_world_radius(context, coord, hit, diameter_px, radius_factor):
+    """Convert the native brush diameter (5.2: pixels) to a world radius."""
+    try:
+        region = context.region
+        rv3d = context.space_data.region_3d
+        half_px = max(0.5, float(diameter_px) * 0.5 * float(radius_factor))
+        probe = Vector((float(coord.x) + half_px, float(coord.y)))
+        world_probe = view3d_utils.region_2d_to_location_3d(region, rv3d, probe, hit)
+        radius = float((world_probe - hit).length)
+        if radius > 1.0e-8 and math.isfinite(radius):
+            return radius
+        distance = float(getattr(rv3d, "view_distance", 1.0))
+        width = max(1.0, float(region.width))
+        return max(distance * half_px / width, 1.0e-5)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _local_feature_read_mask_hidden(mesh):
+    """Read Sculpt mask/hidden state once; missing mask means fully editable."""
+    import numpy as np
+
+    count = len(mesh.vertices)
+    hidden = np.zeros(count, dtype=bool)
+    mask = np.zeros(count, dtype=np.float32)
+    try:
+        mesh.vertices.foreach_get("hide", hidden)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        for index, vertex in enumerate(mesh.vertices):
+            hidden[index] = bool(getattr(vertex, "hide", False))
+    attribute = mesh.attributes.get(".sculpt_mask")
+    if attribute is not None and attribute.domain == "POINT":
+        try:
+            attribute.data.foreach_get("value", mask)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            for index, item in enumerate(attribute.data):
+                mask[index] = float(getattr(item, "value", 0.0))
+    # A hidden polygon can still expose vertices that are not individually
+    # hidden.  Mark those vertices protected too, so a nearby visible face's
+    # halo cannot move geometry belonging to a hidden face.
+    try:
+        for polygon in mesh.polygons:
+            if bool(polygon.hide):
+                for index in polygon.vertices:
+                    hidden[int(index)] = True
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        pass
+    return hidden, np.clip(mask, 0.0, 1.0)
+
+
+def _local_feature_build_cache_steps(obj):
+    """Yield through one reusable world-space triangle/BVH preparation."""
+    import numpy as np
+
+    signature = _local_feature_signature(obj)
+    if signature is None:
+        raise RuntimeError("mesh signature unavailable")
+    cached = _local_feature_brush_cache.get(signature)
+    if cached is not None:
+        return cached
+    mesh = obj.data
+    if len(mesh.vertices) == 0 or len(mesh.polygons) == 0:
+        raise RuntimeError("mesh has no surface")
+    mesh.calc_loop_triangles()
+    coordinates_local = np.empty((len(mesh.vertices), 3), dtype=np.float64)
+    yield "allocate"
+    mesh.vertices.foreach_get("co", coordinates_local.ravel())
+    yield "vertices"
+    transform = np.asarray(obj.matrix_world, dtype=np.float64)
+    coordinates_world = coordinates_local @ transform[:3, :3].T + transform[:3, 3]
+    triangles = np.empty((len(mesh.loop_triangles), 3), dtype=np.int32)
+    mesh.loop_triangles.foreach_get("vertices", triangles.ravel())
+    yield "triangles"
+    if len(triangles) == 0:
+        raise RuntimeError("mesh has no triangles")
+    bvh_points = []
+    for start in range(0, len(coordinates_world), 4096):
+        bvh_points.extend(
+            tuple(float(value) for value in point)
+            for point in coordinates_world[start : start + 4096]
+        )
+        yield f"bvh-points-{min(start + 4096, len(coordinates_world))}"
+    bvh_faces = []
+    for start in range(0, len(triangles), 4096):
+        bvh_faces.extend(
+            tuple(int(value) for value in face)
+            for face in triangles[start : start + 4096]
+        )
+        yield f"bvh-faces-{min(start + 4096, len(triangles))}"
+    try:
+        bvh = BVHTree.FromPolygons(
+            bvh_points,
+            bvh_faces,
+            all_triangles=True,
+        )
+    except (AttributeError, RuntimeError, TypeError, ValueError, MemoryError) as error:
+        raise RuntimeError(f"surface index build failed: {error}")
+    yield "bvh"
+    hidden, mask = _local_feature_read_mask_hidden(mesh)
+    yield "mask-hidden"
+    cache = {
+        "signature": signature,
+        "obj_ptr": int(obj.as_pointer()),
+        "mesh_ptr": int(mesh.as_pointer()),
+        "points_world": coordinates_world,
+        "source_points_world": coordinates_world.copy(),
+        "points_local": coordinates_local,
+        "triangles": triangles,
+        "bvh": bvh,
+        "hidden": hidden,
+        "mask": mask,
+        "max_displacement_world": 0.0,
+        "created_at": time.monotonic(),
+    }
+    _local_feature_brush_cache[signature] = cache
+    return cache
+
+
+def _local_feature_build_cache(obj):
+    """Synchronous wrapper used by isolated callers; modal uses the steps."""
+    job = _local_feature_build_cache_steps(obj)
+    while True:
+        try:
+            next(job)
+        except StopIteration as complete:
+            return complete.value
+
+
+def _local_feature_dab_arrays(
+    points_world,
+    triangles,
+    center,
+    normal,
+    radius,
+    strength=0.35,
+    feature_scale=0.35,
+    target_indices=None,
+    hidden=None,
+    mask=None,
+):
+    """Return local ridge/valley deltas using only a candidate+halo patch.
+
+    The operation is intentionally independent of world axes and stroke
+    tangent.  A long low-pass before the residual gate is what rejects the
+    known fine-ripple failure of the earlier four-pass prototype.
+    """
+    import numpy as np
+
+    points = np.asarray(points_world, dtype=np.float64)
+    faces = np.asarray(triangles, dtype=np.int32).reshape((-1, 3))
+    if len(points) == 0 or len(faces) == 0:
+        return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.float64)
+    center = np.asarray(center, dtype=np.float64).reshape(3)
+    normal = np.asarray(normal, dtype=np.float64).reshape(3)
+    normal_length = float(np.linalg.norm(normal))
+    if normal_length <= 1.0e-12:
+        return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.float64)
+    normal /= normal_length
+    radius = float(radius)
+    if not math.isfinite(radius) or radius <= 1.0e-10:
+        return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.float64)
+    scale = max(0.10, min(1.0, float(feature_scale)))
+    strength = max(0.0, min(1.0, float(strength)))
+    distances = np.linalg.norm(points - center[None, :], axis=1)
+    local_ids = np.flatnonzero(distances < radius * 2.25).astype(np.int32)
+    if target_indices is None:
+        target = distances < radius
+    else:
+        target = np.zeros(len(points), dtype=bool)
+        target[np.asarray(target_indices, dtype=np.int32)] = True
+        target &= distances < radius
+    if hidden is not None:
+        target &= ~np.asarray(hidden, dtype=bool)
+    if mask is not None:
+        target &= np.asarray(mask, dtype=np.float64) < (1.0 - 1.0e-6)
+    if not np.any(target) or len(local_ids) < 4:
+        return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.float64)
+    local_lookup = np.full(len(points), -1, dtype=np.int32)
+    local_lookup[local_ids] = np.arange(len(local_ids), dtype=np.int32)
+    inside = np.all(np.isin(faces, local_ids), axis=1)
+    local_faces = local_lookup[faces[inside]]
+    if len(local_faces) == 0:
+        return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.float64)
+    edges = np.concatenate(
+        (local_faces[:, (0, 1)], local_faces[:, (1, 2)], local_faces[:, (2, 0)]),
+        axis=0,
+    )
+    edges = np.concatenate((edges, edges[:, ::-1]), axis=0)
+    degree = np.bincount(edges[:, 0], minlength=len(local_ids)).astype(np.float64)
+    if not np.any(degree > 0.0):
+        return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.float64)
+    heights = (points[local_ids] - center[None, :]) @ normal
+    iterations = max(8, min(24, int(round(8.0 + 16.0 * scale))))
+    smoothed = heights.copy()
+    # Jacobi low-pass uses the same local graph for every pass.  Halo vertices
+    # keep boundary values from leaking into the target patch.
+    for _index in range(iterations):
+        sums = np.zeros(len(local_ids), dtype=np.float64)
+        np.add.at(sums, edges[:, 0], smoothed[edges[:, 1]])
+        neighbour = sums / np.maximum(degree, 1.0)
+        smoothed = 0.30 * smoothed + 0.70 * neighbour
+    sums = np.zeros(len(local_ids), dtype=np.float64)
+    np.add.at(sums, edges[:, 0], smoothed[edges[:, 1]])
+    neighbour = sums / np.maximum(degree, 1.0)
+    residual = smoothed - neighbour
+    edge_lengths = np.linalg.norm(
+        points[local_ids[edges[:, 0]]] - points[local_ids[edges[:, 1]]], axis=1
+    )
+    edge_scale = float(np.median(edge_lengths[edge_lengths > 1.0e-12])) if np.any(edge_lengths > 1.0e-12) else 0.0
+    if edge_scale <= 1.0e-12:
+        return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.float64)
+    curvature = residual / (edge_scale * edge_scale)
+    # A curvature gate is deliberately applied after the 16-pass low-pass.
+    # This leaves a flat plane and a pure fine ripple below the gate while
+    # retaining both signs of a broad existing ridge/valley.
+    gate_start = 0.20 / (0.55 + scale)
+    gate_end = 0.80 / (0.55 + scale)
+    gate = np.clip((np.abs(curvature) - gate_start) / max(gate_end - gate_start, 1.0e-9), 0.0, 1.0)
+    target_local = local_lookup[np.flatnonzero(target)]
+    target_local = target_local[target_local >= 0]
+    if len(target_local) == 0:
+        return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.float64)
+    t = np.clip(distances[local_ids[target_local]] / radius, 0.0, 1.0)
+    falloff = (1.0 - t * t) ** 2
+    if mask is None:
+        editable = np.ones(len(target_local), dtype=np.float64)
+    else:
+        editable = 1.0 - np.clip(np.asarray(mask, dtype=np.float64)[local_ids[target_local]], 0.0, 1.0)
+    gain = 0.55 * strength
+    deltas = residual[target_local] * gain * gate[target_local] * falloff * editable
+    max_delta = max(edge_scale * 0.35, radius * 0.025) * max(strength, 0.05)
+    deltas = np.clip(deltas, -max_delta, max_delta)
+    keep = np.abs(deltas) > 1.0e-12
+    return local_ids[target_local[keep]].astype(np.int32), deltas[keep].astype(np.float64)
+
+
+def _local_feature_pick_candidate(cache, center, radius):
+    """Use the one-time BVH to obtain a local triangle candidate set."""
+    import numpy as np
+
+    try:
+        displacement_bound = max(0.0, float(cache.get("max_displacement_world", 0.0)))
+        query_radius = float(radius * 2.25) + displacement_bound
+        hits = cache["bvh"].find_nearest_range(
+            tuple(float(value) for value in center), query_radius
+        )
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        hits = []
+    triangle_ids = []
+    for item in hits:
+        try:
+            triangle_ids.append(int(item[2]))
+        except (IndexError, TypeError, ValueError):
+            continue
+    if not triangle_ids:
+        return np.empty(0, dtype=np.int32), np.empty((0, 3), dtype=np.int32)
+    triangles = cache["triangles"][np.unique(np.asarray(triangle_ids, dtype=np.int32))]
+    return np.unique(triangles.reshape(-1)).astype(np.int32), triangles.astype(np.int32, copy=False)
+
+
+def _local_feature_apply_dab(state, context, coord, pressure=1.0):
+    """Ray-hit one dab, compute local deltas, and write only changed vertices."""
+    import numpy as np
+
+    obj = state.get("obj")
+    cache = state.get("cache")
+    if obj is None or cache is None:
+        return 0
+    if state.get("native_prepared") and not _local_feature_native_coverage_valid(
+        state, context, coord
+    ):
+        raise RuntimeError(
+            "local feature stroke left the one-time native Sculpt coverage contract"
+        )
+    hit = _local_feature_raycast(context, coord)
+    if hit is None or hit[0] is not obj:
+        return 0
+    _hit_obj, _face_index, world_hit, world_normal = hit
+    if state.get("native_prepared") and not _local_feature_native_world_coverage_valid(
+        state, world_hit
+    ):
+        raise RuntimeError("local feature hit left the one-time native Sculpt world coverage")
+    settings = state["settings"]
+    radius = _local_feature_world_radius(
+        context,
+        coord,
+        world_hit,
+        settings["diameter_px"],
+        state.get("radius_factor", settings["radius_factor"]),
+    )
+    if radius is None:
+        return 0
+    candidate, candidate_triangles = _local_feature_pick_candidate(cache, world_hit, radius)
+    if len(candidate) == 0:
+        return 0
+    # Compress to the BVH-returned candidate+halo before any NumPy operation.
+    # Passing the full mesh here would turn every dab into an O(total-N) scan.
+    candidate = np.asarray(candidate, dtype=np.int32)
+    # ``candidate`` is sorted by np.unique, so searchsorted maps global
+    # triangle indices to the compact patch without allocating an N-sized map.
+    local_triangles = np.searchsorted(candidate, candidate_triangles).astype(np.int32)
+    if len(local_triangles) == 0:
+        return 0
+    local_ids, deltas = _local_feature_dab_arrays(
+        cache["points_world"][candidate],
+        local_triangles,
+        world_hit,
+        world_normal,
+        radius,
+        strength=settings["strength"]
+        * float(state.get("strength_factor", 1.0))
+        * (float(pressure) if settings["pressure_enabled"] else 1.0),
+        feature_scale=settings["feature_scale"],
+        target_indices=np.arange(len(candidate), dtype=np.int32),
+        hidden=cache["hidden"][candidate],
+        mask=cache["mask"][candidate],
+    )
+    if len(local_ids) == 0:
+        return 0
+    # The first usable dab is the only point at which the native Sculpt
+    # position node may be prepared.  Compute deltas first so a flat/no-op
+    # dab does not create an empty undo step, then prepare before any setter.
+    if not state.get("native_prepared"):
+        state["native_prep"] = _local_feature_native_undo_prep(
+            context, state, coord, world_hit
+        )
+        state["native_prepared"] = True
+    transform = np.asarray(obj.matrix_world, dtype=np.float64)
+    inverse_linear = np.linalg.inv(transform[:3, :3])
+    mesh = obj.data
+    changed = 0
+    for vertex_index, delta in zip(local_ids, deltas):
+        index = int(candidate[int(vertex_index)])
+        if bool(cache["hidden"][index]) or float(cache["mask"][index]) >= 1.0 - 1.0e-6:
+            continue
+        if index not in state["saved_coords"]:
+            state["saved_coords"][index] = tuple(float(value) for value in mesh.vertices[index].co)
+        world_delta = np.asarray(world_normal, dtype=np.float64) * float(delta)
+        local_delta = inverse_linear @ world_delta
+        vertex = mesh.vertices[index]
+        current = np.asarray(vertex.co, dtype=np.float64)
+        new_value = current + local_delta
+        vertex.co = tuple(float(value) for value in new_value)
+        cache["points_local"][index] = new_value
+        current_world = new_value @ transform[:3, :3].T + transform[:3, 3]
+        cache["points_world"][index] = current_world
+        source_world = cache.get("source_points_world")
+        if source_world is not None:
+            displacement = float(np.linalg.norm(current_world - source_world[index]))
+            cache["max_displacement_world"] = max(
+                float(cache.get("max_displacement_world", 0.0)), displacement
+            )
+        changed += 1
+    if changed:
+        state["changed"] = True
+        state["last_hit"] = tuple(float(value) for value in world_hit)
+        _local_feature_notify_owned_update(state)
+    return changed
+
+
+def _local_feature_finalize_mesh(state):
+    try:
+        obj = state.get("obj")
+        if obj is not None and obj.type == "MESH":
+            obj.data.update(calc_edges=False, calc_edges_loose=False)
+            obj.update_tag(refresh={"DATA"})
+            for area in bpy.context.screen.areas if bpy.context.screen else ():
+                if area.type == "VIEW_3D":
+                    area.tag_redraw()
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        pass
+
+
+def _local_feature_restore_state(state):
+    try:
+        obj = state.get("obj")
+        if obj is None or obj.type != "MESH":
+            _local_feature_drop_cache(state)
+            return False
+        if not _local_feature_mesh_identity(state, obj):
+            # Never write saved indices into a replacement mesh or changed
+            # topology.  The runtime/cache is disposable at this boundary.
+            _local_feature_drop_cache(state)
+            state["saved_coords"] = {}
+            return False
+        mesh = obj.data
+        for index, coordinate in state.get("saved_coords", {}).items():
+            if 0 <= int(index) < len(mesh.vertices):
+                mesh.vertices[int(index)].co = coordinate
+        if state.get("saved_coords"):
+            _local_feature_finalize_mesh(state)
+        _local_feature_drop_cache(state)
+        return True
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        _local_feature_drop_cache(state)
+        return False
+
+
+def _local_feature_dispose_state(state):
+    if state is None:
+        return
+    timer = state.get("prepare_timer")
+    if timer is not None:
+        window_manager = state.get("window_manager")
+        try:
+            if window_manager is not None:
+                window_manager.event_timer_remove(timer)
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            pass
+        state["prepare_timer"] = None
+    state["prepare_job"] = None
+    key = state.get("operator_key")
+    if key is not None:
+        _local_feature_brush_states.pop(key, None)
+
+
+def _local_feature_cancel_all(reason="lifecycle", restore=True):
+    global _local_feature_brush_pending_stroke, _local_feature_brush_stroke_operator
+    for state in list(_local_feature_brush_states.values()):
+        if restore and state.get("changed"):
+            _local_feature_restore_state(state)
+        selector = state.get("selector")
+        if selector is not None:
+            selector["cache"] = None
+        _local_feature_dispose_state(state)
+    _local_feature_brush_cache.clear()
+    _local_feature_brush_pending_stroke = None
+    _local_feature_brush_stroke_operator = None
+
+
+def _on_local_feature_brush_depsgraph_update(_scene, depsgraph):
+    """Invalidate reusable geometry after an external mesh update."""
+    updated = set()
+    try:
+        for update in depsgraph.updates:
+            data = update.id
+            updated.add(int(data.as_pointer()))
+            original = getattr(data, "original", None)
+            if original is not None:
+                updated.add(int(original.as_pointer()))
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        _local_feature_brush_cache.clear()
+        for state in _local_feature_brush_states.values():
+            state["cache"] = None
+            state["cache_invalidated"] = True
+            selector = state.get("selector")
+            if selector is not None:
+                selector["cache"] = None
+                selector["cache_invalidated"] = True
+        return
+    for signature, cache in list(_local_feature_brush_cache.items()):
+        if cache.get("obj_ptr") not in updated and cache.get("mesh_ptr") not in updated:
+            continue
+        owned = False
+        for state in _local_feature_brush_states.values():
+            if state.get("cache") is not cache:
+                continue
+            state_obj = state.get("obj")
+            try:
+                state_obj_ptr = int(state_obj.as_pointer()) if state_obj is not None else -1
+            except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+                state_obj_ptr = -1
+            cache_obj_ptr = int(cache.get("obj_ptr", -1))
+            if (
+                state.get("owned_update_pending")
+                and not state.get("external_update_expected")
+                and (
+                    state.get("mesh_ptr") in updated
+                    or cache_obj_ptr in updated
+                    or state_obj_ptr in updated
+                )
+            ):
+                # Mesh.update() from our own write is consumed at this exact
+                # depsgraph boundary.  A native Shift Smooth marks the
+                # external flag before PASS_THROUGH and therefore cannot be
+                # mistaken for this update.
+                state["owned_update_pending"] = False
+                owned = True
+            else:
+                state["owned_update_pending"] = False
+                state["external_update_expected"] = False
+        if owned:
+            continue
+        _local_feature_brush_cache.pop(signature, None)
+        for state in _local_feature_brush_states.values():
+            if state.get("cache") is cache:
+                state["cache"] = None
+                state["cache_invalidated"] = True
+            selector = state.get("selector")
+            if selector is not None and selector.get("cache") is cache:
+                selector["cache"] = None
+                selector["cache_invalidated"] = True
+
+
+def _on_local_feature_brush_undo_post(_scene):
+    # Native Undo has already restored its own coordinates.  Never write an
+    # old modal snapshot over that authoritative history result.
+    _local_feature_cancel_all("undo", restore=False)
+
+
+def _on_local_feature_brush_redo_post(_scene):
+    _local_feature_cancel_all("redo", restore=False)
+
+
+def _on_local_feature_brush_load_pre(_scene):
+    _local_feature_cancel_all("load-pre", restore=False)
+
+
+def _on_local_feature_brush_load_post(_scene):
+    _local_feature_cancel_all("load-post", restore=False)
+
+
+class VIEW3D_OT_mesh_focus_local_feature_brush(bpy.types.Operator):
+    """Dispatch one stroke when the dedicated Brush Asset is active.
+
+    This operator is bound only to an unmodified LMB press in the Sculpt
+    keymap.  It is not a selector and never installs a persistent modal
+    handler; Blender's Asset Shelf remains the selection UI.
+    """
+
+    bl_idname = LOCAL_FEATURE_BRUSH_OPERATOR_ID
+    bl_label = "Mesh Focus: Local Feature Brush"
+    bl_description = "With the MFO Brush Asset selected, drag LMB to enhance existing ridges and valleys"
+    bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, context):
+        return (
+            context.area is not None
+            and context.area.type == "VIEW_3D"
+            and context.region is not None
+            and context.region.type == "WINDOW"
+            and context.space_data is not None
+            and context.mode == "SCULPT"
+            and context.active_object is not None
+            and context.active_object.type == "MESH"
+            and _local_feature_brush_is_active(context)
+        )
+
+    def invoke(self, context, event):
+        global _local_feature_brush_pending_stroke
+        if not self.poll(context):
+            return {"PASS_THROUGH"}
+        # The keymap already excludes modifiers, but retain this guard for
+        # direct invocation and for Blender keymap precedence differences.
+        if (
+            bool(getattr(event, "shift", False))
+            or bool(getattr(event, "ctrl", False))
+            or bool(getattr(event, "alt", False))
+            or _local_feature_event_in_non_window_region(context, event)
+        ):
+            return {"PASS_THROUGH"}
+        obj = context.active_object
+        reason = _local_feature_safety_reason(obj)
+        if reason:
+            self.report({"WARNING"}, f"Local Feature Brush: {reason}")
+            return {"CANCELLED"}
+        settings = _local_feature_brush_settings(context)
+        if settings is None:
+            self.report({"WARNING"}, "Local Feature Brush: Sculpt brush settings unavailable")
+            return {"CANCELLED"}
+        # This transient selector record belongs to the child stroke only;
+        # it is intentionally not placed in _local_feature_brush_states and
+        # therefore cannot consume idle UI/navigation events between strokes.
+        selector_state = {
+            "operator": self,
+            "obj": obj,
+            "mesh_ptr": int(obj.data.as_pointer()),
+            "signature": _local_feature_signature(obj),
+            "settings": settings,
+            "selection_signature": _local_feature_selection_signature(context),
+            "radius_factor": 1.0,
+            "strength_factor": 1.0,
+            "selected": True,
+            "cache": None,
+        }
+        _local_feature_brush_pending_stroke = {
+            "selector": selector_state,
+            "coord": Vector((event.mouse_region_x, event.mouse_region_y)),
+            "pressure": _local_feature_event_pressure(event),
+        }
+        try:
+            result = bpy.ops.view3d.mesh_focus_local_feature_brush_stroke("INVOKE_DEFAULT")
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            _local_feature_brush_pending_stroke = None
+            self.report({"WARNING"}, "Local Feature Brush: stroke could not start")
+            # The dedicated asset owns this LMB press.  A failed start must
+            # not fall through to the asset's native Draw behaviour.
+            return {"CANCELLED"}
+        # The child modal owns only this active stroke.  Returning FINISHED
+        # here is what leaves the viewport and all sibling UI regions free
+        # between strokes while the selected Asset remains active.
+        if isinstance(result, set) and "CANCELLED" in result:
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class VIEW3D_OT_mesh_focus_local_feature_brush_stroke(bpy.types.Operator):
+    """Own one LMB stroke around one native Sculpt Undo preparation."""
+
+    bl_idname = "view3d.mesh_focus_local_feature_brush_stroke"
+    bl_label = "Mesh Focus: Local Feature Brush Stroke"
+    # The outer stroke operator must retain its UNDO depth until FINISHED so
+    # the nested public Sculpt position step stays pending until LMB release.
+    # The selector remains non-UNDO; only native-prepared strokes are allowed.
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return VIEW3D_OT_mesh_focus_local_feature_brush.poll(context)
+
+    def invoke(self, context, _event):
+        global _local_feature_brush_pending_stroke, _local_feature_brush_stroke_operator
+        pending = _local_feature_brush_pending_stroke
+        _local_feature_brush_pending_stroke = None
+        if pending is None or pending.get("selector") is None:
+            return {"CANCELLED"}
+        selector_state = pending["selector"]
+        if selector_state.get("operator") is None or not self.poll(context):
+            return {"CANCELLED"}
+        obj = selector_state.get("obj")
+        reason = _local_feature_safety_reason(obj)
+        if reason:
+            self.report({"WARNING"}, f"Local Feature Brush: {reason}")
+            return {"CANCELLED"}
+        # Preferences are editable from the Sculpt N-panel while the selector
+        # remains active.  Re-read them at every stroke boundary so the next
+        # stroke uses the values currently shown in the panel; the selector's
+        # wheel multipliers remain intentionally persistent between strokes.
+        settings = _local_feature_brush_settings(context)
+        if settings is None:
+            self.report({"WARNING"}, "Local Feature Brush: Sculpt brush settings unavailable")
+            return {"CANCELLED"}
+        selector_state["settings"] = settings
+        key = _operator_key(self)
+        state = {
+            "operator": self,
+            "operator_key": key,
+            "selector": selector_state,
+            "obj": obj,
+            "window_manager": context.window_manager,
+            "mesh_ptr": int(obj.data.as_pointer()),
+            "signature": _local_feature_signature(obj),
+            "settings": settings,
+            "radius_factor": max(
+                0.10,
+                min(
+                    4.0,
+                    float(settings["radius_factor"])
+                    * float(selector_state.get("radius_factor", 1.0)),
+                ),
+            ),
+            "strength_factor": selector_state.get("strength_factor", 1.0),
+            "stroke_active": True,
+            "changed": False,
+            "saved_coords": {},
+            "native_prepared": False,
+            "native_prep": None,
+            "cache_invalidated": False,
+            "owned_update_pending": False,
+            "owned_update_serial": 0,
+            "external_update_expected": False,
+            "cache": selector_state.get("cache"),
+            "last_mouse": pending["coord"],
+            "ignore_first_press": True,
+            "pending_pressure": pending["pressure"],
+            "prepare_job": None,
+            "prepare_timer": None,
+            "prepare_timer_duration": 0.0,
+            "prepare_stage": "queued",
+        }
+        try:
+            if state["cache"] is None:
+                state["prepare_job"] = _local_feature_build_cache_steps(obj)
+                state["prepare_timer"] = context.window_manager.event_timer_add(
+                    0.01, window=context.window
+                )
+            _local_feature_brush_states[key] = state
+            _local_feature_brush_stroke_operator = self
+            context.window_manager.modal_handler_add(self)
+            if state["cache"] is not None:
+                _local_feature_apply_dab(state, context, pending["coord"], pressure=pending["pressure"])
+        except (MemoryError, RuntimeError, TypeError, ValueError) as error:
+            self.report({"WARNING"}, f"Local Feature Brush: preparation failed ({error})")
+            _local_feature_brush_stroke_operator = None
+            _local_feature_dispose_state(state)
+            return {"CANCELLED"}
+        return {"RUNNING_MODAL"}
+
+    def _state(self):
+        return _local_feature_brush_states.get(_operator_key(self))
+
+    def _finish(self, state, cancelled=False):
+        global _local_feature_brush_stroke_operator
+        timer = state.get("prepare_timer")
+        if timer is not None:
+            try:
+                state.get("window_manager", bpy.context.window_manager).event_timer_remove(timer)
+            except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+                pass
+            state["prepare_timer"] = None
+        if cancelled:
+            _local_feature_restore_state(state)
+        elif state.get("changed"):
+            _local_feature_finalize_mesh(state)
+        selector = state.get("selector")
+        if cancelled and state.get("drop_selector_on_cancel") and selector is not None:
+            _local_feature_dispose_state(selector)
+        _local_feature_dispose_state(state)
+        _local_feature_brush_stroke_operator = None
+        return {"CANCELLED" if cancelled else "FINISHED"}
+
+    def modal(self, context, event):
+        state = self._state()
+        if state is None or state.get("operator") is not self:
+            return {"CANCELLED"}
+        if not self.poll(context) or context.active_object is not state.get("obj"):
+            state["drop_selector_on_cancel"] = True
+            return self._finish(state, cancelled=True)
+        if _local_feature_signature(state["obj"]) != state.get("signature"):
+            state["drop_selector_on_cancel"] = True
+            return self._finish(state, cancelled=True)
+        if state.get("cache_invalidated") and state.get("prepare_job") is None:
+            return self._finish(state, cancelled=True)
+        event_type = getattr(event, "type", "")
+        event_value = getattr(event, "value", None)
+        if event_type in {"LEFT_SHIFT", "RIGHT_SHIFT"}:
+            return {"PASS_THROUGH"}
+        if event_type == "ESC" and event_value in {None, "PRESS"}:
+            return self._finish(state, cancelled=True)
+        if event_type == "LEFTMOUSE" and event_value == "RELEASE" and state.get("prepare_job") is not None:
+            # The user released before the staged source cache was ready; do
+            # not apply a deferred dab after the gesture has ended.
+            return self._finish(state, cancelled=True)
+        if event_type == "TIMER" and state.get("prepare_job") is not None:
+            if state.get("cache_invalidated"):
+                return self._finish(state, cancelled=True)
+            expected_timer = state.get("prepare_timer")
+            event_timer = getattr(event, "timer", None)
+            if event_timer is not None:
+                # Future Blender versions may expose the owner directly.
+                if event_timer is not expected_timer:
+                    return {"PASS_THROUGH"}
+            else:
+                # Blender 5.2's public Event exposes TIMER type/value but no
+                # timer pointer.  Use the saved WM Timer's monotonic public
+                # duration as the progress/ownership boundary.
+                if expected_timer is None:
+                    return {"PASS_THROUGH"}
+                try:
+                    duration = float(getattr(expected_timer, "time_duration"))
+                    previous = float(state.get("prepare_timer_duration", 0.0))
+                except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+                    return {"PASS_THROUGH"}
+                if not math.isfinite(duration) or duration <= previous:
+                    return {"PASS_THROUGH"}
+                state["prepare_timer_duration"] = duration
+            try:
+                state["prepare_stage"] = next(state["prepare_job"])
+                return {"RUNNING_MODAL"}
+            except StopIteration as complete:
+                state["prepare_job"] = None
+                state["prepare_timer"] = None
+                state["cache"] = complete.value
+                state["selector"]["cache"] = state["cache"]
+                try:
+                    if expected_timer is not None:
+                        bpy.context.window_manager.event_timer_remove(expected_timer)
+                except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+                    pass
+                try:
+                    _local_feature_apply_dab(
+                        state,
+                        context,
+                        state["last_mouse"],
+                        pressure=state.get("pending_pressure", 1.0),
+                    )
+                except (MemoryError, RuntimeError, TypeError, ValueError) as error:
+                    self.report({"WARNING"}, f"Local Feature Brush: dab failed ({error})")
+                    return self._finish(state, cancelled=True)
+                return {"RUNNING_MODAL"}
+            except (MemoryError, RuntimeError, TypeError, ValueError) as error:
+                self.report({"WARNING"}, f"Local Feature Brush: preparation failed ({error})")
+                return self._finish(state, cancelled=True)
+        if event_type in {"WHEELUPMOUSE", "WHEELDOWNMOUSE"} and event_value in {None, "PRESS"}:
+            factor = 1.15 if event_type == "WHEELUPMOUSE" else 1.0 / 1.15
+            if bool(getattr(event, "shift", False)):
+                state["strength_factor"] = max(0.10, min(2.0, state["strength_factor"] * factor))
+            else:
+                state["radius_factor"] = max(0.10, min(4.0, state["radius_factor"] * factor))
+            return {"RUNNING_MODAL"}
+        if event_type == "LEFTMOUSE" and event_value == "PRESS":
+            if state.get("ignore_first_press"):
+                state["ignore_first_press"] = False
+                if bool(getattr(event, "shift", False)):
+                    state["external_update_expected"] = True
+                return {"PASS_THROUGH"}
+            if bool(getattr(event, "shift", False)):
+                state["external_update_expected"] = True
+                return {"PASS_THROUGH"}
+            state["last_mouse"] = Vector((event.mouse_region_x, event.mouse_region_y))
+            pressure = _local_feature_event_pressure(event)
+            try:
+                _local_feature_apply_dab(state, context, state["last_mouse"], pressure=pressure)
+            except (MemoryError, RuntimeError, TypeError, ValueError) as error:
+                self.report({"WARNING"}, f"Local Feature Brush: dab failed ({error})")
+                return self._finish(state, cancelled=True)
+            return {"RUNNING_MODAL"}
+        if event_type == "MOUSEMOVE" and state.get("stroke_active"):
+            if bool(getattr(event, "shift", False)):
+                return {"PASS_THROUGH"}
+            coordinate = Vector((event.mouse_region_x, event.mouse_region_y))
+            state["last_mouse"] = coordinate
+            pressure = _local_feature_event_pressure(event)
+            try:
+                _local_feature_apply_dab(state, context, coordinate, pressure=pressure)
+            except (MemoryError, RuntimeError, TypeError, ValueError) as error:
+                self.report({"WARNING"}, f"Local Feature Brush: dab failed ({error})")
+                return self._finish(state, cancelled=True)
+            return {"RUNNING_MODAL"}
+        if event_type == "LEFTMOUSE" and event_value == "RELEASE":
+            state["stroke_active"] = False
+            if not state.get("changed") and not state.get("native_prepared"):
+                # A flat/masked/no-op stroke must not leave an empty generic
+                # REGISTER,UNDO record behind.
+                return self._finish(state, cancelled=True)
+            return self._finish(state, cancelled=False)
+        if event_type in {"RIGHTMOUSE", "WINDOW_DEACTIVATE"}:
+            return {"PASS_THROUGH"}
+        return {"RUNNING_MODAL"}
 
 
 # ---------------------------------------------------------------------------
@@ -8760,36 +10381,110 @@ def _fill_preview_cursor_build_shading_geometry(obj, cache, spatial_radius):
     transform = np.asarray(obj.matrix_world, dtype=np.float64)[:3, :3]
     normals = normals_all[face_ids].astype(np.float64) @ np.linalg.inv(transform)
     normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1.0e-20)
+    face_vertex_ids_global = tuple(
+        tuple(
+            int(mesh.loops[int(loop_index)].vertex_index)
+            for loop_index in mesh.polygons[int(face_id)].loop_indices
+        )
+        for face_id in face_ids
+    )
+    vertex_values = sorted(
+        set(int(value) for values in face_vertex_ids_global for value in values)
+    )
+    vertex_local = {value: index for index, value in enumerate(vertex_values)}
+    world_vertices = np.asarray(
+        [
+            tuple(
+                float(value)
+                for value in (obj.matrix_world @ mesh.vertices[vertex_id].co)
+            )
+            for vertex_id in vertex_values
+        ],
+        dtype=np.float64,
+    )
+    face_vertex_ids = tuple(
+        tuple(vertex_local[int(value)] for value in values)
+        for values in face_vertex_ids_global
+    )
+    # ``world_vertices`` is compact for a cursor crop.  Keep pair endpoints
+    # in that same compact id space; mesh.edges[].vertices are mesh-global
+    # ids and must never be mixed with these indices.
+    pair_v0 = np.empty(len(pair_edges), dtype=np.int32)
+    pair_v1 = np.empty(len(pair_edges), dtype=np.int32)
+    for pair_index, edge_index in enumerate(pair_edges):
+        edge_vertices = tuple(int(value) for value in mesh.edges[int(edge_index)].vertices)
+        if len(edge_vertices) != 2:
+            pair_v0[pair_index] = -1
+            pair_v1[pair_index] = -1
+            continue
+        try:
+            pair_v0[pair_index] = int(vertex_local[edge_vertices[0]])
+            pair_v1[pair_index] = int(vertex_local[edge_vertices[1]])
+        except KeyError:
+            pair_v0[pair_index] = -1
+            pair_v1[pair_index] = -1
+    # Keep the actual world-space endpoints for every face pair.  The
+    # shading proxy uses this local edge direction to distinguish two shores
+    # from two contacts on the same shore; an edge index alone is not enough
+    # after the crop-local graph has been filtered.
+    pair_edge_points = np.empty((len(pair_edges), 2, 3), dtype=np.float64)
+    for pair_index, edge_index in enumerate(pair_edges):
+        if pair_v0[pair_index] < 0 or pair_v1[pair_index] < 0:
+            pair_edge_points[pair_index] = np.nan
+            continue
+        pair_edge_points[pair_index, 0] = np.asarray(
+            world_vertices[pair_v0[pair_index]],
+            dtype=np.float64,
+        )
+        pair_edge_points[pair_index, 1] = np.asarray(
+            world_vertices[pair_v1[pair_index]],
+            dtype=np.float64,
+        )
     delta = centers[second] - centers[first]
     pair_lengths = np.maximum(np.linalg.norm(delta, axis=1), 1.0e-20)
     sources = np.r_[first, second]
     destinations = np.r_[second, first]
     directed_lengths = np.r_[pair_lengths, pair_lengths]
+    directed_v0 = np.r_[pair_v0, pair_v0]
+    directed_v1 = np.r_[pair_v1, pair_v1]
     directed_edges = np.r_[pair_edges, pair_edges]
     graph_order = np.argsort(sources, kind="stable")
     degree = np.bincount(sources, minlength=face_count)
     offsets = np.r_[0, np.cumsum(degree)].astype(np.int64)
+    face_of_loop = np.repeat(
+        np.arange(len(totals), dtype=np.int32), totals
+    )
+    physical_loop = (
+        (edge_degree[loop_edges] == 2)
+        & ~hidden_all[face_of_loop]
+    ).astype(np.int32, copy=False)
+    physical_degree_all = np.add.reduceat(physical_loop, face_starts)
     return {
         "signature": cache["signature"],
         "count": face_count,
         "face_edge_counts": local_counts.astype(np.int32, copy=False),
+        "physical_degree": physical_degree_all[face_ids].astype(
+            np.int32, copy=False
+        ),
         "centers": centers,
         "normals": normals,
         "hidden": np.zeros(face_count, dtype=bool),
-        "world_vertices": np.empty((0, 3), dtype=np.float64),
+        "world_vertices": world_vertices,
         "offsets": offsets,
         "neighbors": destinations[graph_order].astype(np.int32, copy=False),
         "neighbor_lengths": directed_lengths[graph_order],
-        "edge_v0": directed_edges[graph_order].astype(np.int32, copy=False),
-        "edge_v1": directed_edges[graph_order].astype(np.int32, copy=False),
+        "edge_v0": directed_v0[graph_order].astype(np.int32, copy=False),
+        "edge_v1": directed_v1[graph_order].astype(np.int32, copy=False),
         "edge_indices": directed_edges[graph_order].astype(np.int32, copy=False),
         "first": first,
         "second": second,
         "pair_lengths": pair_lengths,
-        "pair_v0": pair_edges,
-        "pair_v1": pair_edges,
+        "pair_v0": pair_v0,
+        "pair_v1": pair_v1,
         "pair_edge_indices": pair_edges,
+        "pair_edge_points": pair_edge_points,
         "pair_kind": pair_kind,
+        "face_vertex_ids": face_vertex_ids,
         "seam_count": int(seam_count),
         "face_ids": face_ids,
         "spatial_radius": float(spatial_radius),
@@ -8799,6 +10494,7 @@ def _fill_preview_cursor_build_shading_geometry(obj, cache, spatial_radius):
             | (second == int(np.flatnonzero(face_ids == seed_face)[0]))
         ],
         "cursor_local": True,
+        "vertex_id_space": "compact",
         "shading_approx": True,
     }
 
@@ -8838,6 +10534,7 @@ def _fill_preview_cursor_build_geometry(obj, cache, spatial_radius):
     normals = np.empty((len(face_ids), 3), dtype=np.float64)
     vertex_index = {}
     vertex_world = []
+    face_vertex_ids = []
     edge_records = {}
     boundary_records = []
     edge_degree = cache["edge_degree"]
@@ -8861,6 +10558,15 @@ def _fill_preview_cursor_build_geometry(obj, cache, spatial_radius):
             float(np.linalg.norm(world_normal)), 1.0e-20
         )
         loop_indices = tuple(polygon.loop_indices)
+        # Keep vertex ids local to ``world_vertices``.  This makes the same
+        # face-vertex schema usable by the enclosed-component resolver and by
+        # the valley proof after a cursor crop.
+        face_vertex_ids.append(
+            tuple(
+                local_vertex(int(mesh.loops[int(loop_index)].vertex_index))
+                for loop_index in loop_indices
+            )
+        )
         for loop_position, loop_index in enumerate(loop_indices):
             edge_index = int(mesh.loops[int(loop_index)].edge_index)
             v0_global = int(mesh.loops[int(loop_index)].vertex_index)
@@ -8948,6 +10654,15 @@ def _fill_preview_cursor_build_geometry(obj, cache, spatial_radius):
         pair_kind = np.empty(0, dtype=np.int8)
     if pair_records:
         pair_kind = np.asarray(pair_kind, dtype=np.int8)
+    pair_edge_points = (
+        np.stack(
+            (np.asarray(vertex_world, dtype=np.float64)[pair_v0],
+             np.asarray(vertex_world, dtype=np.float64)[pair_v1]),
+            axis=1,
+        )
+        if len(pair_v0)
+        else np.empty((0, 2, 3), dtype=np.float64)
+    )
     delta = centers[second] - centers[first]
     pair_lengths = np.maximum(np.linalg.norm(delta, axis=1), 1.0e-20)
     sources = np.r_[first, second]
@@ -8980,13 +10695,16 @@ def _fill_preview_cursor_build_geometry(obj, cache, spatial_radius):
         "pair_lengths": pair_lengths,
         "pair_v0": pair_v0,
         "pair_v1": pair_v1,
+        "pair_edge_points": pair_edge_points,
         "pair_kind": pair_kind,
+        "face_vertex_ids": tuple(face_vertex_ids),
         "seam_count": int(seam_count),
         "face_ids": face_ids,
         "spatial_radius": float(spatial_radius),
         "spatial_faces": int(len(spatial_ids)),
         "seed_neighbor_lengths": seed_neighbor_lengths,
         "cursor_local": True,
+        "vertex_id_space": "compact",
     }
 
 
@@ -9171,13 +10889,28 @@ def _fill_preview_build_adjacency(obj, prepared=None):
     source_edges = np.r_[np.arange(len(first)), np.arange(len(first))]
     edge_v0_directed = np.r_[edge_v0, edge_v0]
     edge_v1_directed = np.r_[edge_v1, edge_v1]
+    face_vertex_ids = tuple(
+        tuple(
+            int(value)
+            for value in loop_vertices[
+                int(face_starts[face]):int(face_starts[face]) + int(totals[face])
+            ]
+        )
+        for face in range(face_count)
+    )
     order = np.argsort(sources, kind="stable")
     degree = np.bincount(sources, minlength=face_count)
     offsets = np.r_[0, np.cumsum(degree)].astype(np.int64)
+    pair_edge_points = (
+        np.stack((world_vertices[edge_v0], world_vertices[edge_v1]), axis=1)
+        if len(edge_v0)
+        else np.empty((0, 2, 3), dtype=np.float64)
+    )
     cached = {
         "signature": signature,
         "count": int(face_count),
         "face_edge_counts": totals.astype(np.int32, copy=False),
+        "physical_degree": degree.astype(np.int32, copy=False),
         "centers": centers,
         "normals": normals,
         "hidden": hidden,
@@ -9185,6 +10918,9 @@ def _fill_preview_build_adjacency(obj, prepared=None):
         "offsets": offsets,
         "neighbors": destinations[order].astype(np.int32, copy=False),
         "neighbor_lengths": np.r_[distance, distance][order],
+        # Physical pair id for each directed CSR neighbor.  Boundary-local
+        # passes use this index to gather only a one/two-ring edge band.
+        "edge_indices": source_edges[order].astype(np.int32, copy=False),
         "edge_v0": edge_v0_directed[order].astype(np.int32, copy=False),
         "edge_v1": edge_v1_directed[order].astype(np.int32, copy=False),
         "first": first,
@@ -9192,6 +10928,11 @@ def _fill_preview_build_adjacency(obj, prepared=None):
         "pair_lengths": distance,
         "pair_v0": edge_v0,
         "pair_v1": edge_v1,
+        "pair_edge_points": pair_edge_points,
+        "face_vertex_ids": face_vertex_ids,
+        # Canonical mesh polygon ids are present even for the full graph.  The
+        # proxy/fine valley record uses this field instead of patch-local ids.
+        "face_ids": np.arange(face_count, dtype=np.int32),
         "seam_count": seam_count,
     }
     # Drop obsolete revisions for this mesh while retaining unrelated meshes.
@@ -9276,6 +11017,446 @@ def _fill_preview_dijkstra_incremental(geometry, seed_face, max_distance, state)
     return distances, ids, int(state["popped"]), state
 
 
+def _fill_preview_progressive_range_step(state, radius):
+    """Advance the active normal-E physical range by one bounded stage.
+
+    This small entry point is intentionally shared by the production result
+    builder and diagnostics.  It owns only the reusable Dijkstra frontier;
+    viewport capture, screen morphology, and projection helpers are not part
+    of this active path.
+    """
+    import numpy as np
+
+    geometry = state["adjacency"]
+    if state.get("cursor_local"):
+        _fill_preview_cursor_expand(state, float(radius))
+        geometry = state["adjacency"]
+    seed_value = state.get("seed_local")
+    if seed_value is None:
+        seed_value = state.get("seed_face", 0)
+    seed_face = int(seed_value)
+    halo = max(float(radius) * 0.5, float(state.get("initial_radius") or radius) * 0.5)
+    patch_radius = float(radius) + halo
+    previous = state.get("distance_state")
+    popped_before = int(previous.get("popped", 0)) if isinstance(previous, dict) else 0
+    distances, patch_ids, popped, distance_state = _fill_preview_dijkstra_incremental(
+        geometry, seed_face, patch_radius, previous
+    )
+    state["distance_state"] = distance_state
+    newly_processed = max(
+        0, int(distance_state.get("popped", popped)) - popped_before
+    )
+    return {
+        "geometry": geometry,
+        "seed_face": seed_face,
+        "distances": distances,
+        "patch_ids": patch_ids,
+        "popped": int(popped),
+        "patch_radius": float(patch_radius),
+        "newly_processed_faces": int(newly_processed),
+        "reused_faces": int(max(0, len(patch_ids) - newly_processed)),
+    }
+
+
+def _fill_preview_valley_contact_pair_is_crossing(
+    geometry,
+    valley_face,
+    first_contact,
+    second_contact,
+    scale=1.0,
+    contact_edge_points=None,
+):
+    """Prove that two contacts lie on opposite shores of one valley face.
+
+    A center projection alone cannot distinguish opposite shores from two
+    contacts on the same shore (or from a pair running along the valley).
+    Use the actual shared-edge midpoint vectors in the local tangent plane:
+    the shore vectors must oppose one another and the contact vector must
+    align with their across-valley axis.  Missing/ambiguous edge geometry is
+    deliberately rejected so a crop or malformed graph cannot turn a normal
+    valley boundary into a rescue.
+    """
+    import numpy as np
+
+    try:
+        valley_faces = np.asarray(valley_face, dtype=np.int32).reshape(-1)
+        first_contact = int(first_contact)
+        second_contact = int(second_contact)
+        centers = np.asarray(geometry["centers"], dtype=np.float64)
+        normals = np.asarray(geometry["normals"], dtype=np.float64)
+        first = np.asarray(geometry["first"], dtype=np.int32).reshape(-1)
+        second = np.asarray(geometry["second"], dtype=np.int32).reshape(-1)
+        pair_points = np.asarray(
+            geometry.get("pair_edge_points"), dtype=np.float64
+        )
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+        return False
+    if (
+        centers.ndim != 2
+        or centers.shape[1] != 3
+        or normals.ndim != 2
+        or normals.shape[1] != 3
+        or len(first) != len(second)
+        or pair_points.shape != (len(first), 2, 3)
+        or len(valley_faces) == 0
+        or np.any(valley_faces < 0)
+        or min(first_contact, second_contact) < 0
+        or max(int(np.max(valley_faces)), first_contact, second_contact) >= len(centers)
+        or first_contact == second_contact
+    ):
+        return False
+    valley_faces = np.unique(valley_faces)
+
+    def shared_pair(contact):
+        if contact_edge_points is not None:
+            for edge in contact_edge_points.get(int(contact), ()):
+                edge = np.asarray(edge, dtype=np.float64)
+                if edge.shape == (2, 3) and np.all(np.isfinite(edge)):
+                    return edge
+            return None
+        matches = np.flatnonzero(
+            (np.isin(first, valley_faces) & (second == contact))
+            | ((first == contact) & np.isin(second, valley_faces))
+        )
+        for index in matches:
+            edge = pair_points[int(index)]
+            if np.all(np.isfinite(edge)):
+                return edge
+        return None
+
+    edge_first = shared_pair(first_contact)
+    edge_second = shared_pair(second_contact)
+    if edge_first is None or edge_second is None:
+        return False
+    valley_normal = np.mean(normals[valley_faces], axis=0)
+    normal_length = float(np.linalg.norm(valley_normal))
+    if not np.isfinite(normal_length) or normal_length <= 1.0e-12:
+        return False
+    valley_normal = valley_normal / normal_length
+    side_vectors = []
+    edge_directions = []
+    for contact, edge in (
+        (first_contact, edge_first),
+        (second_contact, edge_second),
+    ):
+        edge_vector = np.asarray(edge[1] - edge[0], dtype=np.float64)
+        edge_length = float(np.linalg.norm(edge_vector))
+        if not np.isfinite(edge_length) or edge_length <= 1.0e-12:
+            return False
+        edge_directions.append(edge_vector / edge_length)
+        side = centers[contact] - np.mean(edge, axis=0)
+        side = side - valley_normal * float(np.dot(side, valley_normal))
+        side_length = float(np.linalg.norm(side))
+        if not np.isfinite(side_length) or side_length <= max(float(scale) * 1.0e-6, 1.0e-12):
+            return False
+        side_vectors.append(side / side_length)
+    side_first, side_second = side_vectors
+    if float(np.dot(side_first, side_second)) >= -0.15:
+        return False
+    # The two shore edges should describe the same long direction.  This gate
+    # is intentionally conservative for one/two-face components.
+    if abs(float(np.dot(edge_directions[0], edge_directions[1]))) < 0.20:
+        return False
+    cross = centers[second_contact] - centers[first_contact]
+    cross = cross - valley_normal * float(np.dot(cross, valley_normal))
+    cross_length = float(np.linalg.norm(cross))
+    across = side_second - side_first
+    across = across - valley_normal * float(np.dot(across, valley_normal))
+    across_length = float(np.linalg.norm(across))
+    if cross_length <= max(float(scale) * 0.35, 1.0e-12) or across_length <= 1.0e-12:
+        return False
+    alignment = abs(float(np.dot(cross / cross_length, across / across_length)))
+    return bool(alignment >= 0.45)
+
+
+def _fill_preview_valley_component_is_crossing(
+    geometry, valley_face_ids, shore_face_ids, interface_edges, scale=1.0
+):
+    """Validate one complete valley component using canonical mesh ids.
+
+    ``interface_edges`` contains ``(valley_id, shore_id, p0, p1)`` records.
+    The record is deliberately component-wide: a middle valley face need not
+    share an edge with both shores itself.  Every candidate shore pair is
+    compared, and a pair is accepted only when its edge directions agree,
+    its side vectors oppose, and its span is transverse to the component
+    tangent.  Ambiguous one-face polygons (for example a square) fail closed.
+    """
+    import numpy as np
+
+    try:
+        canonical = np.asarray(geometry["face_ids"], dtype=np.int64).reshape(-1)
+        centers = np.asarray(geometry["centers"], dtype=np.float64)
+        normals = np.asarray(geometry["normals"], dtype=np.float64)
+        face_vertices = geometry.get("face_vertex_ids")
+        world_vertices = np.asarray(
+            geometry.get("world_vertices"), dtype=np.float64
+        )
+        valley_ids = tuple(dict.fromkeys(int(value) for value in valley_face_ids))
+        shore_ids = tuple(dict.fromkeys(int(value) for value in shore_face_ids))
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+        return False
+    if (
+        len(canonical) != len(centers)
+        or centers.ndim != 2
+        or centers.shape[1] != 3
+        or normals.shape != centers.shape
+        or len(valley_ids) == 0
+        or len(shore_ids) < 2
+        or face_vertices is None
+        or len(face_vertices) != len(canonical)
+        or world_vertices.ndim != 2
+        or world_vertices.shape[1] != 3
+        or len(set(int(value) for value in canonical)) != len(canonical)
+    ):
+        return False
+    local_by_mesh = {int(mesh_id): index for index, mesh_id in enumerate(canonical)}
+    if any(value not in local_by_mesh for value in valley_ids + shore_ids):
+        return False
+    valley_local = np.asarray([local_by_mesh[value] for value in valley_ids], dtype=np.int32)
+    shore_local = {value: local_by_mesh[value] for value in shore_ids}
+    normal = np.mean(normals[valley_local], axis=0)
+    normal_length = float(np.linalg.norm(normal))
+    if not np.isfinite(normal_length) or normal_length <= 1.0e-12:
+        return False
+    normal /= normal_length
+    component_center = np.mean(centers[valley_local], axis=0)
+    # The component tangent is derived from the component's complete polygon
+    # footprint for every component size.  Vertex ids are deduplicated before
+    # PCA so shared vertices do not receive extra weight merely because they
+    # occur on two adjacent valley faces.  Project onto the mean-normal
+    # tangent plane first; face-center differences can point across the valley
+    # and must never become a two-face tangent shortcut.
+    def derive_tangent(local_faces):
+        vertex_ids = set()
+        try:
+            for local_face in tuple(int(value) for value in local_faces):
+                for vertex_id in face_vertices[local_face]:
+                    vertex_id = int(vertex_id)
+                    if vertex_id < 0 or vertex_id >= len(world_vertices):
+                        return None
+                    vertex_ids.add(vertex_id)
+        except (IndexError, TypeError, ValueError):
+            return None
+        if len(vertex_ids) < 2:
+            return None
+        points = world_vertices[np.asarray(sorted(vertex_ids), dtype=np.int32)]
+        points = points - component_center
+        points = points - normal * np.sum(points * normal, axis=1, keepdims=True)
+        points = points - np.mean(points, axis=0)
+        if len(points) < 2:
+            return None
+        try:
+            _u, singular, vh = np.linalg.svd(points, full_matrices=False)
+            if (
+                not len(singular)
+                or float(singular[0]) <= max(float(scale) * 1.0e-8, 1.0e-12)
+                or (len(singular) >= 2 and float(singular[0]) <= float(singular[1]) * 1.15)
+            ):
+                return None
+            tangent = vh[0]
+        except (np.linalg.LinAlgError, TypeError, ValueError):
+            return None
+        tangent = tangent - normal * float(np.dot(tangent, normal))
+        tangent_length = float(np.linalg.norm(tangent))
+        return tangent / tangent_length if tangent_length > 1.0e-12 else None
+
+    tangent = derive_tangent(valley_local)
+    if tangent is None:
+        # A single face without a geometrically dominant long direction is
+        # indistinguishable from a square/ambiguous contact arrangement.
+        return False
+
+    by_shore = {shore_id: [] for shore_id in shore_ids}
+    try:
+        for valley_id, shore_id, point_a, point_b in interface_edges:
+            valley_id = int(valley_id)
+            shore_id = int(shore_id)
+            if valley_id not in valley_ids or shore_id not in by_shore:
+                continue
+            edge = np.asarray((point_a, point_b), dtype=np.float64)
+            if edge.shape != (2, 3) or not np.all(np.isfinite(edge)):
+                return False
+            by_shore[shore_id].append((valley_id, edge))
+    except (TypeError, ValueError):
+        return False
+    if any(not edges for edges in by_shore.values()):
+        return False
+
+    # Compare interface edges at the same local station along the component,
+    # rather than requiring every cross-section to sit near the component's
+    # global centroid.  The latter rejects a valid long valley as soon as its
+    # shores are distributed along the full component.  Keep the entries
+    # sorted so the pair search below visits only a bounded local window.
+    station_entries = {}
+    all_station_entries = []
+    max_edge_length = 0.0
+    try:
+        for shore_id, edges in by_shore.items():
+            prepared = []
+            for valley_id, edge in edges:
+                edge_vector = np.asarray(edge[1] - edge[0], dtype=np.float64)
+                edge_length = float(np.linalg.norm(edge_vector))
+                edge_midpoint = np.mean(edge, axis=0)
+                station = float(np.dot(edge_midpoint, tangent))
+                if (
+                    not np.isfinite(edge_length)
+                    or edge_length <= 1.0e-12
+                    or not np.isfinite(station)
+                ):
+                    return False
+                prepared.append(
+                    (station, valley_id, edge, edge_length)
+                )
+                max_edge_length = max(max_edge_length, edge_length)
+            prepared.sort(key=lambda value: value[0])
+            station_entries[shore_id] = tuple(prepared)
+            all_station_entries.extend(
+                (float(station), int(shore_id), int(valley_id), edge, float(edge_length))
+                for station, valley_id, edge, edge_length in prepared
+            )
+    except (TypeError, ValueError):
+        return False
+    if not station_entries or not all_station_entries or max_edge_length <= 1.0e-12:
+        return False
+
+    # Compare only entries in one local station window.  The previous
+    # shore-pair outer loop still visited every contact pair even though most
+    # pairs had no nearby interface edge; indexing all edges once keeps the
+    # hot path bounded by local interface density instead of shore^2.
+    all_station_entries.sort(key=lambda value: value[0])
+    all_stations = np.asarray(
+        [entry[0] for entry in all_station_entries], dtype=np.float64
+    )
+    station_search_window = max(
+        float(scale) * 4.0,
+        max_edge_length + float(scale) * 2.0,
+    )
+    pair_geometry = {}
+    candidates = []
+    for first_index, (
+        station_first,
+        shore_first_raw,
+        valley_first,
+        edge_first,
+        edge_length_first,
+    ) in enumerate(all_station_entries):
+        start = int(
+            np.searchsorted(
+                all_stations,
+                station_first - station_search_window,
+                side="left",
+            )
+        )
+        end = int(
+            np.searchsorted(
+                all_stations,
+                station_first + station_search_window,
+                side="right",
+            )
+        )
+        for second_index in range(max(first_index + 1, start), end):
+            (
+                station_second,
+                shore_second_raw,
+                valley_second,
+                edge_second,
+                edge_length_second,
+            ) = all_station_entries[second_index]
+            shore_first = int(shore_first_raw)
+            shore_second = int(shore_second_raw)
+            if shore_first == shore_second:
+                continue
+            # Keep each unordered contact pair in one orientation.  All
+            # gates below are sign-invariant except the side vectors, whose
+            # opposing-dot test is symmetric as well.
+            if shore_first > shore_second:
+                shore_first, shore_second = shore_second, shore_first
+                edge_first, edge_second = edge_second, edge_first
+                edge_length_first, edge_length_second = (
+                    edge_length_second,
+                    edge_length_first,
+                )
+            pair_key = (shore_first, shore_second)
+            cached = pair_geometry.get(pair_key)
+            if cached is None:
+                first_center = centers[shore_local[shore_first]]
+                second_center = centers[shore_local[shore_second]]
+                cross = second_center - first_center
+                cross = cross - normal * float(np.dot(cross, normal))
+                cross_length = float(np.linalg.norm(cross))
+                pair_geometry[pair_key] = (cross, cross_length)
+            else:
+                cross, cross_length = cached
+            if cross_length <= max(float(scale) * 0.35, 1.0e-12):
+                continue
+            # The permitted station span is derived from the local graph
+            # scale, the two interface edge lengths, and a bounded fraction
+            # of the across-valley span.  It is intentionally independent of
+            # the component's total length and global center.
+            if abs(float(station_second) - float(station_first)) > max(
+                float(scale) * 2.0,
+                (edge_length_first + edge_length_second) * 0.5,
+                min(float(cross_length) * 0.25, float(scale) * 2.0),
+            ):
+                continue
+            dirs = []
+            sides = []
+            valid = True
+            first_center = centers[shore_local[shore_first]]
+            second_center = centers[shore_local[shore_second]]
+            for contact_center, edge in (
+                (first_center, edge_first),
+                (second_center, edge_second),
+            ):
+                edge_vector = edge[1] - edge[0]
+                edge_length = float(np.linalg.norm(edge_vector))
+                if edge_length <= 1.0e-12:
+                    valid = False
+                    break
+                dirs.append(edge_vector / edge_length)
+                side = contact_center - np.mean(edge, axis=0)
+                side = side - normal * float(np.dot(side, normal))
+                side_length = float(np.linalg.norm(side))
+                if side_length <= max(float(scale) * 1.0e-6, 1.0e-12):
+                    valid = False
+                    break
+                sides.append(side / side_length)
+            if not valid:
+                continue
+            # Always use the component tangent.  Re-deriving it from the two
+            # contact faces turns a two-face cross-valley center difference
+            # into a false longitudinal tangent.
+            if abs(float(np.dot(cross, tangent))) / cross_length > 0.78:
+                continue
+            if float(np.dot(sides[0], sides[1])) >= -0.25:
+                continue
+            if abs(float(np.dot(dirs[0], dirs[1]))) < 0.45:
+                continue
+            # A shore edge is longitudinal; a pair whose center span follows
+            # it is a long-way/end contact, not a cross-section.
+            if max(
+                abs(float(np.dot(cross / cross_length, direction)))
+                for direction in dirs
+            ) > 0.70:
+                continue
+            across = sides[1] - sides[0]
+            across_length = float(np.linalg.norm(across))
+            if across_length <= 1.0e-12:
+                continue
+            alignment = abs(
+                float(np.dot(cross / cross_length, across / across_length))
+            )
+            if alignment < 0.45:
+                continue
+            candidates.append(cross_length)
+    # At least one stable section is required.  The component-wide tangent,
+    # opposing side vectors, and complete interface scan make a lone accepted
+    # pair a proof of this component rather than a scalar face shortcut.
+    if not candidates:
+        return False
+    return True
+
+
 def _fill_preview_shading_proxy(geometry, patch_ids, distances, target_radius, seed_local):
     """Choose a coarse candidate plus a narrow correction band.
 
@@ -9295,6 +11476,15 @@ def _fill_preview_shading_proxy(geometry, patch_ids, distances, target_radius, s
     if count == 0:
         return patch_ids, {"proxy_seconds": 0.0, "proxy_nodes": 0}
     global_count = int(geometry["count"])
+    if np.any(patch_ids < 0) or np.any(patch_ids >= global_count):
+        return patch_ids, {
+            "proxy_seconds": float(time.perf_counter() - started),
+            "proxy_nodes": count,
+            "proxy_candidate_faces": count,
+            "proxy_band_faces": count,
+            "proxy_barrier_edges": 0,
+            "proxy_valley_merge_reason": "patch-id-schema",
+        }
     local_id = np.full(global_count, -1, dtype=np.int32)
     local_id[patch_ids] = np.arange(count, dtype=np.int32)
     graph_first = np.asarray(geometry["first"], dtype=np.int32)
@@ -9352,6 +11542,12 @@ def _fill_preview_shading_proxy(geometry, patch_ids, distances, target_radius, s
         pair_kind = pair_kind[keep]
     else:
         pair_kind = np.zeros(len(first), dtype=np.int8)
+    raw_pair_points = geometry.get("pair_edge_points")
+    pair_edge_points = None
+    if raw_pair_points is not None:
+        raw_pair_points = np.asarray(raw_pair_points, dtype=np.float64)
+        if raw_pair_points.shape == (len(graph_first), 2, 3):
+            pair_edge_points = raw_pair_points[keep]
 
     # Split the original face graph at the signed valley barriers.  True seams
     # remain traversable here; they are not geometric valley barriers.  This
@@ -9362,6 +11558,11 @@ def _fill_preview_shading_proxy(geometry, patch_ids, distances, target_radius, s
     target_mask = np.isfinite(patch_distances) & (
         patch_distances <= float(target_radius) + 1.0e-9
     )
+    hidden = np.asarray(
+        geometry.get("hidden", np.zeros(global_count, dtype=bool)), dtype=bool
+    )
+    if len(hidden) == global_count:
+        target_mask &= ~hidden[patch_ids]
     parent = np.arange(count, dtype=np.int32)
     sizes = np.ones(count, dtype=np.int32)
 
@@ -9389,14 +11590,12 @@ def _fill_preview_shading_proxy(geometry, patch_ids, distances, target_radius, s
     if not np.any(candidate):
         candidate[seed_local] = True
 
-    # A valley strip may be isolated as a barrier band even after its finite
-    # end has wrapped around.  Admit only a local cross-section face when two
-    # selected, non-valley contacts lie on opposite sides of that same face.
-    # This intentionally avoids PCA over a curved valley component: one local
-    # proof can add one local face, never the entire component.
+    # A valley can be several faces wide and can run for many face rows.  Keep
+    # one component-wide record so the fine stage can revalidate the same
+    # proof even when the exact partition excludes every valley face.
     valley_merge = np.zeros(count, dtype=bool)
-    valley_merge_evidence = []
-    valley_faces = face_valley >= valley_threshold
+    valley_components = []
+    valley_faces = (face_valley >= valley_threshold) & target_mask
     incidence_sources = np.r_[first, second]
     incidence_edges = np.r_[
         np.arange(len(first), dtype=np.int32),
@@ -9405,57 +11604,149 @@ def _fill_preview_shading_proxy(geometry, patch_ids, distances, target_radius, s
     incidence_order = np.argsort(incidence_sources, kind="stable")
     incidence_faces = incidence_sources[incidence_order]
     incidence_edges = incidence_edges[incidence_order]
-    for valley_face in np.flatnonzero(valley_faces & target_mask):
-        valley_face = int(valley_face)
-        contacts = []
-        tangent_neighbors = []
-        incidence_start = int(
-            np.searchsorted(incidence_faces, valley_face, side="left")
-        )
-        incidence_end = int(
-            np.searchsorted(incidence_faces, valley_face, side="right")
-        )
-        for edge in incidence_edges[incidence_start:incidence_end]:
-            edge = int(edge)
-            left = int(first[edge])
-            right = int(second[edge])
-            other = right if left == valley_face else left
-            if valley_faces[other]:
-                tangent_neighbors.append(other)
-            elif candidate[other] and target_mask[other]:
-                contacts.append(other)
-        if len(contacts) < 2 or not tangent_neighbors:
+    incidence_counts = np.bincount(incidence_sources, minlength=count)
+    raw_edge_counts = geometry.get("face_edge_counts")
+    edge_counts = np.empty(0, dtype=np.int32)
+    valley_protection_ready = False
+    if raw_edge_counts is not None:
+        raw_edge_counts = np.asarray(raw_edge_counts, dtype=np.int32).reshape(-1)
+        if len(raw_edge_counts) == global_count and np.all(raw_edge_counts > 0):
+            edge_counts = raw_edge_counts[patch_ids]
+            valley_protection_ready = True
+        elif (
+            len(raw_edge_counts) == count
+            and global_count == count
+            and np.all(raw_edge_counts > 0)
+        ):
+            # A genuinely patch-local geometry is valid only when its count
+            # cannot be confused with a larger global geometry.
+            edge_counts = raw_edge_counts
+            valley_protection_ready = True
+    if len(hidden) != global_count:
+        valley_protection_ready = False
+    try:
+        mesh_face_ids = np.asarray(
+            geometry.get("face_ids"), dtype=np.int64
+        ).reshape(-1)
+    except (AttributeError, TypeError, ValueError):
+        mesh_face_ids = np.empty(0, dtype=np.int64)
+    canonical_ready = (
+        len(mesh_face_ids) == global_count
+        and len(np.unique(mesh_face_ids)) == global_count
+    )
+    valley_seen = np.zeros(count, dtype=bool)
+    for valley_start in (
+        np.flatnonzero(valley_faces) if valley_protection_ready else ()
+    ):
+        valley_start = int(valley_start)
+        if valley_seen[valley_start]:
             continue
-        center = centers[valley_face]
-        for contact_index, first_contact in enumerate(contacts):
-            for second_contact in contacts[contact_index + 1:]:
-                cross = centers[second_contact] - centers[first_contact]
-                cross_length = float(np.linalg.norm(cross))
-                if not (0.60 * local_scale <= cross_length <= 2.10 * local_scale):
-                    continue
-                tangent = centers[int(tangent_neighbors[0])] - center
-                tangent_length = max(float(np.linalg.norm(tangent)), 1.0e-20)
-                if abs(float(np.dot(tangent, cross))) / (
-                    tangent_length * cross_length
-                ) > 0.72:
-                    continue
-                side_first = float(np.dot(centers[first_contact] - center, cross))
-                side_second = float(np.dot(centers[second_contact] - center, cross))
-                if side_first * side_second >= 0.0:
-                    continue
-                if min(abs(side_first), abs(side_second)) < 0.20 * cross_length * cross_length:
-                    continue
-                valley_merge[valley_face] = True
-                valley_merge_evidence.append(
-                    (
-                        int(patch_ids[valley_face]),
-                        int(patch_ids[first_contact]),
-                        int(patch_ids[second_contact]),
-                    )
-                )
-                break
-            if valley_merge[valley_face]:
-                break
+        valley_seen[valley_start] = True
+        pending = [valley_start]
+        component = []
+        while pending:
+            valley_face = int(pending.pop())
+            component.append(valley_face)
+            incidence_start = int(
+                np.searchsorted(incidence_faces, valley_face, side="left")
+            )
+            incidence_end = int(
+                np.searchsorted(incidence_faces, valley_face, side="right")
+            )
+            for edge in incidence_edges[incidence_start:incidence_end]:
+                edge = int(edge)
+                left = int(first[edge])
+                right = int(second[edge])
+                other = right if left == valley_face else left
+                if valley_faces[other] and not valley_seen[other]:
+                    valley_seen[other] = True
+                    pending.append(other)
+
+        component = np.asarray(component, dtype=np.int32)
+        component_mask = np.zeros(count, dtype=bool)
+        component_mask[component] = True
+        component_open = False
+        contacts = set()
+        interface_edges = []
+        for valley_face in component:
+            valley_face = int(valley_face)
+            # ``face_edge_counts`` is the original polygon edge count.  A
+            # lower graph degree means an open/non-manifold/crop boundary.
+            expected_edges = int(edge_counts[valley_face]) if len(edge_counts) == count else 0
+            if expected_edges and int(incidence_counts[valley_face]) < expected_edges:
+                component_open = True
+            incidence_start = int(
+                np.searchsorted(incidence_faces, valley_face, side="left")
+            )
+            incidence_end = int(
+                np.searchsorted(incidence_faces, valley_face, side="right")
+            )
+            for edge in incidence_edges[incidence_start:incidence_end]:
+                edge = int(edge)
+                left = int(first[edge])
+                right = int(second[edge])
+                other = right if left == valley_face else left
+                # A neighbor beyond the requested radius is a legitimate
+                # clipping endpoint.  Do not reject the in-radius valley
+                # component merely because the valley continues outside the
+                # current brush domain; hidden faces remain a hard boundary.
+                if not target_mask[other] and bool(hidden[patch_ids[other]]):
+                    component_open = True
+                elif not component_mask[other] and candidate[other]:
+                    contacts.add(other)
+                    if pair_edge_points is not None:
+                        # Explicit ID conversion: patch-local -> geometry
+                        # local via patch_ids -> canonical mesh polygon id via
+                        # geometry["face_ids"].  The edge points come from the
+                        # same retained graph edge.
+                        valley_geometry_id = int(patch_ids[valley_face])
+                        shore_geometry_id = int(patch_ids[other])
+                        interface_edges.append(
+                            (
+                                int(mesh_face_ids[valley_geometry_id]),
+                                int(mesh_face_ids[shore_geometry_id]),
+                                tuple(float(value) for value in pair_edge_points[edge, 0]),
+                                tuple(float(value) for value in pair_edge_points[edge, 1]),
+                            )
+                        )
+        if component_open or len(contacts) < 2:
+            continue
+        if not canonical_ready or pair_edge_points is None:
+            continue
+        component_geometry_ids = tuple(
+            int(patch_ids[int(face)]) for face in component
+        )
+        contact_geometry_ids = tuple(
+            int(patch_ids[int(face)]) for face in sorted(contacts)
+        )
+        component_mesh_ids = tuple(
+            int(mesh_face_ids[geometry_id])
+            for geometry_id in component_geometry_ids
+        )
+        shore_mesh_ids = tuple(
+            int(mesh_face_ids[geometry_id])
+            for geometry_id in contact_geometry_ids
+        )
+        if not _fill_preview_valley_component_is_crossing(
+            # The helper receives the complete geometry-local arrays and the
+            # canonical mesh ids above.  Slicing only face_ids would make the
+            # canonical-to-local map disagree with centers/normals/vertices.
+            geometry,
+            component_mesh_ids,
+            shore_mesh_ids,
+            interface_edges,
+            scale=local_scale,
+        ):
+            continue
+        valley_merge[component] = True
+        valley_components.append(
+            {
+                "valley_face_ids": component_mesh_ids,
+                "shore_face_ids": shore_mesh_ids,
+                "interface_edges": tuple(interface_edges),
+                "scale": float(local_scale),
+            }
+        )
     if np.any(valley_merge):
         candidate |= valley_merge
 
@@ -9489,14 +11780,24 @@ def _fill_preview_shading_proxy(geometry, patch_ids, distances, target_radius, s
         "proxy_band_faces": int(len(selected)),
         "proxy_barrier_edges": int(np.count_nonzero(barrier)),
         "proxy_valley_threshold": float(valley_threshold),
+        "proxy_valley_merge_protection": bool(
+            valley_protection_ready and pair_edge_points is not None
+        ),
+        "proxy_valley_merge_reason": (
+            "edge-count-schema"
+            if not valley_protection_ready
+            else "pair-edge-schema"
+            if pair_edge_points is None
+            else "ok"
+        ),
         "proxy_valley_merge_faces": int(np.count_nonzero(valley_merge)),
         "proxy_valley_merge_ids": proxy_valley_merge_ids,
-        "proxy_valley_merge_evidence": tuple(valley_merge_evidence),
+        "proxy_valley_components": tuple(valley_components),
         "proxy_candidate_ids": proxy_candidate_ids,
     }
 
 
-def _fill_preview_local_geometry(geometry, face_ids):
+def _fill_preview_local_geometry(geometry, face_ids, strict_mode=False):
     """Slice adjacency and recompute all scalar features on the local patch."""
     import numpy as np
 
@@ -9558,11 +11859,38 @@ def _fill_preview_local_geometry(geometry, face_ids):
         "pair_v0": pair_v0.astype(np.int32, copy=False),
         "pair_v1": pair_v1.astype(np.int32, copy=False),
         "pair_edge_indices": pair_edge_indices.astype(np.int32, copy=False),
+        "face_edge_counts": np.asarray(
+            geometry.get("face_edge_counts", np.zeros(int(len(face_ids)), dtype=np.int32)),
+            dtype=np.int32,
+        )[face_ids].astype(np.int32, copy=False),
         "count": int(len(face_ids)),
         "seam_count": int(geometry.get("seam_count", 0)),
         "partitions": {},
         "_global_face_ids": face_ids,
+        # The endpoint ids and ``world_vertices`` are meaningful only when
+        # their id space is explicitly declared by the geometry builder.
+        # Never infer mesh-global ids for a compact cursor slice.
+        "vertex_id_space": geometry.get("vertex_id_space"),
     }
+    geometry_count = int(geometry.get("count", len(geometry.get("hidden", ()))))
+    physical_degree = np.asarray(
+        geometry.get("physical_degree", ()), dtype=np.int32
+    ).reshape(-1)
+    full_edge_counts = np.asarray(
+        geometry.get("face_edge_counts", ()), dtype=np.int32
+    ).reshape(-1)
+    source_hard = np.asarray(
+        geometry.get("source_hard", ()), dtype=bool
+    ).reshape(-1)
+    if len(physical_degree) == geometry_count and len(full_edge_counts) == geometry_count:
+        local["physical_degree"] = physical_degree[face_ids].copy()
+        if len(source_hard) != geometry_count:
+            source_hard = (
+                geometry["hidden"]
+                | (physical_degree < full_edge_counts)
+            )
+    if len(source_hard) == geometry_count:
+        local["source_hard"] = source_hard[face_ids].copy()
     count = local["count"]
     local["scale"] = (
         np.bincount(first, weights=pair_lengths, minlength=count)
@@ -9596,8 +11924,31 @@ def _fill_preview_local_geometry(geometry, face_ids):
         distance = np.maximum(np.linalg.norm(delta, axis=1), 1.0e-20)
         direction = delta / distance[:, None]
         signed_turn = np.mean(shade_delta * (direction @ lights.T), axis=1)
-        local_scale = max(float(np.median(pair_lengths)), 1.0e-12)
-        normalized_turn = -signed_turn / np.maximum(pair_lengths / local_scale, 1.0e-12)
+        if bool(strict_mode):
+            # Preserve the conservative Ctrl+E geometry path byte-for-byte
+            # in its feature normalization; only ordinary E uses the
+            # candidate-size-independent local normalization below.
+            local_scale = max(float(np.median(pair_lengths)), 1.0e-12)
+            normalized_turn = -signed_turn / np.maximum(
+                pair_lengths / local_scale, 1.0e-12
+            )
+        else:
+            # Normalize each edge against its incident physical edge scale. A
+            # larger wheel stage therefore cannot change the same local valley
+            # by changing the median of a much wider candidate patch.
+            face_degree = np.bincount(first, minlength=count) + np.bincount(
+                second, minlength=count
+            )
+            face_edge_scale = (
+                np.bincount(first, weights=pair_lengths, minlength=count)
+                + np.bincount(second, weights=pair_lengths, minlength=count)
+            ) / np.maximum(face_degree, 1)
+            pair_edge_scale = 0.5 * (
+                face_edge_scale[first] + face_edge_scale[second]
+            )
+            normalized_turn = -signed_turn / np.maximum(
+                pair_lengths / np.maximum(pair_edge_scale, 1.0e-12), 1.0e-12
+            )
         face_valley = np.zeros(count, dtype=np.float64)
         np.maximum.at(face_valley, first, np.maximum(normalized_turn, 0.0))
         np.maximum.at(face_valley, second, np.maximum(normalized_turn, 0.0))
@@ -9608,13 +11959,21 @@ def _fill_preview_local_geometry(geometry, face_ids):
                 + np.bincount(first, weights=face_valley[second], minlength=count)
                 + np.bincount(second, weights=face_valley[first], minlength=count)
             ) / np.maximum(degree + 1, 1)
-        robust_center = float(np.median(face_valley))
-        robust_mad = float(np.median(np.abs(face_valley - robust_center)))
-        valley_threshold = max(0.025, robust_center + 2.0 * robust_mad)
-        normalized_face_valley = np.maximum(
-            face_valley / max(valley_threshold, 1.0e-12) * 0.10,
-            0.0,
-        )
+        if bool(strict_mode):
+            robust_center = float(np.median(face_valley))
+            robust_mad = float(np.median(np.abs(face_valley - robust_center)))
+            valley_threshold = max(0.025, robust_center + 2.0 * robust_mad)
+            normalized_face_valley = np.maximum(
+                face_valley / max(valley_threshold, 1.0e-12) * 0.10,
+                0.0,
+            )
+        else:
+            # Keep the scalar's physical meaning fixed. Robust local
+            # hysteresis is applied later by the grayscale edge window; this
+            # stage must not recompute a candidate-wide baseline that changes
+            # with radius.
+            valley_threshold = 0.025
+            normalized_face_valley = np.maximum(face_valley * 0.10, 0.0)
         edge_valley = np.maximum(
             normalized_face_valley[first], normalized_face_valley[second]
         )
@@ -9680,9 +12039,156 @@ def _fill_preview_region(local, seed_local, strict_mode):
     """Run the production partition semantics on one local patch."""
     import numpy as np
 
-    partition = _fill_partition(local, strict_mode)
-    core, owner = partition["core"], partition["owner"]
     seed_local = int(seed_local)
+    working_local = local
+    face_set_values = np.asarray(
+        local.get("face_set_values", ()), dtype=np.int32
+    ).reshape(-1)
+    face_set_seed_id = int(local.get("face_set_seed_id", -1))
+    prior_enabled = bool(local.get("face_set_prior_enabled", False))
+    trusted_same_set = np.zeros(int(local["count"]), dtype=bool)
+    relaxed_pair_count = 0
+    neutral_crossing_count = 0
+    compact_cut_relaxed_faces = 0
+    source_hard_faces = 0
+    prior_safety_reason = "disabled"
+    prior_reason = "disabled"
+    if (
+        prior_enabled
+        and face_set_seed_id >= 0
+        and len(face_set_values) == int(local["count"])
+        and 0 <= seed_local < int(local["count"])
+    ):
+        count = int(local["count"])
+        offsets = np.asarray(local["offsets"], dtype=np.int64).reshape(-1)
+        neighbors = np.asarray(local["neighbors"], dtype=np.int32).reshape(-1)
+        hidden = np.asarray(
+            local.get("hidden", np.zeros(count, dtype=bool)), dtype=bool
+        ).reshape(-1)
+        degree = np.diff(offsets) if len(offsets) == count + 1 else np.zeros(0, dtype=np.int32)
+        edge_counts = np.asarray(
+            local.get("face_edge_counts", degree), dtype=np.int32
+        ).reshape(-1)
+        source_hard = np.asarray(
+            local.get("source_hard", ()), dtype=bool
+        ).reshape(-1)
+        if (
+            len(hidden) == count
+            and len(edge_counts) == count
+            and len(degree) == count
+            and int(offsets[-1]) == len(neighbors)
+        ):
+            if len(source_hard) == count:
+                # ``degree`` belongs to the compact analysis slice and may
+                # be smaller solely because its neighboring faces were
+                # cropped.  Only the full-geometry source_hard mask can mark
+                # a true open/non-manifold/hidden barrier.
+                hard = source_hard | hidden
+                source_hard_faces = int(np.count_nonzero(hard))
+                compact_cut_mask = (degree < edge_counts) & ~hard
+                same_id = face_set_values == face_set_seed_id
+                if same_id[seed_local] and not hard[seed_local]:
+                    trusted_same_set[seed_local] = True
+                    pending_same = deque([seed_local])
+                    while pending_same:
+                        face = int(pending_same.popleft())
+                        for neighbor in neighbors[int(offsets[face]) : int(offsets[face + 1])]:
+                            neighbor = int(neighbor)
+                            if (
+                                not trusted_same_set[neighbor]
+                                and same_id[neighbor]
+                                and not hard[neighbor]
+                            ):
+                                trusted_same_set[neighbor] = True
+                                pending_same.append(neighbor)
+                compact_cut_relaxed_faces = int(
+                    np.count_nonzero(trusted_same_set & compact_cut_mask)
+                )
+                prior_safety_reason = (
+                    "compact-cut-relaxed"
+                    if compact_cut_relaxed_faces
+                    else "full-geometry-source-hard"
+                )
+                first = np.asarray(local["first"], dtype=np.int32).reshape(-1)
+                second = np.asarray(local["second"], dtype=np.int32).reshape(-1)
+                safe_pair = ~hard[first] & ~hard[second]
+                if len(first) == len(second):
+                    relaxed_pair_count = int(
+                        np.count_nonzero(
+                            trusted_same_set[first]
+                            & trusted_same_set[second]
+                            & safe_pair
+                        )
+                    )
+                    neutral_crossing_count = int(
+                        np.count_nonzero(
+                            (face_set_values[first] != face_set_values[second])
+                            & safe_pair
+                        )
+                    )
+            else:
+                # No full-geometry safety metadata means the prior is
+                # disabled; never infer physical safety from compact degree.
+                hard = hidden
+                source_hard_faces = int(np.count_nonzero(hard))
+                prior_safety_reason = "source-hard-schema-missing"
+                prior_reason = "prior-physical-safety-schema"
+            # Apply only a geodesic/traversal bonus to the connected same-ID
+            # component.  Different IDs are deliberately untouched and can
+            # still be reached by the ordinary geometry resolver.
+            neighbor_lengths = np.asarray(
+                local.get("neighbor_lengths", np.ones(len(neighbors))),
+                dtype=np.float64,
+            ).reshape(-1)
+            contour_cost = np.asarray(
+                local.get("contour_cost", np.ones(len(neighbors))),
+                dtype=np.float64,
+            ).reshape(-1)
+            if (
+                len(source_hard) == count
+                and len(neighbor_lengths) == len(neighbors)
+                and len(contour_cost) == len(neighbors)
+            ):
+                adjusted_lengths = neighbor_lengths.copy()
+                adjusted_contour = contour_cost.copy()
+                for face in range(count):
+                    if not trusted_same_set[face]:
+                        continue
+                    for edge_position in range(int(offsets[face]), int(offsets[face + 1])):
+                        neighbor = int(neighbors[edge_position])
+                        if trusted_same_set[neighbor]:
+                            adjusted_lengths[edge_position] *= 0.5
+                            adjusted_contour[edge_position] *= 0.5
+                working_local = dict(local)
+                working_local["neighbor_lengths"] = adjusted_lengths
+                working_local["contour_cost"] = adjusted_contour
+                working_local["partitions"] = {}
+                prior_reason = (
+                    "same-id-geodesic-discount"
+                    if relaxed_pair_count
+                    else "same-id-component-no-shared-pair"
+                )
+            else:
+                prior_reason = "prior-cost-schema"
+        else:
+            prior_reason = "prior-graph-schema"
+    elif prior_enabled:
+        prior_reason = "prior-attribute-schema"
+    partition = _fill_partition(working_local, strict_mode)
+    partition["face_set_prior_applied_reason"] = prior_reason
+    partition["face_set_relaxed_pair_count"] = int(relaxed_pair_count)
+    partition["face_set_reached_same_set_faces"] = int(
+        np.count_nonzero(trusted_same_set)
+    )
+    partition["face_set_different_id_neutral_crossing_count"] = int(
+        neutral_crossing_count
+    )
+    partition["face_set_compact_cut_relaxed_faces"] = int(
+        compact_cut_relaxed_faces
+    )
+    partition["face_set_source_hard_faces"] = int(source_hard_faces)
+    partition["face_set_prior_safety_reason"] = prior_safety_reason
+    core, owner = partition["core"], partition["owner"]
     root = int(owner[seed_local])
     if root == int(local["count"]):
         return np.asarray([seed_local], dtype=np.int32), partition
@@ -9698,12 +12204,12 @@ def _fill_preview_region(local, seed_local, strict_mode):
                 selected[neighbor] = True
                 pending.append(neighbor)
     region = selected[owner]
-    first, second = local["first"], local["second"]
+    first, second = working_local["first"], working_local["second"]
     relaxed = region.copy()
     editable = partition["band"] & ~partition["protected"] & (
-        owner < local["count"]
+        owner < working_local["count"]
     )
-    weights = local["contour_cost"]
+    weights = working_local["contour_cost"]
     for iteration in range(6):
         crossing = relaxed[first] != relaxed[second]
         fringe = np.unique(np.r_[first[crossing], second[crossing]])
@@ -9738,6 +12244,4403 @@ def _fill_preview_region(local, seed_local, strict_mode):
         if connected[seed_local]:
             region = connected
     return np.flatnonzero(region).astype(np.int32), partition
+
+
+def _fill_preview_face_set_initial_component(
+    geometry, distances, radius, seed_mesh_face, face_sets
+):
+    """Return the safe same-ID component from the unsliced preview graph.
+
+    ``_fill_preview_local_geometry`` intentionally drops faces outside the
+    current analysis slice.  Its compact degree is therefore not a physical
+    manifold test.  Initial Face Set prior traversal uses this wider graph
+    and its full physical-safety metadata before projecting back to the local
+    candidate.
+    """
+    import numpy as np
+
+    count = int(geometry.get("count", 0))
+    face_ids = np.asarray(
+        geometry.get("face_ids", np.arange(count, dtype=np.int32)),
+        dtype=np.int32,
+    ).reshape(-1)
+    if count <= 0 or len(face_ids) != count:
+        return np.empty(0, dtype=np.int32), np.empty(0, dtype=bool), "graph-schema"
+    face_sets = np.asarray(face_sets, dtype=np.int32).reshape(-1)
+    if (
+        len(face_sets) == 0
+        or np.any(face_ids < 0)
+        or np.any(face_ids >= len(face_sets))
+    ):
+        return np.empty(0, dtype=np.int32), np.empty(0, dtype=bool), "face-set-schema"
+    offsets = np.asarray(geometry.get("offsets", ()), dtype=np.int64).reshape(-1)
+    neighbors = np.asarray(geometry.get("neighbors", ()), dtype=np.int32).reshape(-1)
+    hidden = np.asarray(
+        geometry.get("hidden", np.zeros(count, dtype=bool)), dtype=bool
+    ).reshape(-1)
+    edge_counts = np.asarray(
+        geometry.get("face_edge_counts", ()), dtype=np.int32
+    ).reshape(-1)
+    physical_degree = np.asarray(
+        geometry.get("physical_degree", ()), dtype=np.int32
+    ).reshape(-1)
+    source_hard = np.asarray(
+        geometry.get("source_hard", ()), dtype=bool
+    ).reshape(-1)
+    if len(source_hard) != count:
+        if len(physical_degree) != count or len(edge_counts) != count:
+            return np.empty(0, dtype=np.int32), np.empty(0, dtype=bool), "source-hard-schema"
+        source_hard = hidden | (physical_degree < edge_counts)
+    if len(hidden) != count or len(offsets) != count + 1 or int(offsets[-1]) != len(neighbors):
+        return np.empty(0, dtype=np.int32), source_hard, "graph-schema"
+    distances = np.asarray(distances, dtype=np.float64).reshape(-1)
+    if len(distances) != count:
+        return np.empty(0, dtype=np.int32), source_hard, "distance-schema"
+    seed_rows = np.flatnonzero(face_ids == int(seed_mesh_face))
+    if len(seed_rows) != 1:
+        return np.empty(0, dtype=np.int32), source_hard, "seed-schema"
+    seed = int(seed_rows[0])
+    values = face_sets[face_ids]
+    target_id = int(face_sets[int(seed_mesh_face)])
+    limit = float(radius) + max(float(radius) * 1.0e-8, 1.0e-9)
+    eligible = (~source_hard) & np.isfinite(distances) & (distances <= limit)
+    if not eligible[seed] or int(values[seed]) != target_id:
+        return np.empty(0, dtype=np.int32), source_hard, "seed-not-eligible"
+    reached = np.zeros(count, dtype=bool)
+    reached[seed] = True
+    pending = deque([seed])
+    while pending:
+        face = int(pending.popleft())
+        for neighbor in neighbors[int(offsets[face]) : int(offsets[face + 1])]:
+            neighbor = int(neighbor)
+            if (
+                not reached[neighbor]
+                and eligible[neighbor]
+                and int(values[neighbor]) == target_id
+            ):
+                reached[neighbor] = True
+                pending.append(neighbor)
+    return np.flatnonzero(reached).astype(np.int32), source_hard, "full-geometry-safe-component"
+
+
+def _fill_preview_preserve_initial_ids(
+    state, geometry, preview_local_ids, initial_phase, prior_enabled
+):
+    """Keep the accepted initial Face Set range as a monotonic floor.
+
+    The cache is stored in stable mesh-face-id space rather than compact
+    cursor-local indices.  Cursor halo growth can therefore reorder or add
+    local rows without allowing a later wheel result to remove an accepted
+    face.  This helper deliberately does not inspect Face Set values after
+    the initial phase; it only projects the already accepted ids.
+    """
+    import numpy as np
+
+    local_ids = np.unique(
+        np.asarray(preview_local_ids, dtype=np.int32).reshape(-1)
+    )
+    count = int(geometry.get("count", 0))
+    face_ids = np.asarray(
+        geometry.get("face_ids", np.arange(count, dtype=np.int32)),
+        dtype=np.int32,
+    ).reshape(-1)
+    hidden = np.asarray(
+        geometry.get("hidden", np.zeros(count, dtype=bool)), dtype=bool
+    ).reshape(-1)
+    if len(face_ids) != count:
+        face_ids = np.arange(count, dtype=np.int32)
+    if len(hidden) != count:
+        hidden = np.zeros(count, dtype=bool)
+    local_ids = local_ids[(local_ids >= 0) & (local_ids < count)]
+    local_ids = local_ids[~hidden[local_ids]]
+    metrics = {
+        "initial_base_count": 0,
+        "preserved_count": 0,
+        "prevented_removal_count": 0,
+        "monotonic_reason": "no-initial-cache",
+    }
+    if bool(initial_phase) and bool(prior_enabled):
+        stable_ids = np.unique(face_ids[local_ids]).astype(np.int32, copy=False)
+        state["initial_accepted_ids"] = stable_ids.copy()
+        state["initial_base_count"] = int(len(stable_ids))
+        metrics.update(
+            {
+                "initial_base_count": int(len(stable_ids)),
+                "preserved_count": int(len(stable_ids)),
+                "monotonic_reason": "initial-cache-created",
+            }
+        )
+        return local_ids.astype(np.int32, copy=False), metrics, local_ids
+
+    cached = np.asarray(
+        state.get("initial_accepted_ids", ()), dtype=np.int32
+    ).reshape(-1)
+    if len(cached) == 0:
+        return local_ids.astype(np.int32, copy=False), metrics, np.empty(0, dtype=np.int32)
+    cached_local = np.flatnonzero(
+        np.isin(face_ids, np.unique(cached)) & ~hidden
+    ).astype(np.int32)
+    before = np.unique(local_ids)
+    merged = np.unique(np.r_[before, cached_local]).astype(np.int32, copy=False)
+    prevented = int(len(np.setdiff1d(cached_local, before, assume_unique=True)))
+    metrics.update(
+        {
+            "initial_base_count": int(state.get("initial_base_count", len(cached))),
+            "preserved_count": int(len(cached_local)),
+            "prevented_removal_count": prevented,
+            "monotonic_reason": "initial-cache-preserved",
+        }
+    )
+    return merged, metrics, cached_local
+
+
+def _fill_preview_multi_source_metric_shell(
+    source_faces,
+    selected,
+    offsets,
+    neighbors,
+    distances,
+    radius,
+    hard,
+    protected,
+    max_shells=6,
+):
+    """Advance all safe boundary sources until a bounded cyan front exists."""
+    import numpy as np
+
+    selected = np.asarray(selected, dtype=bool).reshape(-1)
+    distances = np.asarray(distances, dtype=np.float64).reshape(-1)
+    hard = np.asarray(hard, dtype=bool).reshape(-1)
+    protected = np.asarray(protected, dtype=bool).reshape(-1)
+    offsets = np.asarray(offsets, dtype=np.int64).reshape(-1)
+    neighbors = np.asarray(neighbors, dtype=np.int32).reshape(-1)
+    count = len(selected)
+    if (
+        len(distances) != count
+        or len(hard) != count
+        or len(protected) != count
+        or len(offsets) != count + 1
+        or int(offsets[-1]) != len(neighbors)
+    ):
+        return set(), set(), 0, "shell-schema"
+    limit = float(radius) + max(float(radius) * 1.0e-8, 1.0e-9)
+    sources = {
+        int(face)
+        for face in source_faces
+        if 0 <= int(face) < count
+        and not selected[int(face)]
+        and not hard[int(face)]
+        and not protected[int(face)]
+        and np.isfinite(distances[int(face)])
+    }
+    if not sources:
+        return set(), set(), 0, "no-safe-boundary-source"
+    front = {face for face in sources if distances[face] > limit}
+    visited = set(sources)
+    frontier = set(sources)
+    shells = 0
+    for shell_index in range(1, max(int(max_shells), 1) + 1):
+        if front:
+            break
+        next_frontier = set()
+        for face in sorted(frontier):
+            for neighbor in neighbors[int(offsets[face]) : int(offsets[face + 1])]:
+                neighbor = int(neighbor)
+                if (
+                    neighbor < 0
+                    or neighbor >= count
+                    or neighbor in visited
+                    or selected[neighbor]
+                    or hard[neighbor]
+                    or protected[neighbor]
+                    or not np.isfinite(distances[neighbor])
+                ):
+                    continue
+                visited.add(neighbor)
+                next_frontier.add(neighbor)
+                if distances[neighbor] > limit:
+                    front.add(neighbor)
+        shells = shell_index
+        frontier = next_frontier
+    return front, sources, shells, "cyan-front-created" if front else "no-safe-front"
+
+
+def _fill_preview_analysis_shader_path():
+    """Resolve the bundled matcap without creating a material datablock."""
+    profile = _FILL_PREVIEW_ANALYSIS_SHADER_PROFILE
+    try:
+        import bpy
+        roots = (
+            bpy.utils.system_resource("DATAFILES"),
+            bpy.utils.resource_path("LOCAL"),
+            bpy.utils.resource_path("SYSTEM"),
+        )
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        roots = ()
+    for root in roots:
+        for filename in profile["matcap_candidates"]:
+            path = os.path.join(root, "studiolights", "matcap", filename)
+            if os.path.isfile(path):
+                return filename, path, True
+    return "", "", False
+
+
+def _fill_preview_shadow_screen_roi_radius(context):
+    """Return the fixed 320px experimental ROI radius.
+
+    The 3.2.85 experiment intentionally decouples the image context from the
+    sculpt brush size.  The crop is clipped only by the View3D edges, giving a
+    roughly 640x640 window (or smaller near a viewport edge) for repeatable
+    screen-space evaluation.
+    """
+    del context
+    return 320
+
+
+def _fill_preview_capture_shadow_signal(context, seed_screen=None):
+    """Capture a temporary, overlay-free viewport luminance line map.
+
+    This is deliberately best-effort.  Ordinary ``E`` may use the capture
+    only when the current View3D can render it; a failed capture is reported
+    to the preview as an explicit seed-only provisional.  The
+    strict Ctrl+E path never calls this function.
+    """
+    import numpy as np
+
+    result = {
+        "ok": False,
+        "reason": "capture-not-attempted",
+        "restore_verified": False,
+        "width": 0,
+        "height": 0,
+        "luminance": np.empty((0, 0), dtype=np.float32),
+        "depth": np.empty((0, 0), dtype=np.float32),
+        "depth_available": False,
+        "line_strength": np.empty((0, 0), dtype=np.float32),
+        "line_map": np.empty((0, 0), dtype=bool),
+        "view_projection": None,
+        "luminance_min": 0.0,
+        "luminance_max": 0.0,
+        "luminance_seed": 0.0,
+        "seed_screen": (0.0, 0.0),
+        "noise_scale": 0.0,
+        "line_pixel_count": 0,
+        "capture_size": (0, 0),
+        "analysis_shader_name": _FILL_PREVIEW_ANALYSIS_SHADER_PROFILE["name"],
+        "analysis_shader_profile_registered": False,
+        "analysis_shader_matcap": "",
+        "faceset_suppressed": False,
+        "mask_suppressed": False,
+        "shading_restore_verified": False,
+        "overlay_restore_verified": False,
+        "analysis_state_snapshot_count": 0,
+    }
+    offscreen = None
+    overlay = getattr(context.space_data, "overlay", None)
+    shading = getattr(context.space_data, "shading", None)
+    saved = {"overlay": {}, "shading": {}}
+    profile_errors = []
+    try:
+        region = context.region
+        space = context.space_data
+        region_3d = getattr(space, "region_3d", None)
+        width = int(getattr(region, "width", 0))
+        height = int(getattr(region, "height", 0))
+        if region_3d is None or width < 8 or height < 8:
+            result["reason"] = "invalid-view3d-region"
+            return result
+        result["width"], result["height"] = width, height
+        result["capture_size"] = (width, height)
+        overlay_properties = (
+            "show_overlays", "show_sculpt_face_sets",
+            "sculpt_mode_face_sets_opacity", "show_sculpt_mask",
+            "sculpt_mode_mask_opacity",
+        )
+        shading_properties = (
+            "type", "light", "studio_light", "use_world_space_lighting",
+            "use_studiolight_view_rotation", "studiolight_rotate_z", "intensity",
+            "color_type", "single_color", "show_shadows", "shadow_intensity",
+            "show_specular_highlight", "show_cavity", "cavity_type",
+            "curvature_ridge_factor", "curvature_valley_factor", "background_type",
+            "background_color", "background_strength", "show_xray",
+            "show_backface_culling",
+        )
+        for owner, properties in ((overlay, overlay_properties), (shading, shading_properties)):
+            if owner is None:
+                continue
+            target = saved["overlay" if owner is overlay else "shading"]
+            for prop_name in properties:
+                if not hasattr(owner, prop_name):
+                    continue
+                try:
+                    target[prop_name] = copy.deepcopy(getattr(owner, prop_name))
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    continue
+        result["analysis_state_snapshot_count"] = int(
+            len(saved["overlay"]) + len(saved["shading"])
+        )
+        matcap_name, matcap_path, profile_registered = _fill_preview_analysis_shader_path()
+        result["analysis_shader_matcap"] = matcap_name
+        result["analysis_shader_profile_registered"] = bool(profile_registered)
+        if not profile_registered:
+            result["reason"] = "analysis-shader-not-found"
+            return result
+        def apply_property(owner, prop_name, value):
+            if owner is None or not hasattr(owner, prop_name):
+                return False
+            try:
+                setattr(owner, prop_name, value)
+                return True
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                profile_errors.append(prop_name)
+                return False
+        # Hide all user-facing color overlays and masks during the temporary
+        # draw.  The values are restored in finally, including enum choices
+        # which may differ between Blender point releases.
+        overlay_ok = True
+        if overlay is not None:
+            overlay_ok &= apply_property(overlay, "show_overlays", False)
+            overlay_ok &= apply_property(overlay, "show_sculpt_face_sets", False)
+            overlay_ok &= apply_property(overlay, "sculpt_mode_face_sets_opacity", 0.0)
+            overlay_ok &= apply_property(overlay, "show_sculpt_mask", False)
+            overlay_ok &= apply_property(overlay, "sculpt_mode_mask_opacity", 0.0)
+        result["faceset_suppressed"] = bool(overlay_ok)
+        result["mask_suppressed"] = bool(overlay_ok)
+        profile_ok = True
+        if shading is not None:
+            profile_ok &= apply_property(shading, "type", "SOLID")
+            profile_ok &= apply_property(shading, "light", "MATCAP")
+            profile_ok &= apply_property(shading, "studio_light", matcap_name)
+            profile_ok &= apply_property(shading, "color_type", "SINGLE")
+            profile_ok &= apply_property(shading, "single_color", (0.72, 0.72, 0.72))
+            profile_ok &= apply_property(shading, "show_specular_highlight", False)
+            profile_ok &= apply_property(shading, "show_shadows", False)
+            profile_ok &= apply_property(shading, "show_cavity", False)
+        if profile_errors or not profile_ok or not overlay_ok:
+            result["reason"] = "analysis-profile-apply-failed"
+            return result
+        from gpu.types import GPUOffScreen
+        offscreen = GPUOffScreen(width, height)
+        view_matrix = region_3d.view_matrix.copy()
+        projection_matrix = region_3d.window_matrix.copy()
+        offscreen.draw_view3d(
+            context.scene,
+            context.view_layer,
+            space,
+            region,
+            view_matrix,
+            projection_matrix,
+            do_color_management=False,
+            draw_background=True,
+        )
+        offscreen.bind()
+        try:
+            color_buffer = offscreen.read_color(0, 0, width, height, 4, 0, "UBYTE")
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            color_buffer = gpu.state.active_framebuffer_get().read_color(
+                0, 0, width, height, 4, 0, "UBYTE"
+            )
+        try:
+            raw_color = np.frombuffer(bytes(color_buffer), dtype=np.uint8)
+        except (TypeError, ValueError):
+            raw_color = np.asarray(color_buffer.to_list(), dtype=np.uint8)
+        expected = width * height * 4
+        if raw_color.size < expected:
+            raise RuntimeError("color-readback-short")
+        rgba = raw_color[:expected].reshape((height, width, 4)).astype(np.float32) / 255.0
+        depth = np.empty((0, 0), dtype=np.float32)
+        try:
+            depth_buffer = offscreen.read_depth(0, 0, width, height)
+            raw_depth = np.frombuffer(bytes(depth_buffer), dtype=np.float32)
+            if raw_depth.size >= width * height:
+                depth = raw_depth[: width * height].reshape((height, width))
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            depth = np.empty((0, 0), dtype=np.float32)
+        luminance = (
+            0.2126 * rgba[..., 0]
+            + 0.7152 * rgba[..., 1]
+            + 0.0722 * rgba[..., 2]
+        )
+        # Ordinary E performs denoise, gradient hysteresis, and Closing only
+        # inside the bounded cursor ROI.  Keep these legacy fields empty so a
+        # future caller cannot accidentally interpret a full-viewport edge
+        # map as the normal classifier's input.
+        line_strength = np.empty((0, 0), dtype=np.float32)
+        line_map = np.empty((0, 0), dtype=bool)
+        noise = 0.0
+        seed_x, seed_y = width // 2, height // 2
+        if seed_screen is not None:
+            try:
+                seed_x = int(round(float(seed_screen[0])))
+                seed_y = int(round(float(seed_screen[1])))
+            except (IndexError, TypeError, ValueError):
+                try:
+                    seed_x = int(round(float(seed_screen.x)))
+                    seed_y = int(round(float(seed_screen.y)))
+                except (AttributeError, TypeError, ValueError):
+                    seed_x, seed_y = width // 2, height // 2
+        seed_x = max(0, min(width - 1, seed_x))
+        seed_y = max(0, min(height - 1, seed_y))
+        result.update(
+            {
+                "ok": True,
+                "reason": "ok",
+                "luminance": luminance.astype(np.float32, copy=False),
+                "depth": depth,
+                "depth_available": bool(depth.shape == (height, width)),
+                "line_strength": line_strength,
+                "line_map": line_map,
+                "view_projection": np.asarray(
+                    region_3d.perspective_matrix, dtype=np.float64
+                ),
+                "luminance_min": float(np.min(luminance)),
+                "luminance_max": float(np.max(luminance)),
+                "luminance_seed": float(luminance[seed_y, seed_x]),
+                "seed_screen": (int(seed_x), int(seed_y)),
+                # Full-viewport gradient noise is intentionally not computed
+                # in the ROI design.  ``noise`` is the remaining capture
+                # noise estimate; the ROI helper records its own gradient
+                # MAD, so no stale ``gradient_noise`` local belongs here.
+                "noise_scale": float(noise),
+                "line_pixel_count": 0,
+            }
+        )
+    except (AttributeError, ImportError, MemoryError, RuntimeError, TypeError, ValueError):
+        result["reason"] = "offscreen-readback-failed"
+    finally:
+        try:
+            if offscreen is not None:
+                offscreen.unbind()
+        except (AttributeError, RuntimeError):
+            pass
+        try:
+            if offscreen is not None:
+                offscreen.free()
+        except (AttributeError, RuntimeError):
+            pass
+        overlay_restore_ok = True
+        shading_restore_ok = True
+        for owner, key in ((overlay, "overlay"), (shading, "shading")):
+            values = saved.get(key, {})
+            if owner is None:
+                continue
+            for prop_name, value in values.items():
+                try:
+                    setattr(owner, prop_name, value)
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    if key == "overlay":
+                        overlay_restore_ok = False
+                    else:
+                        shading_restore_ok = False
+        result["overlay_restore_verified"] = bool(overlay_restore_ok)
+        result["shading_restore_verified"] = bool(shading_restore_ok)
+        result["restore_verified"] = bool(overlay_restore_ok and shading_restore_ok)
+        if result["ok"] and not result["restore_verified"]:
+            result["ok"] = False
+            result["reason"] = "viewport-state-restore-failed"
+    return result
+
+
+def _fill_preview_visible_analysis_profile(context):
+    """Apply the manually toggled analysis look to the visible View3D.
+
+    This helper is intentionally independent from normal E.  It is a viewing
+    utility only: toon_dark is shown together with semi-transparent Face Set
+    colors and mesh wire overlay.  No material/datablock is touched; the exact
+    SpaceView3D values are retained in the returned token and restoration is
+    idempotent.
+    """
+    space = getattr(context, "space_data", None)
+    overlay = getattr(space, "overlay", None)
+    shading = getattr(space, "shading", None)
+    token = {
+        "active": False,
+        "applied": False,
+        "restore_verified": False,
+        "space": space,
+        "overlay": overlay,
+        "shading": shading,
+        "saved": {"overlay": {}, "shading": {}},
+        "analysis_shader_name": _FILL_PREVIEW_ANALYSIS_SHADER_PROFILE["name"],
+        "analysis_shader_matcap": "",
+        "reason": "not-attempted",
+    }
+    if space is None or (overlay is None and shading is None):
+        token["reason"] = "view3d-state-unavailable"
+        return token
+    matcap_name, _matcap_path, profile_registered = _fill_preview_analysis_shader_path()
+    token["analysis_shader_matcap"] = matcap_name
+    if not profile_registered:
+        token["reason"] = "analysis-shader-not-found"
+        return token
+    overlay_properties = (
+        "show_overlays", "show_sculpt_face_sets",
+        "sculpt_mode_face_sets_opacity", "show_sculpt_mask",
+        "sculpt_mode_mask_opacity",
+        "show_wireframes", "wireframe_threshold",
+    )
+    shading_properties = (
+        "type", "light", "studio_light", "use_world_space_lighting",
+        "use_studiolight_view_rotation", "studiolight_rotate_z", "intensity",
+        "color_type", "single_color", "show_shadows", "shadow_intensity",
+        "show_specular_highlight", "show_cavity", "cavity_type",
+        "curvature_ridge_factor", "curvature_valley_factor", "background_type",
+        "background_color", "background_strength", "show_xray",
+        "show_backface_culling",
+    )
+    for owner, properties, key in (
+        (overlay, overlay_properties, "overlay"),
+        (shading, shading_properties, "shading"),
+    ):
+        if owner is None:
+            continue
+        for prop_name in properties:
+            if not hasattr(owner, prop_name):
+                continue
+            try:
+                token["saved"][key][prop_name] = copy.deepcopy(getattr(owner, prop_name))
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                pass
+    errors = []
+    def apply(owner, name, value):
+        if owner is None or not hasattr(owner, name):
+            return True
+        try:
+            setattr(owner, name, value)
+            return True
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            errors.append(name)
+            return False
+    # Keep the overlay pass visible for the custom orange/cyan draw handler.
+    # Manual analysis deliberately retains Face Set colors at a readable,
+    # semi-transparent opacity and enables wireframes when Blender exposes
+    # those overlay properties.
+    if overlay is not None:
+        apply(overlay, "show_overlays", True)
+        apply(overlay, "show_sculpt_face_sets", True)
+        apply(overlay, "sculpt_mode_face_sets_opacity", 0.45)
+        apply(overlay, "show_sculpt_mask", False)
+        apply(overlay, "sculpt_mode_mask_opacity", 0.0)
+        apply(overlay, "show_wireframes", True)
+        apply(overlay, "wireframe_threshold", 0.5)
+    if shading is not None:
+        apply(shading, "type", "SOLID")
+        apply(shading, "light", "MATCAP")
+        apply(shading, "studio_light", matcap_name)
+        apply(shading, "color_type", "SINGLE")
+        apply(shading, "single_color", (0.72, 0.72, 0.72))
+        apply(shading, "show_specular_highlight", False)
+        apply(shading, "show_shadows", False)
+        apply(shading, "show_cavity", False)
+    if errors:
+        token["reason"] = "analysis-profile-apply-failed"
+        _fill_preview_restore_visible_analysis_profile(token)
+        return token
+    token["active"] = True
+    token["applied"] = True
+    token["reason"] = "visible-analysis-profile-active"
+    try:
+        _tag_redraw(getattr(context, "area", None))
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        pass
+    return token
+
+
+def _fill_preview_restore_visible_analysis_profile(token):
+    """Restore a visible analysis profile exactly once and report success."""
+    if not isinstance(token, dict):
+        return False
+    if token.get("restore_verified"):
+        return True
+    saved = token.get("saved", {})
+    ok = True
+    for owner, key in (
+        (token.get("overlay"), "overlay"),
+        (token.get("shading"), "shading"),
+    ):
+        if owner is None:
+            continue
+        for prop_name, value in saved.get(key, {}).items():
+            try:
+                setattr(owner, prop_name, value)
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                ok = False
+    token["active"] = False
+    token["restore_verified"] = bool(ok)
+    if not ok:
+        token["reason"] = "visible-analysis-restore-failed"
+    return bool(ok)
+
+
+def _fill_preview_shadow_view_key(context):
+    """Return the current View3D identity without retaining a dead area."""
+    try:
+        space = getattr(context, "space_data", None)
+        return int(space.as_pointer()) if space is not None else 0
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return 0
+
+
+def _fill_preview_restore_manual_analysis_profiles():
+    """Restore and clear all manually toggled View3D analysis profiles."""
+    global _shadow_analysis_view_tokens
+    tokens = list(_shadow_analysis_view_tokens.values())
+    _shadow_analysis_view_tokens.clear()
+    for token in tokens:
+        try:
+            _fill_preview_restore_visible_analysis_profile(token)
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            if isinstance(token, dict):
+                token["restore_verified"] = False
+
+
+class VIEW3D_OT_mesh_focus_shadow_analysis_toggle(bpy.types.Operator):
+    """Toggle the toon_dark + Face Set + wire analysis look in this View3D."""
+
+    bl_idname = "view3d.mesh_focus_shadow_analysis_toggle"
+    bl_label = "Mesh Focus: Toggle Shadow Analysis View"
+    bl_description = (
+        "Show toon_dark with Face Sets and wire overlay, or restore this View3D"
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return (
+            context.area is not None
+            and context.area.type == "VIEW_3D"
+            and context.space_data is not None
+            and context.mode == "SCULPT"
+        )
+
+    def execute(self, context):
+        global _shadow_analysis_view_tokens
+        if not self.poll(context):
+            return {"CANCELLED"}
+        key = _fill_preview_shadow_view_key(context)
+        if not key:
+            self.report({"WARNING"}, "Shadow analysis view: no View3D space")
+            return {"CANCELLED"}
+        token = _shadow_analysis_view_tokens.get(key)
+        if isinstance(token, dict) and token.get("active"):
+            restored = _fill_preview_restore_visible_analysis_profile(token)
+            _shadow_analysis_view_tokens.pop(key, None)
+            if restored:
+                self.report(
+                    {"INFO"},
+                    "Analysis View: OFF (restored; Shift+Alt+E to enable)",
+                )
+                _tag_redraw(context.area)
+                return {"FINISHED"}
+            self.report({"WARNING"}, "Shadow analysis view: restore failed")
+            return {"CANCELLED"}
+        token = _fill_preview_visible_analysis_profile(context)
+        if not token.get("applied"):
+            self.report(
+                {"WARNING"},
+                "Shadow analysis view: " + str(token.get("reason", "apply failed")),
+            )
+            return {"CANCELLED"}
+        token["manual"] = True
+        _shadow_analysis_view_tokens[key] = token
+        self.report(
+            {"INFO"},
+            "Analysis View: toon_dark + Face Sets + Wire ON "
+            "(Shift+Alt+E to restore)",
+        )
+        return {"FINISHED"}
+
+
+def _fill_preview_shadow_pair_signal(state, local, pair_index, with_reason=False):
+    """Sample the captured screen-space shadow line at one physical edge."""
+    import numpy as np
+
+    capture = state.get("shadow_capture")
+    if not isinstance(capture, dict) or not capture.get("ok"):
+        value = (0.0, 0, "capture-unavailable")
+        return value if with_reason else value[:2]
+    line_strength = np.asarray(capture.get("line_strength", ()), dtype=np.float32)
+    line_map = np.asarray(capture.get("line_map", ()), dtype=bool)
+    projection = np.asarray(capture.get("view_projection"), dtype=np.float64)
+    if (
+        line_strength.ndim != 2 or line_map.shape != line_strength.shape
+        or projection.shape != (4, 4)
+    ):
+        value = (0.0, 0, "capture-schema")
+        return value if with_reason else value[:2]
+    try:
+        pair_index = int(pair_index)
+        vertices = np.asarray(local["world_vertices"], dtype=np.float64)
+        v0 = int(local["pair_v0"][pair_index])
+        v1 = int(local["pair_v1"][pair_index])
+        if local.get("vertex_id_space") == "mesh-global":
+            mesh = state["obj"].data
+            matrix = state["obj"].matrix_world
+            a = np.asarray(matrix @ mesh.vertices[v0].co, dtype=np.float64)
+            b = np.asarray(matrix @ mesh.vertices[v1].co, dtype=np.float64)
+        else:
+            a = vertices[v0]
+            b = vertices[v1]
+        if a.shape != (3,) or b.shape != (3,):
+            value = (0.0, 0, "endpoint-schema")
+            return value if with_reason else value[:2]
+        samples = []
+        projected_samples = 0
+        for fraction in (0.25, 0.5, 0.75):
+            point = a * (1.0 - fraction) + b * fraction
+            clip = projection @ np.r_[point, 1.0]
+            if not np.all(np.isfinite(clip)) or abs(float(clip[3])) <= 1.0e-12:
+                continue
+            ndc = clip[:3] / float(clip[3])
+            x = int(round((float(ndc[0]) * 0.5 + 0.5) * (line_strength.shape[1] - 1)))
+            y = int(round((float(ndc[1]) * 0.5 + 0.5) * (line_strength.shape[0] - 1)))
+            if 1 <= x < line_strength.shape[1] - 1 and 1 <= y < line_strength.shape[0] - 1:
+                projected_samples += 1
+                crop = line_strength[y - 1:y + 2, x - 1:x + 2]
+                mask = line_map[y - 1:y + 2, x - 1:x + 2]
+                if np.any(mask):
+                    samples.append(float(np.max(crop[mask])))
+        if projected_samples == 0:
+            value = (0.0, 0, "projection-no-sample")
+            return value if with_reason else value[:2]
+        if not samples:
+            value = (0.0, projected_samples, "line-not-hit")
+            return value if with_reason else value[:2]
+        value = (float(max(samples)), projected_samples, "line-hit")
+        return value if with_reason else value[:2]
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError, ZeroDivisionError):
+        value = (0.0, 0, "endpoint-schema")
+        return value if with_reason else value[:2]
+
+
+def _fill_preview_shadow_edge_key(local, pair_index):
+    """Return a direction-independent physical-edge cache key."""
+    import numpy as np
+
+    try:
+        pair_index = int(pair_index)
+        edge_ids = np.asarray(local.get("pair_edge_indices", ()), dtype=np.int64).reshape(-1)
+        if 0 <= pair_index < len(edge_ids) and int(edge_ids[pair_index]) >= 0:
+            return ("edge", int(edge_ids[pair_index]))
+        v0 = np.asarray(local.get("pair_v0", ()), dtype=np.int64).reshape(-1)
+        v1 = np.asarray(local.get("pair_v1", ()), dtype=np.int64).reshape(-1)
+        if 0 <= pair_index < len(v0) and 0 <= pair_index < len(v1):
+            return ("vertices", min(int(v0[pair_index]), int(v1[pair_index])), max(int(v0[pair_index]), int(v1[pair_index])))
+    except (AttributeError, IndexError, TypeError, ValueError):
+        pass
+    return None
+
+
+def _fill_preview_shadow_pair_cached_signal(state, local, pair_index):
+    """Read one cached physical-edge signal, with a safe uncached fallback."""
+    cache = state.get("shadow_edge_cache")
+    key = _fill_preview_shadow_edge_key(local, pair_index)
+    if isinstance(cache, dict) and key is not None:
+        values = cache.get("edges", {}).get(key)
+        if isinstance(values, dict):
+            return float(values.get("signal", 0.0)), int(values.get("tested", 0)), str(values.get("reason", "cached"))
+    return _fill_preview_shadow_pair_signal(state, local, pair_index, with_reason=True)
+
+
+def _fill_preview_shadow_edge_cache(state, geometry):
+    """Build/update an immutable-per-invoke physical-edge shadow map."""
+    import numpy as np
+
+    cache = state.get("shadow_edge_cache")
+    if not isinstance(cache, dict) or cache.get("generation") != state.get("shadow_capture_generation"):
+        cache = {
+            "generation": int(state.get("shadow_capture_generation", 0)),
+            "edges": {},
+            "total_pairs": 0,
+            "tested": 0,
+            "skipped_hard": 0,
+            "invalid_endpoint": 0,
+            "projection_no_sample": 0,
+            "line_no_hit": 0,
+        }
+    first = np.asarray(geometry.get("first", ()), dtype=np.int32).reshape(-1)
+    second = np.asarray(geometry.get("second", ()), dtype=np.int32).reshape(-1)
+    hidden = np.asarray(geometry.get("hidden", np.zeros(int(geometry.get("count", 0)), dtype=bool)), dtype=bool).reshape(-1)
+    source_hard = np.asarray(geometry.get("source_hard", np.zeros(len(hidden), dtype=bool)), dtype=bool).reshape(-1)
+    if len(source_hard) != len(hidden):
+        source_hard = np.zeros(len(hidden), dtype=bool)
+    for pair_index in range(min(len(first), len(second))):
+        key = _fill_preview_shadow_edge_key(geometry, pair_index)
+        if key is None or key in cache["edges"]:
+            continue
+        left, right = int(first[pair_index]), int(second[pair_index])
+        cache["total_pairs"] += 1
+        if (
+            left < 0 or right < 0 or left >= len(hidden) or right >= len(hidden)
+            or hidden[left] or hidden[right] or source_hard[left] or source_hard[right]
+        ):
+            cache["skipped_hard"] += 1
+            cache["edges"][key] = {"signal": 0.0, "tested": 0, "reason": "hard-safety"}
+            continue
+        signal, tested, reason = _fill_preview_shadow_pair_signal(state, geometry, pair_index, with_reason=True)
+        cache["tested"] += int(tested > 0)
+        if reason == "projection-no-sample":
+            cache["projection_no_sample"] += 1
+        elif reason in {"endpoint-schema", "capture-schema"}:
+            cache["invalid_endpoint"] += 1
+        elif reason == "line-not-hit":
+            cache["line_no_hit"] += 1
+        cache["edges"][key] = {"signal": float(signal), "tested": int(tested), "reason": reason}
+    state["shadow_edge_cache"] = cache
+    return cache
+
+
+def _fill_preview_shadow_face_key(geometry, face_index):
+    """Return a stable mesh-face key for one cursor/local geometry face."""
+    try:
+        face_ids = geometry.get("face_ids")
+        if face_ids is not None:
+            value = int(face_ids[int(face_index)])
+        else:
+            value = int(face_index)
+        return ("face", value)
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return None
+
+
+def _fill_preview_shadow_face_luminance_cache(state, geometry):
+    """Sample neutral viewport luminance at every source face once per invoke.
+
+    The cache deliberately stores face samples rather than screen edge hits.
+    A wheel stage can therefore reuse the same lighting observation while the
+    graph radius changes, and two neighbouring faces with a shared edge still
+    receive independent near/far values.
+    """
+    import numpy as np
+
+    capture = state.get("shadow_capture")
+    generation = int(state.get("shadow_capture_generation", 0))
+    cached = state.get("shadow_face_luminance_cache")
+    if (
+        isinstance(cached, dict)
+        and cached.get("generation") == generation
+        and cached.get("geometry_signature") == geometry.get("signature")
+    ):
+        return cached
+    cache = {
+        "generation": generation,
+        "geometry_signature": geometry.get("signature"),
+        "values": {},
+        "sampled": 0,
+        "visible": 0,
+        "unsampled": 0,
+        "patch_radius": 1,
+    }
+    if not isinstance(capture, dict) or not capture.get("ok"):
+        state["shadow_face_luminance_cache"] = cache
+        return cache
+    luminance = np.asarray(capture.get("luminance", ()), dtype=np.float32)
+    projection = np.asarray(capture.get("view_projection"), dtype=np.float64)
+    centers = np.asarray(geometry.get("centers", ()), dtype=np.float64)
+    count = int(geometry.get("count", len(centers)))
+    if luminance.ndim != 2 or projection.shape != (4, 4) or len(centers) < count:
+        state["shadow_face_luminance_cache"] = cache
+        return cache
+    height, width = luminance.shape
+    radius = int(cache["patch_radius"])
+    for face_index in range(count):
+        key = _fill_preview_shadow_face_key(geometry, face_index)
+        if key is None:
+            cache["unsampled"] += 1
+            continue
+        try:
+            clip = projection @ np.r_[centers[face_index], 1.0]
+            if not np.all(np.isfinite(clip)) or abs(float(clip[3])) <= 1.0e-12:
+                cache["values"][key] = {
+                    "luminance": None, "sampled": False, "reason": "projection-invalid"
+                }
+                cache["unsampled"] += 1
+                continue
+            ndc = clip[:3] / float(clip[3])
+            if not np.all(np.isfinite(ndc)):
+                raise ValueError("projection-invalid")
+            x = int(round((float(ndc[0]) * 0.5 + 0.5) * (width - 1)))
+            y = int(round((float(ndc[1]) * 0.5 + 0.5) * (height - 1)))
+            if x < 0 or x >= width or y < 0 or y >= height:
+                cache["values"][key] = {
+                    "luminance": None, "sampled": False, "reason": "outside-capture"
+                }
+                cache["unsampled"] += 1
+                continue
+            x0, x1 = max(0, x - radius), min(width, x + radius + 1)
+            y0, y1 = max(0, y - radius), min(height, y + radius + 1)
+            patch = np.asarray(luminance[y0:y1, x0:x1], dtype=np.float64).reshape(-1)
+            patch = patch[np.isfinite(patch)]
+            if len(patch) == 0:
+                raise ValueError("empty-luminance-patch")
+            value = float(np.median(patch))
+            cache["values"][key] = {
+                "luminance": value, "sampled": True, "reason": "face-patch-median"
+            }
+            cache["sampled"] += 1
+            cache["visible"] += 1
+        except (IndexError, TypeError, ValueError, ZeroDivisionError):
+            cache["values"][key] = {
+                "luminance": None, "sampled": False, "reason": "face-sample-failed"
+            }
+            cache["unsampled"] += 1
+    # Remove triangle/cavity speckle before any edge subtraction.  This is a
+    # fixed physical one-ring median on the source graph (not a candidate-size
+    # filter), so a later radius cannot change a face's observed luminance.
+    raw_by_face = np.full(count, np.nan, dtype=np.float64)
+    for face_index in range(count):
+        key = _fill_preview_shadow_face_key(geometry, face_index)
+        entry = cache["values"].get(key, {}) if key is not None else {}
+        try:
+            value = float(entry.get("luminance"))
+        except (AttributeError, TypeError, ValueError):
+            value = float("nan")
+        if np.isfinite(value):
+            raw_by_face[face_index] = value
+    offsets = np.asarray(geometry.get("offsets", ()), dtype=np.int64).reshape(-1)
+    neighbors = np.asarray(geometry.get("neighbors", ()), dtype=np.int32).reshape(-1)
+    smoothed_by_face = np.array(raw_by_face, copy=True)
+    if len(offsets) == count + 1 and int(offsets[-1]) <= len(neighbors):
+        for face_index in range(count):
+            ring_ids = np.r_[
+                np.asarray([face_index], dtype=np.int32),
+                neighbors[int(offsets[face_index]):int(offsets[face_index + 1])],
+            ]
+            ring_values = raw_by_face[ring_ids]
+            ring_values = ring_values[np.isfinite(ring_values)]
+            if len(ring_values):
+                smoothed_by_face[face_index] = float(np.median(ring_values))
+    for face_index in range(count):
+        key = _fill_preview_shadow_face_key(geometry, face_index)
+        if key is None or key not in cache["values"]:
+            continue
+        entry = cache["values"][key]
+        if np.isfinite(smoothed_by_face[face_index]):
+            entry["smoothed_luminance"] = float(smoothed_by_face[face_index])
+        else:
+            entry["smoothed_luminance"] = None
+    cache["smoothed_count"] = int(np.count_nonzero(np.isfinite(smoothed_by_face)))
+    cache["raw_values_by_face"] = raw_by_face
+    cache["smoothed_values_by_face"] = smoothed_by_face
+    state["shadow_face_luminance_cache"] = cache
+    return cache
+
+
+def _fill_preview_shadow_luminance_edge_cache_legacy(
+    state, geometry, distances, seed_geometry_face
+):
+    """Build a direction-aware, seed-relative shadow knee map.
+
+    This is intentionally a small robust edge calculation, not a second
+    region solver.  The existing graph flood still owns extent and topology;
+    this map only classifies physical shared edges as a shadow onset.  The
+    context for a threshold is the one-ring of the edge, so candidate size
+    and the current radius cannot alter a previously observed decision.
+    """
+    import numpy as np
+
+    generation = int(state.get("shadow_capture_generation", 0))
+    signature = geometry.get("signature")
+    cached = state.get("shadow_luminance_edge_cache")
+    if (
+        isinstance(cached, dict)
+        and cached.get("generation") == generation
+        and cached.get("geometry_signature") == signature
+    ):
+        return cached
+    face_cache = _fill_preview_shadow_face_luminance_cache(state, geometry)
+    cache = {
+        "generation": generation,
+        "geometry_signature": signature,
+        "edges": {},
+        "total_pairs": 0,
+        "tested": 0,
+        "skipped_hard": 0,
+        "unsampled": 0,
+        "gentle": 0,
+        "brightening": 0,
+        "knee_candidates": 0,
+        "knee_adopted": 0,
+        "no_context_rejected": 0,
+        "component_count": 0,
+        "post_close_component_count": 0,
+        "component_lengths": (),
+        "traced_sequence_count": 0,
+        "junction_pair_count": 0,
+        "junction_split_count": 0,
+        "junction_ambiguous_count": 0,
+        "junction_fallback_count": 0,
+        "closing_window_physical": 0.0,
+        "closing_window_n": 0,
+        "closing_filled_physical": 0.0,
+        "free_endpoint_count": 0,
+        "closed_chain_count": 0,
+        "domain_spanning_chain_count": 0,
+        "adopted_edge_count": 0,
+        "adopted_after_coherence": 0,
+        "plateau_median": None,
+        "plateau_mad": 0.0,
+        "smoothed_count": int(face_cache.get("smoothed_count", 0)),
+        "local_trend_median": 0.0,
+        "local_trend_mad": 0.0,
+        "seed_luminance": None,
+        "seed_luminance_used": False,
+        "reason": "capture-unavailable",
+    }
+    first = np.asarray(geometry.get("first", ()), dtype=np.int32).reshape(-1)
+    second = np.asarray(geometry.get("second", ()), dtype=np.int32).reshape(-1)
+    count = int(geometry.get("count", 0))
+    distances = np.asarray(distances, dtype=np.float64).reshape(-1)
+    source_offsets = np.asarray(
+        geometry.get("offsets", ()), dtype=np.int64
+    ).reshape(-1)
+    source_neighbors = np.asarray(
+        geometry.get("neighbors", ()), dtype=np.int32
+    ).reshape(-1)
+    hidden = np.asarray(
+        geometry.get("hidden", np.zeros(count, dtype=bool)), dtype=bool
+    ).reshape(-1)
+    source_hard = np.asarray(
+        geometry.get("source_hard", np.zeros(count, dtype=bool)), dtype=bool
+    ).reshape(-1)
+    if len(source_hard) != count:
+        physical_degree = np.asarray(
+            geometry.get("physical_degree", ()), dtype=np.int32
+        ).reshape(-1)
+        edge_counts = np.asarray(
+            geometry.get("face_edge_counts", ()), dtype=np.int32
+        ).reshape(-1)
+        if len(physical_degree) == count and len(edge_counts) == count:
+            source_hard = hidden | (physical_degree < edge_counts)
+        else:
+            source_hard = np.zeros(count, dtype=bool)
+    if (
+        not face_cache.get("values")
+        or len(first) != len(second)
+        or len(distances) < count
+    ):
+        state["shadow_luminance_edge_cache"] = cache
+        return cache
+    smoothed_by_face = np.asarray(
+        face_cache.get("smoothed_values_by_face", ()), dtype=np.float64
+    ).reshape(-1)
+    if len(smoothed_by_face) != count:
+        smoothed_by_face = np.full(count, np.nan, dtype=np.float64)
+    seed_key = _fill_preview_shadow_face_key(geometry, seed_geometry_face)
+    seed_entry = face_cache.get("values", {}).get(seed_key, {})
+    try:
+        seed_luminance = float(seed_entry.get("smoothed_luminance"))
+    except (AttributeError, TypeError, ValueError):
+        seed_luminance = float("nan")
+    # Establish the plateau from a fixed one-ring around the seed.  This is
+    # the measured local variation/noise floor; a global capture MAD is not a
+    # reliable noise estimate on a large viewport with a real shadow.
+    plateau_ids = np.asarray([int(seed_geometry_face)], dtype=np.int32)
+    if (
+        0 <= int(seed_geometry_face) < count
+        and len(source_offsets) == count + 1
+    ):
+        seed_start = int(source_offsets[int(seed_geometry_face)])
+        seed_end = int(source_offsets[int(seed_geometry_face) + 1])
+        plateau_ids = np.r_[
+            plateau_ids,
+            source_neighbors[seed_start:seed_end],
+        ]
+    plateau_ids = plateau_ids[(plateau_ids >= 0) & (plateau_ids < count)]
+    plateau_values = smoothed_by_face[plateau_ids]
+    plateau_values = plateau_values[np.isfinite(plateau_values)]
+    if len(plateau_values):
+        plateau_median = float(np.median(plateau_values))
+        plateau_mad = float(
+            1.4826 * np.median(np.abs(plateau_values - plateau_median))
+        )
+        cache["plateau_median"] = plateau_median
+        cache["plateau_mad"] = plateau_mad
+        if not np.isfinite(seed_luminance):
+            seed_luminance = plateau_median
+    if np.isfinite(seed_luminance):
+        cache["seed_luminance"] = seed_luminance
+        cache["seed_luminance_used"] = True
+    finite_distance = np.isfinite(distances[:count])
+    tolerance = max(
+        float(np.median(np.asarray(geometry.get("pair_lengths", (1.0,)), dtype=np.float64)))
+        * 1.0e-8,
+        1.0e-9,
+    )
+    incident = [[] for _ in range(count)]
+    raw = np.zeros(len(first), dtype=np.float64)
+    tested = np.zeros(len(first), dtype=bool)
+    near_face = np.full(len(first), -1, dtype=np.int32)
+    far_face = np.full(len(first), -1, dtype=np.int32)
+    near_lum = np.full(len(first), np.nan, dtype=np.float64)
+    far_lum = np.full(len(first), np.nan, dtype=np.float64)
+    for pair_index, (left_value, right_value) in enumerate(zip(first, second)):
+        left, right = int(left_value), int(right_value)
+        cache["total_pairs"] += 1
+        if (
+            left < 0 or right < 0 or left >= count or right >= count
+            or hidden[left] or hidden[right] or source_hard[left] or source_hard[right]
+            or not finite_distance[left] or not finite_distance[right]
+        ):
+            cache["skipped_hard"] += 1
+            continue
+        left_key = _fill_preview_shadow_face_key(geometry, left)
+        right_key = _fill_preview_shadow_face_key(geometry, right)
+        left_lum = (
+            float(smoothed_by_face[left]) if 0 <= left < len(smoothed_by_face) else float("nan")
+        )
+        right_lum = (
+            float(smoothed_by_face[right]) if 0 <= right < len(smoothed_by_face) else float("nan")
+        )
+        if not np.isfinite(left_lum) or not np.isfinite(right_lum):
+            cache["unsampled"] += 1
+            continue
+        if distances[left] < distances[right] - tolerance:
+            near, far = left, right
+            lnear, lfar = left_lum, right_lum
+        elif distances[right] < distances[left] - tolerance:
+            near, far = right, left
+            lnear, lfar = right_lum, left_lum
+        else:
+            # Tangential/equal-distance edges have no outward direction and
+            # must not become barriers from a bright/dark ordering accident.
+            continue
+        near_face[pair_index], far_face[pair_index] = near, far
+        near_lum[pair_index], far_lum[pair_index] = lnear, lfar
+        raw[pair_index] = max(0.0, float(lnear - lfar))
+        tested[pair_index] = True
+        cache["tested"] += 1
+        incident[near].append(pair_index)
+        incident[far].append(pair_index)
+    # The plateau supplies a relative SNR floor.  It scales with the captured
+    # seed luminance and measured local variation, so a flat area with tiny
+    # raster noise cannot become a field of orange edges.
+    plateau_reference = (
+        float(cache["plateau_median"])
+        if cache["plateau_median"] is not None
+        else float(seed_luminance) if np.isfinite(seed_luminance) else 0.0
+    )
+    plateau_mad = float(cache.get("plateau_mad", 0.0))
+    noise_floor = max(
+        2.0 * plateau_mad,
+        0.015 * max(abs(plateau_reference), 1.0e-2),
+    )
+    trend_values = []
+    raw_candidate_indices = []
+    for pair_index in np.flatnonzero(tested):
+        near, far = int(near_face[pair_index]), int(far_face[pair_index])
+        # Only predecessor edges whose far face is this edge's near face are
+        # valid trend context.  Mixing the near/far incident fan makes a
+        # nearly flat 2-D patch look like a zero-trend discontinuity.
+        predecessors = [
+            other for other in incident[near]
+            if other != pair_index
+            and tested[other]
+            and int(far_face[other]) == near
+            and float(distances[int(near_face[other])])
+            < float(distances[near]) - tolerance
+        ]
+        trend_source = [float(raw[other]) for other in predecessors]
+        drop = float(raw[pair_index])
+        far_value = float(far_lum[pair_index])
+        dark_from_plateau = bool(
+            np.isfinite(seed_luminance)
+            and max(0.0, plateau_reference - far_value) > noise_floor
+        )
+        if trend_source:
+            trend = float(np.median(trend_source))
+            mad = float(
+                1.4826 * np.median(np.abs(np.asarray(trend_source) - trend))
+            )
+            trend_values.extend(trend_source)
+            margin = max(2.0 * mad, 0.75 * noise_floor)
+            knee = bool(
+                dark_from_plateau
+                and drop > noise_floor
+                and drop > trend + margin
+            )
+        else:
+            cache["no_context_rejected"] += 1
+            trend = 0.0
+            mad = 0.0
+            # A seed-rim edge has no predecessor.  It may be an entrance only
+            # when its drop is large relative to the measured plateau and the
+            # other seed-rim crossings provide line context.
+            seed_rim = near == int(seed_geometry_face)
+            knee = bool(
+                seed_rim
+                and dark_from_plateau
+                and drop > noise_floor
+                and len(incident[near]) >= 2
+            )
+        if knee:
+            cache["knee_candidates"] += 1
+            raw_candidate_indices.append(int(pair_index))
+        elif drop > 0.0:
+            if far_value >= float(near_lum[pair_index]):
+                cache["brightening"] += 1
+            else:
+                cache["gentle"] += 1
+        key = _fill_preview_shadow_edge_key(geometry, pair_index)
+        if key is not None:
+            cache["edges"][key] = {
+                "signal": drop,
+                "tested": 1,
+                "barrier": False,
+                "candidate": bool(knee),
+                "reason": "shadow-knee-candidate" if knee else (
+                    "brightening-pass" if far_value >= float(near_lum[pair_index])
+                    else "gentle-darkening-pass"
+                ),
+                "near_luminance": float(near_lum[pair_index]),
+                "far_luminance": far_value,
+                "drop": drop,
+                "trend": trend,
+                "mad": mad,
+                "dark_from_seed": bool(dark_from_plateau),
+                "context_count": int(len(predecessors)),
+            }
+    # A knee candidate is not a barrier until it forms a finite physical line.
+    # Connected components use the shared face and, when available, the shared
+    # mesh vertex of the physical edges.  This removes isolated face-raster
+    # noise without changing the scalar luminance calculation itself.
+    candidate_set = set(int(value) for value in raw_candidate_indices)
+    face_candidates = {}
+    for pair_index in raw_candidate_indices:
+        face_candidates.setdefault(int(first[pair_index]), []).append(int(pair_index))
+        face_candidates.setdefault(int(second[pair_index]), []).append(int(pair_index))
+    pair_v0 = np.asarray(geometry.get("pair_v0", ()), dtype=np.int32).reshape(-1)
+    pair_v1 = np.asarray(geometry.get("pair_v1", ()), dtype=np.int32).reshape(-1)
+
+    def shares_physical_vertex(left_pair, right_pair):
+        if (
+            len(pair_v0) == len(first) and len(pair_v1) == len(first)
+            and pair_v0[left_pair] >= 0 and pair_v1[left_pair] >= 0
+            and pair_v0[right_pair] >= 0 and pair_v1[right_pair] >= 0
+        ):
+            return bool(
+                pair_v0[left_pair] in (pair_v0[right_pair], pair_v1[right_pair])
+                or pair_v1[left_pair] in (pair_v0[right_pair], pair_v1[right_pair])
+            )
+        return True
+
+    remaining = set(candidate_set)
+    components = []
+    while remaining:
+        start = min(remaining)
+        remaining.remove(start)
+        component = [start]
+        pending = [start]
+        while pending:
+            current = pending.pop()
+            shared_faces = (int(first[current]), int(second[current]))
+            neighbors_in_line = set()
+            for face in shared_faces:
+                neighbors_in_line.update(face_candidates.get(face, ()))
+            for other in sorted(neighbors_in_line):
+                if other in remaining and shares_physical_vertex(current, other):
+                    remaining.remove(other)
+                    pending.append(other)
+                    component.append(other)
+        components.append(tuple(sorted(component)))
+    cache["component_count"] = int(len(components))
+    component_lengths = np.asarray(
+        geometry.get("pair_lengths", np.ones(len(first))), dtype=np.float64
+    ).reshape(-1)
+    finite_lengths = component_lengths[tested & np.isfinite(component_lengths)]
+    median_length = float(np.median(finite_lengths)) if len(finite_lengths) else 1.0
+    pair_points = np.asarray(geometry.get("pair_edge_points", ()), dtype=np.float64)
+    projection = np.asarray(
+        state.get("shadow_capture", {}).get("view_projection"), dtype=np.float64
+    )
+    adopted = set()
+    accepted_lengths = []
+    orientation_rejected = 0
+    for component in components:
+        length = float(np.sum(component_lengths[list(component)])) if len(component_lengths) else 0.0
+        orientation_ok = True
+        projected_directions = []
+        if pair_points.ndim == 3 and pair_points.shape[1:] == (2, 3) and projection.shape == (4, 4):
+            for pair_index in component:
+                if pair_index >= len(pair_points) or not np.all(np.isfinite(pair_points[pair_index])):
+                    continue
+                clip = np.column_stack((pair_points[pair_index], np.ones(2))) @ projection.T
+                if not np.all(np.isfinite(clip)) or np.any(np.abs(clip[:, 3]) <= 1.0e-12):
+                    continue
+                ndc = clip[:, :2] / clip[:, 3:4]
+                direction = ndc[1] - ndc[0]
+                norm = float(np.linalg.norm(direction))
+                if norm > 1.0e-8:
+                    projected_directions.append(direction / norm)
+            if len(projected_directions) >= 2:
+                reference = projected_directions[0]
+                alignment = [abs(float(np.dot(reference, direction))) for direction in projected_directions[1:]]
+                orientation_ok = bool(float(np.median(alignment)) >= 0.10)
+        coherent = bool(
+            len(component) >= 2
+            and length >= max(2.0 * median_length, 1.0e-12)
+            and orientation_ok
+        )
+        if coherent:
+            adopted.update(component)
+            accepted_lengths.append(length)
+        elif not orientation_ok:
+            orientation_rejected += 1
+    cache["component_lengths"] = tuple(float(value) for value in accepted_lengths)
+    cache["orientation_rejected"] = int(orientation_rejected)
+    cache["adopted_after_coherence"] = int(len(adopted))
+    cache["knee_adopted"] = int(len(adopted))
+    for pair_index in raw_candidate_indices:
+        key = _fill_preview_shadow_edge_key(geometry, pair_index)
+        if key is None or key not in cache["edges"]:
+            continue
+        entry = cache["edges"][key]
+        if pair_index in adopted:
+            entry["barrier"] = True
+            entry["reason"] = "shadow-knee-coherent-line"
+        else:
+            entry["reason"] = "knee-no-coherence"
+    if trend_values:
+        trend_array = np.asarray(trend_values, dtype=np.float64)
+        trend_median = float(np.median(trend_array))
+        cache["local_trend_median"] = trend_median
+        cache["local_trend_mad"] = float(
+            1.4826 * np.median(np.abs(trend_array - trend_median))
+        )
+    cache["reason"] = "seed-relative-shadow-knee" if cache["seed_luminance_used"] else "seed-unsampled"
+    state["shadow_luminance_edge_cache"] = cache
+    return cache
+
+
+def _fill_preview_shadow_luminance_edge_cache(
+    state, geometry, distances, seed_geometry_face
+):
+    """Classify a fresh luminance field with metric grayscale morphology.
+
+    ``S_view`` is an absolute luminance contrast per physical edge length.
+    The seed plateau supplies its relative tolerance and contrast scale.  A
+    local scalar max/min closing is applied before a physical-line coherence
+    check, so isolated raster noise cannot become an orange boundary while a
+    short gap in a real shadow line can be recovered.
+    """
+    import numpy as np
+
+    generation = int(state.get("shadow_capture_generation", 0))
+    signature = geometry.get("signature")
+    cached = state.get("shadow_luminance_edge_cache")
+    if (
+        isinstance(cached, dict)
+        and cached.get("generation") == generation
+        and cached.get("geometry_signature") == signature
+    ):
+        return cached
+    face_cache = _fill_preview_shadow_face_luminance_cache(state, geometry)
+    first = np.asarray(geometry.get("first", ()), dtype=np.int32).reshape(-1)
+    second = np.asarray(geometry.get("second", ()), dtype=np.int32).reshape(-1)
+    count = int(geometry.get("count", 0))
+    edge_count = min(len(first), len(second))
+    cache = {
+        "generation": generation,
+        "geometry_signature": signature,
+        "edges": {},
+        "total_pairs": int(edge_count),
+        "tested": 0,
+        "skipped_hard": 0,
+        "unsampled": 0,
+        "gentle": 0,
+        "brightening": 0,
+        "knee_candidates": 0,
+        "knee_adopted": 0,
+        "no_context_rejected": 0,
+        "component_count": 0,
+        "post_close_component_count": 0,
+        "component_lengths": (),
+        "traced_sequence_count": 0,
+        "junction_pair_count": 0,
+        "junction_split_count": 0,
+        "junction_ambiguous_count": 0,
+        "junction_fallback_count": 0,
+        "closing_window_physical": 0.0,
+        "closing_window_n": 0,
+        "closing_filled_physical": 0.0,
+        "free_endpoint_count": 0,
+        "closed_chain_count": 0,
+        "domain_spanning_chain_count": 0,
+        "adopted_edge_count": 0,
+        "adopted_after_coherence": 0,
+        "closing_filled_gaps": 0,
+        "raw_high_edges": 0,
+        "raw_s_min": 0.0,
+        "raw_s_median": 0.0,
+        "raw_s_max": 0.0,
+        "raw_s_mad": 0.0,
+        "plateau_median": None,
+        "plateau_mad": 0.0,
+        "baseline_tolerance": 0.0,
+        "contrast_scale": 0.0,
+        "smoothed_count": int(face_cache.get("smoothed_count", 0)),
+        "local_trend_median": 0.0,
+        "local_trend_mad": 0.0,
+        "seed_luminance": None,
+        "seed_luminance_used": False,
+        "reason": "capture-unavailable",
+    }
+    if not face_cache.get("values") or edge_count == 0:
+        state["shadow_luminance_edge_cache"] = cache
+        return cache
+    smoothed = np.asarray(
+        face_cache.get("smoothed_values_by_face", ()), dtype=np.float64
+    ).reshape(-1)
+    if len(smoothed) != count:
+        smoothed = np.full(count, np.nan, dtype=np.float64)
+    offsets = np.asarray(geometry.get("offsets", ()), dtype=np.int64).reshape(-1)
+    neighbors = np.asarray(geometry.get("neighbors", ()), dtype=np.int32).reshape(-1)
+    seed_index = int(seed_geometry_face)
+    seed_ring = [seed_index]
+    if 0 <= seed_index < count and len(offsets) == count + 1:
+        seed_ring.extend(
+            int(value) for value in neighbors[offsets[seed_index]:offsets[seed_index + 1]]
+        )
+    seed_ring = np.asarray(seed_ring, dtype=np.int32)
+    seed_ring = seed_ring[(seed_ring >= 0) & (seed_ring < count)]
+    plateau_values = smoothed[seed_ring]
+    plateau_values = plateau_values[np.isfinite(plateau_values)]
+    if len(plateau_values):
+        plateau_median = float(np.median(plateau_values))
+        plateau_mad = float(
+            1.4826 * np.median(np.abs(plateau_values - plateau_median))
+        )
+        cache["plateau_median"] = plateau_median
+        cache["plateau_mad"] = plateau_mad
+    else:
+        plateau_median = float("nan")
+        plateau_mad = 0.0
+    seed_key = _fill_preview_shadow_face_key(geometry, seed_index)
+    seed_entry = face_cache.get("values", {}).get(seed_key, {})
+    try:
+        seed_luminance = float(seed_entry.get("smoothed_luminance"))
+    except (AttributeError, TypeError, ValueError):
+        seed_luminance = float("nan")
+    if not np.isfinite(seed_luminance) and np.isfinite(plateau_median):
+        seed_luminance = plateau_median
+    if np.isfinite(seed_luminance):
+        cache["seed_luminance"] = seed_luminance
+        cache["seed_luminance_used"] = True
+    plateau_reference = (
+        plateau_median if np.isfinite(plateau_median) else seed_luminance
+    )
+    baseline_tolerance = max(
+        2.0 * plateau_mad,
+        0.015 * max(abs(float(plateau_reference)), 1.0e-2)
+        if np.isfinite(plateau_reference) else 0.0,
+    )
+    cache["baseline_tolerance"] = float(baseline_tolerance)
+    pair_lengths = np.asarray(
+        geometry.get("pair_lengths", ()), dtype=np.float64
+    ).reshape(-1)
+    if len(pair_lengths) != edge_count:
+        pair_lengths = np.linalg.norm(
+            np.asarray(geometry.get("centers", np.empty((0, 3))), dtype=np.float64)[second]
+            - np.asarray(geometry.get("centers", np.empty((0, 3))), dtype=np.float64)[first],
+            axis=1,
+        ) if edge_count and len(geometry.get("centers", ())) else np.ones(edge_count)
+    finite_lengths = pair_lengths[np.isfinite(pair_lengths) & (pair_lengths > 1.0e-12)]
+    edge_scale = float(np.median(finite_lengths)) if len(finite_lengths) else 1.0
+    contrast_scale = max(
+        3.0 * plateau_mad,
+        0.02 * max(abs(float(plateau_reference)), 1.0e-2)
+        if np.isfinite(plateau_reference) else 0.02,
+        1.0e-4,
+    )
+    cache["contrast_scale"] = float(contrast_scale)
+    hidden = np.asarray(
+        geometry.get("hidden", np.zeros(count, dtype=bool)), dtype=bool
+    ).reshape(-1)
+    source_hard = np.asarray(
+        geometry.get("source_hard", np.zeros(count, dtype=bool)), dtype=bool
+    ).reshape(-1)
+    if len(source_hard) != count:
+        physical_degree = np.asarray(geometry.get("physical_degree", ()), dtype=np.int32).reshape(-1)
+        edge_counts = np.asarray(geometry.get("face_edge_counts", ()), dtype=np.int32).reshape(-1)
+        source_hard = (
+            hidden | (physical_degree < edge_counts)
+            if len(physical_degree) == count and len(edge_counts) == count
+            else np.zeros(count, dtype=bool)
+        )
+    incident = [[] for _ in range(count)]
+    raw_s = np.zeros(edge_count, dtype=np.float64)
+    departures = np.zeros(edge_count, dtype=np.float64)
+    tested = np.zeros(edge_count, dtype=bool)
+    for pair_index in range(edge_count):
+        left, right = int(first[pair_index]), int(second[pair_index])
+        if (
+            left < 0 or right < 0 or left >= count or right >= count
+            or hidden[left] or hidden[right] or source_hard[left] or source_hard[right]
+        ):
+            cache["skipped_hard"] += 1
+            continue
+        left_lum = float(smoothed[left]) if np.isfinite(smoothed[left]) else float("nan")
+        right_lum = float(smoothed[right]) if np.isfinite(smoothed[right]) else float("nan")
+        if not np.isfinite(left_lum) or not np.isfinite(right_lum):
+            cache["unsampled"] += 1
+            continue
+        length = max(float(pair_lengths[pair_index]), 0.25 * edge_scale, 1.0e-12)
+        # S_view = abs(I(A)-I(B))/d * Weight_contrast.  The edge-scale factor
+        # keeps the result dimensionless while retaining physical-length
+        # behavior across nonuniform tessellation.
+        score = abs(left_lum - right_lum) / length * edge_scale / contrast_scale
+        raw_s[pair_index] = float(score)
+        departures[pair_index] = max(
+            abs(left_lum - float(plateau_reference)),
+            abs(right_lum - float(plateau_reference)),
+        ) if np.isfinite(plateau_reference) else 0.0
+        tested[pair_index] = True
+        cache["tested"] += 1
+        incident[left].append(pair_index)
+        incident[right].append(pair_index)
+    valid_scores = raw_s[tested]
+    if len(valid_scores):
+        cache["raw_s_min"] = float(np.min(valid_scores))
+        cache["raw_s_median"] = float(np.median(valid_scores))
+        cache["raw_s_max"] = float(np.max(valid_scores))
+        cache["raw_s_mad"] = float(
+            1.4826 * np.median(np.abs(valid_scores - cache["raw_s_median"]))
+        )
+    raw_high = np.zeros(edge_count, dtype=bool)
+    local_threshold = np.zeros(edge_count, dtype=np.float64)
+    context_values = []
+    for pair_index in np.flatnonzero(tested):
+        left, right = int(first[pair_index]), int(second[pair_index])
+        context_ids = set(incident[left]) | set(incident[right])
+        context_ids.discard(int(pair_index))
+        values = [float(raw_s[other]) for other in sorted(context_ids) if tested[other]]
+        context_values.extend(values)
+        if not values:
+            cache["no_context_rejected"] += 1
+        median = float(np.median(values)) if values else 0.0
+        mad = (
+            float(1.4826 * np.median(np.abs(np.asarray(values) - median)))
+            if values else float(cache["raw_s_mad"])
+        )
+        threshold = median + max(1.0 * mad, 0.5) if values else float("inf")
+        local_threshold[pair_index] = threshold
+        departed = departures[pair_index] > baseline_tolerance
+        raw_high[pair_index] = bool(departed and raw_s[pair_index] > threshold)
+        if not raw_high[pair_index]:
+            if raw_s[pair_index] < threshold:
+                cache["gentle"] += 1
+            else:
+                cache["brightening"] += 1
+        key = _fill_preview_shadow_edge_key(geometry, pair_index)
+        if key is not None:
+            left_luminance = float(smoothed[left])
+            right_luminance = float(smoothed[right])
+            cache["edges"][key] = {
+                "signal": float(raw_s[pair_index]),
+                "raw_signal": float(raw_s[pair_index]),
+                "tested": 1,
+                "barrier": False,
+                "candidate": False,
+                "near_luminance": left_luminance,
+                "far_luminance": right_luminance,
+                "drop": float(abs(left_luminance - right_luminance)),
+                "departure": float(departures[pair_index]),
+                "local_threshold": float(threshold),
+                "reason": "raw-high" if raw_high[pair_index] else "below-local-threshold",
+            }
+    cache["raw_high_edges"] = int(np.count_nonzero(raw_high))
+    if context_values:
+        context_array = np.asarray(context_values, dtype=np.float64)
+        cache["local_trend_median"] = float(np.median(context_array))
+        cache["local_trend_mad"] = float(
+            1.4826 * np.median(np.abs(context_array - cache["local_trend_median"]))
+        )
+    # Trace maximal simple physical-edge sequences before filtering.  The
+    # previous implementation connected an entire face fan and ran one-hop
+    # max/min filters, which fragmented a long shadow line and allowed the
+    # flood to walk around its short pieces.  Endpoints are therefore the
+    # primary topology, while a junction is paired only through the most
+    # straight continuation.  A near tie is deliberately split.
+    pair_v0 = np.asarray(geometry.get("pair_v0", ()), dtype=np.int32).reshape(-1)
+    pair_v1 = np.asarray(geometry.get("pair_v1", ()), dtype=np.int32).reshape(-1)
+    world_vertices = np.asarray(geometry.get("world_vertices", ()), dtype=np.float64)
+    endpoint_ok = len(pair_v0) == edge_count and len(pair_v1) == edge_count
+    line_neighbors = [set() for _ in range(edge_count)]
+    cache["junction_pair_count"] = 0
+    cache["junction_split_count"] = 0
+    cache["junction_ambiguous_count"] = 0
+    cache["junction_fallback_count"] = 0
+    for face in range(count):
+        members = [int(value) for value in incident[face] if tested[int(value)]]
+        if len(members) < 2:
+            continue
+        shared = {pair_index: [] for pair_index in members}
+        for offset, left_pair in enumerate(members):
+            for right_pair in members[offset + 1:]:
+                shares = True
+                if endpoint_ok:
+                    lv = (int(pair_v0[left_pair]), int(pair_v1[left_pair]))
+                    rv = (int(pair_v0[right_pair]), int(pair_v1[right_pair]))
+                    shares = min(lv + rv) < 0 or bool(set(lv) & set(rv))
+                if shares:
+                    shared[left_pair].append(right_pair)
+                    shared[right_pair].append(left_pair)
+        # Faces with a single contour crossing do not contribute a line pair;
+        # missing endpoint metadata uses the old deterministic face-fan
+        # fallback, but is counted for diagnostics.
+        for left_pair in members:
+            options = sorted(set(shared[left_pair]))
+            if not options:
+                continue
+            if not endpoint_ok:
+                cache["junction_fallback_count"] += len(options)
+            if len(options) == 1:
+                right_pair = options[0]
+                line_neighbors[left_pair].add(right_pair)
+                line_neighbors[right_pair].add(left_pair)
+                cache["junction_pair_count"] += 1
+                continue
+            def edge_direction(pair_index):
+                if (
+                    not endpoint_ok or len(world_vertices) == 0
+                    or int(pair_v0[pair_index]) < 0
+                    or int(pair_v1[pair_index]) < 0
+                    or int(pair_v0[pair_index]) >= len(world_vertices)
+                    or int(pair_v1[pair_index]) >= len(world_vertices)
+                ):
+                    return None
+                vector = world_vertices[int(pair_v1[pair_index])] - world_vertices[int(pair_v0[pair_index])]
+                length = float(np.linalg.norm(vector))
+                return vector / length if np.isfinite(length) and length > 1.0e-12 else None
+            direction = edge_direction(left_pair)
+            scored = []
+            for right_pair in options:
+                other_direction = edge_direction(right_pair)
+                score = (
+                    abs(float(np.dot(direction, other_direction)))
+                    if direction is not None and other_direction is not None else -1.0
+                )
+                scored.append((score, int(right_pair)))
+            scored.sort(key=lambda item: (-item[0], item[1]))
+            best_score, right_pair = scored[0]
+            next_score = scored[1][0]
+            if best_score < 0.0 or best_score - next_score < 0.10:
+                cache["junction_split_count"] += 1
+                cache["junction_ambiguous_count"] += 1
+                continue
+            line_neighbors[left_pair].add(right_pair)
+            line_neighbors[right_pair].add(left_pair)
+            cache["junction_pair_count"] += 1
+
+    tested_ids = [int(value) for value in np.flatnonzero(tested)]
+    # Extract ordered maximal simple paths.  A node of degree != 2 is a
+    # deterministic interval boundary; all-degree-2 components are closed
+    # loops.  This keeps branches and unrelated parallel lines separate.
+    sequences = []
+    visited_line = set()
+    for start in tested_ids:
+        if start in visited_line or len(line_neighbors[start]) == 2:
+            continue
+        for first_neighbor in sorted(line_neighbors[start]):
+            if first_neighbor in visited_line:
+                continue
+            sequence = [start]
+            previous, current = start, first_neighbor
+            while True:
+                sequence.append(current)
+                visited_line.add(current)
+                choices = sorted(line_neighbors[current] - {previous})
+                if len(line_neighbors[current]) != 2 or not choices:
+                    break
+                previous, current = current, choices[0]
+                if current in sequence:
+                    break
+            visited_line.update(sequence)
+            if len(sequence) >= 2:
+                sequences.append(tuple(sequence))
+    for start in tested_ids:
+        if start in visited_line:
+            continue
+        # Remaining nodes are either isolated or closed degree-two loops.
+        sequence = [start]
+        visited_line.add(start)
+        previous, current = start, None
+        if line_neighbors[start]:
+            current = min(line_neighbors[start])
+        while current is not None and current != start and current not in sequence:
+            sequence.append(current)
+            visited_line.add(current)
+            choices = sorted(line_neighbors[current] - ({previous} if previous is not None else set()))
+            previous, current = current, (choices[0] if choices else None)
+        if len(sequence) >= 2:
+            sequences.append(tuple(sequence))
+    cache["traced_sequence_count"] = int(len(sequences))
+    cache["closed_chain_count"] = int(
+        sum(bool(len(line_neighbors[path[0]]) == 2 and len(line_neighbors[path[-1]]) == 2)
+            for path in sequences if path)
+    )
+    cache["free_endpoint_count"] = int(
+        sum(1 for node in tested_ids if len(line_neighbors[node]) <= 1)
+    )
+
+    # True grayscale Closing on each ordered sequence.  The neighborhood is
+    # selected by accumulated physical length, never by a fixed edge count.
+    # Two edge-scale gaps are the smallest useful default and the upper bound
+    # is intentionally small to keep the live E path bounded.
+    window_radius = min(8.0 * edge_scale, max(2.0 * edge_scale, 1.0e-12))
+    window_n = 2
+    cache["closing_window_physical"] = float(window_radius)
+    cache["closing_window_n"] = int(window_n)
+    closed_signal = np.array(raw_s, copy=True)
+    closing_candidate = np.zeros(edge_count, dtype=bool)
+    raw_components = 0
+    post_components = 0
+    adopted = set()
+    accepted_lengths = []
+    component_lengths = []
+    for path in sequences:
+        path = tuple(int(value) for value in path)
+        if len(path) < 2:
+            continue
+        values = np.asarray([raw_s[node] for node in path], dtype=np.float64)
+        lengths = np.asarray([max(float(pair_lengths[node]), 1.0e-12) for node in path], dtype=np.float64)
+        centers = np.cumsum(lengths) - 0.5 * lengths
+        high = np.asarray([raw_high[node] for node in path], dtype=bool)
+        raw_support = int(np.count_nonzero(high))
+        if raw_support:
+            raw_components += 1
+        if raw_support < 2:
+            continue
+        quiet_values = values[~high]
+        if len(quiet_values):
+            quiet_median = float(np.median(quiet_values))
+            quiet_mad = float(
+                1.4826 * np.median(np.abs(quiet_values - quiet_median))
+            )
+            sequence_threshold = max(0.5, quiet_median + 2.0 * quiet_mad)
+        else:
+            sequence_threshold = max(0.5, float(np.median(values)))
+        # Fixed metric window, with N <= 8 and a cumulative physical radius.
+        dilation = np.array(values, copy=True)
+        for index in range(len(path)):
+            ids = np.flatnonzero(np.abs(centers - centers[index]) <= window_radius + 0.5 * lengths[index])
+            if len(ids):
+                dilation[index] = float(np.max(values[ids]))
+        erosion = np.array(dilation, copy=True)
+        for index in range(len(path)):
+            ids = np.flatnonzero(np.abs(centers - centers[index]) <= window_radius + 0.5 * lengths[index])
+            if len(ids):
+                erosion[index] = float(np.min(dilation[ids]))
+        path_candidate = np.zeros(len(path), dtype=bool)
+        for index, node in enumerate(path):
+            # The per-edge context threshold is useful for raw knee
+            # detection, but it contains the adjacent high support and would
+            # reject the very gap that Closing is intended to recover.  Use a
+            # robust quiet-side threshold for the post-close scalar instead.
+            threshold = float(sequence_threshold)
+            path_candidate[index] = bool(
+                erosion[index] > threshold
+                and departures[node] > 0.5 * baseline_tolerance
+            )
+            closed_signal[node] = float(erosion[index])
+            closing_candidate[node] = bool(path_candidate[index])
+        if not np.any(path_candidate):
+            continue
+        post_components += 1
+        candidate_nodes = [path[index] for index in np.flatnonzero(path_candidate)]
+        component_length = float(np.sum(pair_lengths[candidate_nodes]))
+        component_lengths.append(component_length)
+        # A line must retain at least two raw supports.  The closing may add
+        # intermediate edges but never invents a disconnected endpoint.
+        if len(candidate_nodes) >= 2 and component_length >= 2.0 * edge_scale:
+            adopted.update(candidate_nodes)
+            accepted_lengths.append(component_length)
+            cache["closing_filled_gaps"] += int(
+                np.count_nonzero(path_candidate & ~high)
+            )
+            cache["closing_filled_physical"] = float(
+                cache.get("closing_filled_physical", 0.0)
+                + np.sum(lengths[path_candidate & ~high])
+            )
+            for node in candidate_nodes:
+                key = _fill_preview_shadow_edge_key(geometry, node)
+                if key is not None and key in cache["edges"]:
+                    cache["edges"][key]["candidate"] = True
+                    cache["edges"][key]["barrier"] = True
+                    cache["edges"][key]["closed_signal"] = float(closed_signal[node])
+                    cache["edges"][key]["reason"] = "shadow-chain-metric-closing"
+        else:
+            for node in candidate_nodes:
+                key = _fill_preview_shadow_edge_key(geometry, node)
+                if key is not None and key in cache["edges"]:
+                    cache["edges"][key]["closed_signal"] = float(closed_signal[node])
+                    cache["edges"][key]["candidate"] = True
+                    cache["edges"][key]["reason"] = "closing-short-chain"
+    cache["component_count"] = int(raw_components)
+    cache["post_close_component_count"] = int(post_components)
+    cache["component_lengths"] = tuple(float(value) for value in accepted_lengths)
+    cache["adopted_after_coherence"] = int(len(adopted))
+    cache["knee_candidates"] = int(np.count_nonzero(closing_candidate))
+    cache["knee_adopted"] = int(len(adopted))
+    cache["closing_barrier_count"] = int(len(adopted))
+    cache["adopted_edge_count"] = int(len(adopted))
+    domain_spanning = 0
+    for path in sequences:
+        if not path:
+            continue
+        path_faces = np.asarray(
+            [int(face) for node in path for face in (first[node], second[node])],
+            dtype=np.int32,
+        )
+        path_faces = path_faces[(path_faces >= 0) & (path_faces < len(distances))]
+        if len(path_faces) and np.isfinite(distances[path_faces]).any():
+            domain_spanning += 1
+    cache["domain_spanning_chain_count"] = int(domain_spanning)
+    cache["reason"] = "seed-relative-view-contrast" if cache["seed_luminance_used"] else "seed-unsampled"
+    state["shadow_luminance_edge_cache"] = cache
+    return cache
+
+
+def _fill_preview_shadow_luminance_region(
+    state, local, distances, radius, seed_local, source_geometry=None,
+    source_distances=None,
+):
+    """Flood the connected face class under the visible analysis shader.
+
+    Ordinary ``E`` is intentionally a face-luminance classifier.  Distance is
+    retained only as a secondary halo/cursor acquisition mechanism; it never
+    decides whether a sampled neighbour belongs to the candidate.  The
+    classifier uses one immutable threshold per capture generation so wheel
+    stages cannot turn a dark face into a pass merely by growing the radius.
+    """
+    import numpy as np
+
+    count = int(local.get("count", 0))
+    local_distances = np.asarray(distances, dtype=np.float64).reshape(-1)
+    metrics = {
+        "shadow_classifier_mode": "face-luminance-region",
+        "shadow_classifier_face_set_independent": True,
+        "shadow_classifier_seed_luminance": 0.0,
+        "shadow_classifier_threshold": 0.0,
+        "shadow_classifier_base_threshold": 0.0,
+        "shadow_classifier_threshold_delta": 0.0,
+        "shadow_classifier_step": 0,
+        "shadow_classifier_monotonic_action": "initial",
+        "shadow_classifier_initial_count": 0,
+        "shadow_classifier_previous_count": 0,
+        "shadow_classifier_preserved_count": 0,
+        "shadow_classifier_prevented_removal_count": 0,
+        "shadow_classifier_orientation": "unknown",
+        "shadow_classifier_sampled_count": 0,
+        "shadow_classifier_unsampled_count": 0,
+        "shadow_classifier_sampled_min": 0.0,
+        "shadow_classifier_sampled_max": 0.0,
+        "shadow_classifier_sampled_q10": 0.0,
+        "shadow_classifier_sampled_q90": 0.0,
+        "shadow_classifier_accepted_count": 0,
+        "shadow_classifier_accepted_luminance_min": 0.0,
+        "shadow_classifier_accepted_luminance_max": 0.0,
+        "shadow_classifier_rejected_neighbor_count": 0,
+        "shadow_classifier_rejected_neighbor_min": 0.0,
+        "shadow_classifier_rejected_neighbor_max": 0.0,
+        "shadow_classifier_boundary_count": 0,
+        "shadow_classifier_pass_count": 0,
+        "shadow_classifier_reject_count": 0,
+        "shadow_classifier_reason": "capture-unavailable",
+        "shadow_classifier_threshold_source": "none",
+        "shadow_classifier_radius_secondary": float(radius),
+    }
+    state["shadow_luminance_region_edges"] = set()
+    if count <= 0 or seed_local < 0 or seed_local >= count:
+        metrics["shadow_classifier_reason"] = "classifier-schema"
+        return np.empty(0, dtype=np.int32), metrics
+    source_geometry = source_geometry if source_geometry is not None else local
+    try:
+        face_cache = _fill_preview_shadow_face_luminance_cache(
+            state, source_geometry
+        )
+        smoothed = np.asarray(
+            face_cache.get("smoothed_values_by_face", ()), dtype=np.float64
+        ).reshape(-1)
+        local_global_ids = np.asarray(
+            local.get("_global_face_ids", np.arange(count, dtype=np.int32)),
+            dtype=np.int64,
+        ).reshape(-1)
+        if len(local_global_ids) != count:
+            raise ValueError("classifier-face-id-schema")
+        local_values = np.full(count, np.nan, dtype=np.float64)
+        valid_ids = (
+            (local_global_ids >= 0)
+            & (local_global_ids < len(smoothed))
+        )
+        local_values[valid_ids] = smoothed[local_global_ids[valid_ids]]
+        sampled = np.isfinite(local_values)
+        metrics["shadow_classifier_sampled_count"] = int(np.count_nonzero(sampled))
+        metrics["shadow_classifier_unsampled_count"] = int(np.count_nonzero(~sampled))
+        finite_values = local_values[sampled]
+        if not len(finite_values) or not sampled[int(seed_local)]:
+            metrics["shadow_classifier_reason"] = "seed-unsampled"
+            return np.asarray([int(seed_local)], dtype=np.int32), metrics
+        seed_luminance = float(local_values[int(seed_local)])
+        metrics["shadow_classifier_seed_luminance"] = seed_luminance
+        metrics["shadow_classifier_sampled_min"] = float(np.min(finite_values))
+        metrics["shadow_classifier_sampled_max"] = float(np.max(finite_values))
+        metrics["shadow_classifier_sampled_q10"] = float(np.percentile(finite_values, 10.0))
+        metrics["shadow_classifier_sampled_q90"] = float(np.percentile(finite_values, 90.0))
+        generation = int(state.get("shadow_capture_generation", 0))
+        classifier_cache = state.get("shadow_luminance_classifier_cache")
+        cache_valid = (
+            isinstance(classifier_cache, dict)
+            and classifier_cache.get("generation") == generation
+        )
+        if cache_valid:
+            base_threshold = float(classifier_cache.get("threshold", seed_luminance))
+            bright = bool(classifier_cache.get("bright", True))
+            threshold_source = str(classifier_cache.get("threshold_source", "cached"))
+        else:
+            # Estimate a robust seed plateau from its immediate graph ring.
+            offsets = np.asarray(local.get("offsets", ()), dtype=np.int64).reshape(-1)
+            neighbors = np.asarray(local.get("neighbors", ()), dtype=np.int32).reshape(-1)
+            ring_ids = [int(seed_local)]
+            if len(offsets) == count + 1:
+                ring_ids.extend(
+                    int(v) for v in neighbors[offsets[int(seed_local)]:offsets[int(seed_local) + 1]]
+                )
+            ring_ids = np.asarray(ring_ids, dtype=np.int32)
+            ring_ids = ring_ids[(ring_ids >= 0) & (ring_ids < count)]
+            ring_values = local_values[ring_ids]
+            ring_values = ring_values[np.isfinite(ring_values)]
+            plateau = float(np.median(ring_values)) if len(ring_values) else seed_luminance
+            plateau_mad = float(
+                1.4826 * np.median(np.abs(ring_values - plateau))
+            ) if len(ring_values) else 0.0
+            global_median = float(np.median(finite_values))
+            bright = bool(seed_luminance >= global_median)
+            sorted_values = np.sort(np.unique(finite_values))
+            if bright:
+                side = sorted_values[sorted_values <= seed_luminance + 1.0e-9]
+                gaps = np.diff(side) if len(side) >= 2 else np.empty(0)
+                tolerance = max(3.0 * plateau_mad, 0.02 * max(abs(plateau), 1.0e-2), 1.0e-3)
+                if len(gaps):
+                    gap_index = int(np.argmax(gaps))
+                    if float(gaps[gap_index]) > max(2.0 * tolerance, 0.01):
+                        threshold = float((side[gap_index] + side[gap_index + 1]) * 0.5)
+                        threshold_source = "largest-luminance-gap-below-seed"
+                    else:
+                        threshold = float(plateau - tolerance)
+                        threshold_source = "seed-plateau-relative"
+                else:
+                    threshold = float(plateau - tolerance)
+                    threshold_source = "seed-plateau-relative"
+            else:
+                side = sorted_values[sorted_values >= seed_luminance - 1.0e-9]
+                gaps = np.diff(side) if len(side) >= 2 else np.empty(0)
+                tolerance = max(3.0 * plateau_mad, 0.02 * max(abs(plateau), 1.0e-2), 1.0e-3)
+                if len(gaps):
+                    gap_index = int(np.argmax(gaps))
+                    if float(gaps[gap_index]) > max(2.0 * tolerance, 0.01):
+                        threshold = float((side[gap_index] + side[gap_index + 1]) * 0.5)
+                        threshold_source = "largest-luminance-gap-above-seed"
+                    else:
+                        threshold = float(plateau + tolerance)
+                        threshold_source = "seed-plateau-relative"
+                else:
+                    threshold = float(plateau + tolerance)
+                    threshold_source = "seed-plateau-relative"
+            classifier_cache = {
+                "generation": generation,
+                "threshold": float(threshold),
+                "bright": bool(bright),
+                "threshold_source": threshold_source,
+                "seed_luminance": seed_luminance,
+            }
+            state["shadow_luminance_classifier_cache"] = classifier_cache
+            base_threshold = float(threshold)
+        # The threshold is anchored to the first capture, not to the mutable
+        # result from the previous wheel stage.  This makes wheel semantics a
+        # deterministic one-dimensional control: for a bright seed, expand
+        # lowers T and shrink raises T (with the inverse operation returning
+        # exactly to the stored step-zero result).
+        step = int(state.get("luminance_step", 0))
+        sample_min = float(np.min(finite_values))
+        sample_max = float(np.max(finite_values))
+        sample_span = max(sample_max - sample_min, abs(seed_luminance) * 0.05, 0.02)
+        threshold_delta = max(sample_span * 0.05, 0.01)
+        threshold = float(base_threshold + (-step if bright else step) * threshold_delta)
+        threshold = float(np.clip(threshold, sample_min, sample_max))
+        metrics["shadow_classifier_step"] = step
+        metrics["shadow_classifier_base_threshold"] = float(base_threshold)
+        metrics["shadow_classifier_threshold_delta"] = float(threshold_delta)
+        metrics["shadow_classifier_threshold"] = float(threshold)
+        metrics["shadow_classifier_orientation"] = "bright" if bright else "dark"
+        metrics["shadow_classifier_threshold_source"] = threshold_source
+        offsets = np.asarray(local.get("offsets", ()), dtype=np.int64).reshape(-1)
+        neighbors = np.asarray(local.get("neighbors", ()), dtype=np.int32).reshape(-1)
+        first = np.asarray(local.get("first", ()), dtype=np.int32).reshape(-1)
+        second = np.asarray(local.get("second", ()), dtype=np.int32).reshape(-1)
+        hidden = np.asarray(local.get("hidden", np.zeros(count, dtype=bool)), dtype=bool).reshape(-1)
+        source_hard = np.asarray(local.get("source_hard", np.zeros(count, dtype=bool)), dtype=bool).reshape(-1)
+        if len(hidden) != count:
+            hidden = np.zeros(count, dtype=bool)
+        if len(source_hard) != count:
+            source_hard = np.zeros(count, dtype=bool)
+        hard = hidden | source_hard
+        accepted = np.zeros(count, dtype=bool)
+        rejected = np.zeros(count, dtype=bool)
+        accepted[int(seed_local)] = True
+        pending = deque([int(seed_local)])
+        while pending:
+            face = int(pending.popleft())
+            if len(offsets) != count + 1:
+                break
+            for row in range(int(offsets[face]), int(offsets[face + 1])):
+                neighbor = int(neighbors[row])
+                if neighbor < 0 or neighbor >= count or accepted[neighbor] or rejected[neighbor]:
+                    continue
+                if hard[neighbor] or not sampled[neighbor]:
+                    rejected[neighbor] = True
+                    continue
+                passes = bool(local_values[neighbor] >= threshold) if bright else bool(local_values[neighbor] <= threshold)
+                if passes:
+                    accepted[neighbor] = True
+                    pending.append(neighbor)
+                    metrics["shadow_classifier_pass_count"] += 1
+                else:
+                    rejected[neighbor] = True
+                    metrics["shadow_classifier_reject_count"] += 1
+        accepted[int(seed_local)] = True
+        selected_ids = np.flatnonzero(accepted).astype(np.int32, copy=False)
+        # Enforce inclusion/exclusion in stable mesh-face-id space.  Cursor
+        # halo growth can reorder local indices, so comparing local arrays is
+        # insufficient.  Normal E stores its own immutable step-zero set;
+        # strict Ctrl+E never enters this helper and remains untouched.
+        source_face_ids = np.asarray(
+            source_geometry.get(
+                "face_ids", np.arange(len(smoothed), dtype=np.int32)
+            ),
+            dtype=np.int32,
+        ).reshape(-1)
+        if len(source_face_ids) != len(smoothed):
+            source_face_ids = np.arange(len(smoothed), dtype=np.int32)
+        local_stable_ids = np.full(count, -1, dtype=np.int32)
+        valid_stable = (
+            (local_global_ids >= 0)
+            & (local_global_ids < len(source_face_ids))
+        )
+        local_stable_ids[valid_stable] = source_face_ids[local_global_ids[valid_stable]]
+        candidate_stable = np.unique(
+            local_stable_ids[selected_ids][local_stable_ids[selected_ids] >= 0]
+        ).astype(np.int32, copy=False)
+        initial_stable = np.asarray(
+            state.get("shadow_luminance_initial_ids", ()), dtype=np.int32
+        ).reshape(-1)
+        previous_stable = np.asarray(
+            state.get("shadow_luminance_previous_ids", ()), dtype=np.int32
+        ).reshape(-1)
+        action = "initial"
+        final_stable = candidate_stable
+        if step == 0:
+            if len(initial_stable) == 0:
+                initial_stable = candidate_stable.copy()
+                state["shadow_luminance_initial_ids"] = initial_stable.copy()
+            else:
+                final_stable = initial_stable.copy()
+            action = "initial" if len(previous_stable) == 0 else "return-to-initial"
+        elif step > 0:
+            parts = [candidate_stable]
+            if len(initial_stable):
+                parts.append(initial_stable)
+            if len(previous_stable) and int(state.get("shadow_luminance_previous_step", 0)) < step:
+                parts.append(previous_stable)
+            final_stable = np.unique(np.concatenate(parts)).astype(np.int32, copy=False)
+            action = "expand-union"
+        else:
+            final_stable = np.intersect1d(candidate_stable, initial_stable)
+            if len(previous_stable) and int(state.get("shadow_luminance_previous_step", 0)) > step:
+                final_stable = np.intersect1d(final_stable, previous_stable)
+            action = "shrink-intersection"
+        if len(local_stable_ids) and len(final_stable):
+            accepted = np.isin(local_stable_ids, final_stable)
+            accepted &= local_stable_ids >= 0
+        else:
+            accepted = np.zeros(count, dtype=bool)
+        # Stable-ID projection is only a monotonic luminance policy.  It must
+        # never override the physical safety mask for a face that is hidden
+        # or marked source-hard in the current graph.
+        accepted &= ~hard
+        accepted[int(seed_local)] = True
+        selected_ids = np.flatnonzero(accepted).astype(np.int32, copy=False)
+        previous_count = int(len(previous_stable))
+        state["shadow_luminance_previous_ids"] = final_stable.copy()
+        state["shadow_luminance_previous_step"] = step
+        metrics["shadow_classifier_monotonic_action"] = action
+        metrics["shadow_classifier_initial_count"] = int(len(initial_stable))
+        metrics["shadow_classifier_previous_count"] = previous_count
+        metrics["shadow_classifier_preserved_count"] = int(len(np.intersect1d(final_stable, initial_stable)))
+        metrics["shadow_classifier_prevented_removal_count"] = int(
+            max(0, len(initial_stable) - len(candidate_stable)) if step > 0 else 0
+        )
+        metrics["shadow_classifier_accepted_count"] = int(len(selected_ids))
+        accepted_values = local_values[accepted & sampled]
+        if len(accepted_values):
+            metrics["shadow_classifier_accepted_luminance_min"] = float(np.min(accepted_values))
+            metrics["shadow_classifier_accepted_luminance_max"] = float(np.max(accepted_values))
+        rejected_values = []
+        edge_keys = set()
+        for pair_index, (left, right) in enumerate(zip(first, second)):
+            left, right = int(left), int(right)
+            if left < 0 or right < 0 or left >= count or right >= count:
+                continue
+            if bool(accepted[left]) == bool(accepted[right]):
+                continue
+            key = _fill_preview_shadow_edge_key(local, pair_index)
+            if key is not None:
+                edge_keys.add(key)
+            outside = right if accepted[left] else left
+            if 0 <= outside < count and sampled[outside]:
+                rejected_values.append(float(local_values[outside]))
+        state["shadow_luminance_region_edges"] = edge_keys
+        metrics["shadow_classifier_boundary_count"] = int(len(edge_keys))
+        metrics["shadow_classifier_rejected_neighbor_count"] = int(len(rejected_values))
+        if rejected_values:
+            metrics["shadow_classifier_rejected_neighbor_min"] = float(min(rejected_values))
+            metrics["shadow_classifier_rejected_neighbor_max"] = float(max(rejected_values))
+        metrics["shadow_classifier_reason"] = "connected-luminance-region"
+        return selected_ids, metrics
+    except (AttributeError, IndexError, KeyError, RuntimeError, TypeError, ValueError, ZeroDivisionError):
+        metrics["shadow_classifier_reason"] = "classifier-schema"
+        return np.asarray([int(seed_local)], dtype=np.int32), metrics
+
+
+def _fill_preview_shadow_pre_shadow_snap(
+    state, geometry, buffers, metrics, candidate, seed_face
+):
+    """Choose a coherent mesh chain on the seed side of a shadow onset.
+
+    The screen flood remains authoritative.  This bounded pass only moves an
+    interface inward by one mesh ring when the current accepted face is
+    already contaminated by the directed luminance transition and an
+    adjacent accepted plateau face is available.  All evidence is taken from
+    the same sharpened luminance field used by the flood; topology merely
+    supplies the local ring and continuity checks.
+    """
+    import numpy as np
+    from collections import deque
+
+    defaults = {
+        "shadow_screen_pre_shadow_oriented_chain_count": 0,
+        "shadow_screen_pre_shadow_orientation": "unknown",
+        "shadow_screen_pre_shadow_shift_count": 0,
+        "shadow_screen_pre_shadow_ring_distance": 0,
+        "shadow_screen_pre_shadow_accepted_deviation": 0.0,
+        "shadow_screen_pre_shadow_rejected_drop": 0.0,
+        "shadow_screen_pre_shadow_unchanged_segments": 0,
+        "shadow_screen_pre_shadow_no_valid_direction": 0,
+        "shadow_screen_pre_shadow_coherent_chain_count": 0,
+        "shadow_screen_pre_shadow_seed_connected": False,
+        "shadow_screen_pre_shadow_reason": "not-run",
+    }
+
+    def done(reason, result, **updates):
+        out = dict(defaults)
+        out.update(updates)
+        out["shadow_screen_pre_shadow_reason"] = str(reason)
+        return np.asarray(result, dtype=bool).copy(), out
+
+    refined = np.asarray(candidate, dtype=bool).reshape(-1).copy()
+    count = int(geometry.get("count", len(refined)))
+    if count <= 0 or len(refined) != count:
+        return done("schema", refined)
+    first = np.asarray(geometry.get("first", ()), dtype=np.int32).reshape(-1)
+    second = np.asarray(geometry.get("second", ()), dtype=np.int32).reshape(-1)
+    if len(first) != len(second):
+        return done("edge-schema", refined)
+    valid = (
+        (first >= 0) & (second >= 0)
+        & (first < count) & (second < count)
+    )
+    boundary = valid & (refined[first] != refined[second])
+    rows = np.flatnonzero(boundary).astype(np.int32, copy=False)
+    if not len(rows):
+        return done(
+            "no-boundary", refined,
+            shadow_screen_pre_shadow_seed_connected=bool(
+                0 <= int(seed_face) < count and refined[int(seed_face)]
+            ),
+        )
+    field = np.asarray(buffers.get("denoised", ()), dtype=np.float32)
+    cx = np.asarray(buffers.get("center_x", ()), dtype=np.int64).reshape(-1)
+    cy = np.asarray(buffers.get("center_y", ()), dtype=np.int64).reshape(-1)
+    if field.ndim != 2 or len(cx) != count or len(cy) != count:
+        return done("buffer-schema", refined)
+    h, w = field.shape
+
+    def face_luminance(face):
+        face = int(face)
+        if not (0 <= face < count):
+            return None
+        x, y = int(cx[face]), int(cy[face])
+        if not (0 <= x < w and 0 <= y < h):
+            return None
+        lo_x, hi_x = max(0, x - 1), min(w, x + 2)
+        lo_y, hi_y = max(0, y - 1), min(h, y + 2)
+        values = np.asarray(field[lo_y:hi_y, lo_x:hi_x], dtype=np.float64).reshape(-1)
+        values = values[np.isfinite(values)]
+        return float(np.median(values)) if len(values) else None
+
+    seed_value = face_luminance(seed_face)
+    finite = field[np.isfinite(field)]
+    if seed_value is None or not len(finite):
+        return done("no-luminance", refined)
+    cache = state.get("shadow_screen_classifier_cache")
+    bright = bool(cache.get("bright")) if isinstance(cache, dict) else bool(
+        seed_value >= float(np.median(finite))
+    )
+    seed_mad = float(cache.get("tolerance", 0.0)) if isinstance(cache, dict) else 0.0
+    seed_patch = field[
+        max(0, int(cy[int(seed_face)]) - 1):min(h, int(cy[int(seed_face)]) + 2),
+        max(0, int(cx[int(seed_face)]) - 1):min(w, int(cx[int(seed_face)]) + 2),
+    ]
+    seed_patch = seed_patch[np.isfinite(seed_patch)]
+    if len(seed_patch):
+        patch_median = float(np.median(seed_patch))
+        patch_mad = float(1.4826 * np.median(np.abs(seed_patch - patch_median)))
+    else:
+        patch_median, patch_mad = seed_value, 0.0
+    seed_value = patch_median
+    tolerance = max(seed_mad, 3.0 * patch_mad, 0.02 * max(abs(seed_value), 1.0e-2), 1.0e-3)
+    span = max(float(np.percentile(finite, 90.0) - np.percentile(finite, 10.0)), tolerance)
+    # The direction is deliberately luminance-only.  The seed side is the
+    # bright plateau for a bright seed and the dark plateau for a dark seed.
+    orientation = "bright-to-dark" if bright else "dark-to-bright"
+
+    offsets = np.asarray(geometry.get("offsets", ()), dtype=np.int64).reshape(-1)
+    neighbors = np.asarray(geometry.get("neighbors", ()), dtype=np.int32).reshape(-1)
+    edge_indices = np.asarray(geometry.get("edge_indices", ()), dtype=np.int32).reshape(-1)
+    if len(offsets) != count + 1 or int(offsets[-1]) != len(neighbors):
+        return done("graph-schema", refined, shadow_screen_pre_shadow_orientation=orientation)
+    pair_lookup = {}
+    for directed, pair in enumerate(edge_indices if len(edge_indices) == len(neighbors) else ()):
+        left, right = int(first[int(pair)]), int(second[int(pair)])
+        pair_lookup.setdefault((min(left, right), max(left, right)), int(pair))
+
+    # One face ring is sufficient for the preferred pre-shadow edge.  A row
+    # is eligible only if its accepted side is transition-contaminated while
+    # one accepted neighbour remains plateau-like.  This prevents blind
+    # nearest-edge shifts and leaves weak/top/bottom segments untouched.
+    proposals = []
+    failures = 0
+    accepted_deviations = []
+    rejected_drops = []
+    for row in rows:
+        left, right = int(first[row]), int(second[row])
+        accepted = left if refined[left] else right
+        rejected = right if accepted == left else left
+        ia, ib = face_luminance(accepted), face_luminance(rejected)
+        if ia is None or ib is None:
+            failures += 1
+            continue
+        if bright:
+            directed_drop = ia - ib
+            accepted_deviation = max(0.0, seed_value - ia)
+            rejected_drop = max(0.0, seed_value - ib)
+        else:
+            directed_drop = ib - ia
+            accepted_deviation = max(0.0, ia - seed_value)
+            rejected_drop = max(0.0, ib - seed_value)
+        accepted_deviations.append(accepted_deviation)
+        rejected_drops.append(rejected_drop)
+        # Require an actual directed onset.  A gentle gradient or a random
+        # low-amplitude edge cannot qualify merely because local MAD is zero.
+        drop_floor = max(0.75 * tolerance, 0.025 * span)
+        if directed_drop <= drop_floor or rejected_drop <= max(tolerance, 0.025 * span):
+            continue
+        accepted_neighbors = []
+        start, stop = int(offsets[accepted]), int(offsets[accepted + 1])
+        for neighbor in neighbors[start:stop]:
+            neighbor = int(neighbor)
+            if not (0 <= neighbor < count) or not refined[neighbor]:
+                continue
+            value = face_luminance(neighbor)
+            if value is None:
+                continue
+            if bright:
+                deviation = max(0.0, seed_value - value)
+            else:
+                deviation = max(0.0, value - seed_value)
+            accepted_neighbors.append((deviation, neighbor, value))
+        if not accepted_neighbors:
+            continue
+        accepted_neighbors.sort(key=lambda item: (item[0], item[1]))
+        plateau_deviation, predecessor, _predecessor_value = accepted_neighbors[0]
+        # If the currently accepted face is already plateau-like, this is the
+        # correct pre-shadow chain and must remain unchanged.
+        if accepted_deviation <= max(1.25 * tolerance, 0.02 * span):
+            continue
+        if plateau_deviation > max(1.25 * tolerance, 0.02 * span):
+            continue
+        proposals.append({
+            "row": int(row),
+            "accepted": int(accepted),
+            "rejected": int(rejected),
+            "predecessor": int(predecessor),
+            "drop": float(directed_drop),
+            "accepted_deviation": float(accepted_deviation),
+            "rejected_drop": float(rejected_drop),
+        })
+
+    if not proposals:
+        return done(
+            "no-valid-direction", refined,
+            shadow_screen_pre_shadow_orientation=orientation,
+            shadow_screen_pre_shadow_no_valid_direction=int(len(rows) + failures),
+            shadow_screen_pre_shadow_unchanged_segments=int(len(rows)),
+        )
+
+    # Connect rows by accepted-side topology first, then by the projected
+    # physical contact geometry.  Adjacent rows on a straight boundary often
+    # do not share a face (each edge separates a different pair of rows), so
+    # requiring a common face would fragment the very chain we want.  The
+    # projected midpoint test remains bounded and rejects parallel chains by
+    # requiring progression perpendicular to the accepted/rejected contact.
+    by_face = {}
+    for index, proposal in enumerate(proposals):
+        for face in (proposal["accepted"], proposal["predecessor"]):
+            by_face.setdefault(face, []).append(index)
+    midpoint_data = {}
+    centers = np.asarray(geometry.get("centers", ()), dtype=np.float64)
+    capture = state.get("shadow_capture")
+    projection = np.asarray(
+        capture.get("view_projection") if isinstance(capture, dict) else (),
+        dtype=np.float64,
+    )
+    full_width = int(metrics.get("shadow_screen_width", 0))
+    full_height = int(metrics.get("shadow_screen_height", 0))
+
+    def project(point):
+        if projection.shape != (4, 4):
+            return None
+        clip = projection @ np.r_[np.asarray(point, dtype=np.float64), 1.0]
+        if not np.all(np.isfinite(clip)) or abs(float(clip[3])) <= 1.0e-12:
+            return None
+        ndc = clip[:3] / float(clip[3])
+        px = (float(ndc[0]) * 0.5 + 0.5) * max(1.0, full_width - 1.0)
+        py = (float(ndc[1]) * 0.5 + 0.5) * max(1.0, full_height - 1.0)
+        return np.asarray((px, py), dtype=np.float64)
+
+    if centers.shape == (count, 3):
+        for index, proposal in enumerate(proposals):
+            a = project(centers[proposal["accepted"]])
+            b = project(centers[proposal["rejected"]])
+            if a is not None and b is not None:
+                edge = b - a
+                length = float(np.linalg.norm(edge))
+                if np.isfinite(length) and length > 1.0e-6:
+                    midpoint_data[index] = (
+                        (a + b) * 0.5,
+                        edge / length,
+                    )
+    nearest = []
+    if len(midpoint_data) >= 2:
+        points = tuple(midpoint_data[index][0] for index in sorted(midpoint_data))
+        for index in sorted(midpoint_data):
+            point = midpoint_data[index][0]
+            distances_to_other = [
+                float(np.linalg.norm(point - other))
+                for other_index, other in midpoint_data.items()
+                if other_index != index
+            ]
+            if distances_to_other:
+                nearest.append(min(distances_to_other))
+    typical_spacing = float(np.median(nearest)) if nearest else 0.0
+    factor = max(1, int(metrics.get("shadow_screen_downsample_factor", 1)))
+    link_distance = max(2.25 * float(factor), 1.8 * typical_spacing)
+    unseen = set(range(len(proposals)))
+    components = []
+    while unseen:
+        root = min(unseen)
+        unseen.remove(root)
+        component = [root]
+        pending = [root]
+        while pending:
+            index = pending.pop()
+            proposal = proposals[index]
+            for face in (proposal["accepted"], proposal["predecessor"]):
+                for other in by_face.get(face, ()):
+                    if other in unseen:
+                        unseen.remove(other)
+                        pending.append(other)
+                        component.append(other)
+            if index in midpoint_data:
+                point, direction = midpoint_data[index]
+                for other in tuple(unseen):
+                    if other not in midpoint_data:
+                        continue
+                    other_point, other_direction = midpoint_data[other]
+                    delta = other_point - point
+                    distance = float(np.linalg.norm(delta))
+                    if not np.isfinite(distance) or distance > link_distance or distance <= 1.0e-6:
+                        continue
+                    delta_direction = delta / distance
+                    # Same oriented edge family and a step along the edge
+                    # chain, not across a parallel shadow line.
+                    if abs(float(np.dot(direction, other_direction))) < 0.5:
+                        continue
+                    if abs(float(np.dot(delta_direction, direction))) > 0.75:
+                        continue
+                    unseen.remove(other)
+                    pending.append(other)
+                    component.append(other)
+        components.append(tuple(sorted(component)))
+    coherent = [component for component in components if len(component) >= 3]
+    if not coherent:
+        return done(
+            "no-coherent-chain", refined,
+            shadow_screen_pre_shadow_orientation=orientation,
+            shadow_screen_pre_shadow_no_valid_direction=int(len(proposals)),
+            shadow_screen_pre_shadow_unchanged_segments=int(len(rows)),
+        )
+
+    remove_faces = set()
+    for component in coherent:
+        for index in component:
+            remove_faces.add(int(proposals[index]["accepted"]))
+    remove_faces.discard(int(seed_face))
+    if not remove_faces:
+        return done(
+            "seed-protected", refined,
+            shadow_screen_pre_shadow_orientation=orientation,
+            shadow_screen_pre_shadow_oriented_chain_count=int(len(coherent)),
+            shadow_screen_pre_shadow_coherent_chain_count=int(len(coherent)),
+            shadow_screen_pre_shadow_unchanged_segments=int(len(rows)),
+        )
+    trial = refined.copy()
+    trial[np.asarray(sorted(remove_faces), dtype=np.int32)] = False
+    if not (0 <= int(seed_face) < count and trial[int(seed_face)]):
+        return done("seed-protected", refined, shadow_screen_pre_shadow_orientation=orientation)
+    # Keep the accepted component connected.  The topology check is safety
+    # only; luminance remains the sole orientation and shift criterion.
+    connected = np.zeros(count, dtype=bool)
+    connected[int(seed_face)] = True
+    q = deque((int(seed_face),))
+    while q:
+        face = int(q.popleft())
+        for neighbor in neighbors[int(offsets[face]):int(offsets[face + 1])]:
+            neighbor = int(neighbor)
+            if 0 <= neighbor < count and trial[neighbor] and not connected[neighbor]:
+                connected[neighbor] = True
+                q.append(neighbor)
+    if not np.all(connected[trial]):
+        return done(
+            "seed-disconnected", refined,
+            shadow_screen_pre_shadow_orientation=orientation,
+            shadow_screen_pre_shadow_oriented_chain_count=int(len(coherent)),
+            shadow_screen_pre_shadow_coherent_chain_count=int(len(coherent)),
+        )
+    return done(
+        "applied",
+        trial,
+        shadow_screen_pre_shadow_orientation=orientation,
+        shadow_screen_pre_shadow_oriented_chain_count=int(len(coherent)),
+        shadow_screen_pre_shadow_coherent_chain_count=int(len(coherent)),
+        shadow_screen_pre_shadow_shift_count=int(len(remove_faces)),
+        shadow_screen_pre_shadow_ring_distance=1,
+        shadow_screen_pre_shadow_accepted_deviation=float(np.median(accepted_deviations)) if accepted_deviations else 0.0,
+        shadow_screen_pre_shadow_rejected_drop=float(np.median(rejected_drops)) if rejected_drops else 0.0,
+        shadow_screen_pre_shadow_unchanged_segments=int(max(0, len(rows) - len(proposals))),
+        shadow_screen_pre_shadow_no_valid_direction=int(failures),
+        shadow_screen_pre_shadow_seed_connected=True,
+    )
+
+
+def _fill_preview_shadow_refine_boundary(
+    state, geometry, buffers, metrics, final, seed_face
+):
+    """Refine a screen-classifier interface inside a bounded face band.
+
+    The ROI flood is the authoritative coarse result.  This pass is allowed
+    to move that interface by at most two adjacency rings, and it reads only
+    the immutable analysis luminance/gradient buffers.  It deliberately does
+    not inspect normals, curvature, Face Sets, distances, or any geometry
+    score: mesh topology is used only to enumerate the local edge band and to
+    keep the accepted component connected.
+    """
+    import numpy as np
+    from collections import deque
+
+    def empty_result(reason):
+        return np.asarray(final, dtype=bool).copy(), {
+            "shadow_screen_refine_reason": str(reason),
+            "shadow_screen_boundary_before": 0,
+            "shadow_screen_boundary_after": 0,
+            "shadow_screen_refine_scored_edges": 0,
+            "shadow_screen_refine_score_min": 0.0,
+            "shadow_screen_refine_score_median": 0.0,
+            "shadow_screen_refine_score_max": 0.0,
+            "shadow_screen_refine_score_threshold": 0.0,
+            "shadow_screen_refine_moved_faces": 0,
+            "shadow_screen_refine_max_ring_shift": 0,
+            "shadow_screen_refine_sample_failures": 0,
+            "shadow_screen_refine_chain_count": 0,
+            "shadow_screen_refine_spikes_removed": 0,
+            "shadow_screen_refine_seed_connected": False,
+        }
+
+    candidate = np.asarray(final, dtype=bool).reshape(-1).copy()
+    count = int(geometry.get("count", len(candidate)))
+    if len(candidate) != count or count <= 0:
+        return empty_result("schema")
+    first = np.asarray(geometry.get("first", ()), dtype=np.int32).reshape(-1)
+    second = np.asarray(geometry.get("second", ()), dtype=np.int32).reshape(-1)
+    if len(first) != len(second):
+        return empty_result("edge-schema")
+    boundary = (first >= 0) & (second >= 0) & (first < count) & (second < count)
+    boundary &= candidate[first] != candidate[second]
+    boundary_rows = np.flatnonzero(boundary).astype(np.int32, copy=False)
+    base_metrics = {
+        "shadow_screen_refine_reason": "not-run",
+        "shadow_screen_boundary_before": int(len(boundary_rows)),
+        "shadow_screen_boundary_after": int(len(boundary_rows)),
+        "shadow_screen_refine_scored_edges": 0,
+        "shadow_screen_refine_score_min": 0.0,
+        "shadow_screen_refine_score_median": 0.0,
+        "shadow_screen_refine_score_max": 0.0,
+        "shadow_screen_refine_score_threshold": 0.0,
+        "shadow_screen_refine_moved_faces": 0,
+        "shadow_screen_refine_max_ring_shift": 0,
+        "shadow_screen_refine_sample_failures": 0,
+        "shadow_screen_refine_chain_count": 0,
+        "shadow_screen_refine_spikes_removed": 0,
+        "shadow_screen_refine_seed_connected": False,
+        "shadow_screen_pre_shadow_oriented_chain_count": 0,
+        "shadow_screen_pre_shadow_orientation": "unknown",
+        "shadow_screen_pre_shadow_shift_count": 0,
+        "shadow_screen_pre_shadow_ring_distance": 0,
+        "shadow_screen_pre_shadow_accepted_deviation": 0.0,
+        "shadow_screen_pre_shadow_rejected_drop": 0.0,
+        "shadow_screen_pre_shadow_unchanged_segments": 0,
+        "shadow_screen_pre_shadow_no_valid_direction": 0,
+        "shadow_screen_pre_shadow_coherent_chain_count": 0,
+        "shadow_screen_pre_shadow_seed_connected": False,
+        "shadow_screen_pre_shadow_reason": "not-run",
+    }
+    if not len(boundary_rows):
+        base_metrics["shadow_screen_refine_reason"] = "no-boundary"
+        base_metrics["shadow_screen_refine_seed_connected"] = bool(
+            0 <= int(seed_face) < count and candidate[int(seed_face)]
+        )
+        return candidate, base_metrics
+    offsets = np.asarray(geometry.get("offsets", ()), dtype=np.int64).reshape(-1)
+    neighbors = np.asarray(geometry.get("neighbors", ()), dtype=np.int32).reshape(-1)
+    edge_indices = np.asarray(geometry.get("edge_indices", ()), dtype=np.int32).reshape(-1)
+    if (
+        len(offsets) != count + 1
+        or int(offsets[-1]) != len(neighbors)
+        or (len(edge_indices) not in (0, len(neighbors)))
+    ):
+        return candidate, {**base_metrics, "shadow_screen_refine_reason": "graph-schema"}
+
+    # Build the bounded one/two-ring face band without traversing unrelated
+    # mesh faces.  The CSR graph is already the cached physical adjacency.
+    ring = np.full(count, -1, dtype=np.int8)
+    band_faces = set()
+    queue = deque()
+    for row in boundary_rows:
+        for face in (int(first[row]), int(second[row])):
+            if ring[face] < 0:
+                ring[face] = 0
+                band_faces.add(face)
+                queue.append(face)
+    while queue:
+        face = int(queue.popleft())
+        depth = int(ring[face])
+        if depth >= 2:
+            continue
+        start, stop = int(offsets[face]), int(offsets[face + 1])
+        for neighbor in neighbors[start:stop]:
+            neighbor = int(neighbor)
+            if 0 <= neighbor < count and ring[neighbor] < 0:
+                ring[neighbor] = depth + 1
+                band_faces.add(neighbor)
+                queue.append(neighbor)
+    band_mask = np.zeros(count, dtype=bool)
+    if band_faces:
+        band_mask[np.asarray(sorted(band_faces), dtype=np.int32)] = True
+
+    # Gather physical edge rows incident to the local face band.  New full
+    # graphs expose edge_indices in the directed CSR; the fallback is kept
+    # for old/synthetic geometry and is still limited to the band predicate.
+    edge_rows = set()
+    for face in sorted(band_faces):
+        start, stop = int(offsets[face]), int(offsets[face + 1])
+        if len(edge_indices) == len(neighbors):
+            for directed in range(start, stop):
+                pair = int(edge_indices[directed])
+                if 0 <= pair < len(first):
+                    edge_rows.add(pair)
+    if not edge_rows:
+        edge_rows.update(
+            int(row)
+            for row in np.flatnonzero(
+                (first >= 0) & (second >= 0)
+                & (first < count) & (second < count)
+                & (band_mask[first] | band_mask[second])
+            )
+        )
+    if not edge_rows:
+        return candidate, {**base_metrics, "shadow_screen_refine_reason": "band-empty"}
+
+    capture = state.get("shadow_capture")
+    projection = np.asarray(
+        capture.get("view_projection") if isinstance(capture, dict) else (),
+        dtype=np.float64,
+    )
+    denoised = np.asarray(buffers.get("denoised", ()), dtype=np.float32)
+    gradient = np.asarray(buffers.get("gradient", ()), dtype=np.float32)
+    if (
+        projection.shape != (4, 4)
+        or denoised.ndim != 2
+        or gradient.shape != denoised.shape
+    ):
+        return candidate, {**base_metrics, "shadow_screen_refine_reason": "buffer-schema"}
+    analysis_h, analysis_w = denoised.shape
+    origin = metrics.get("shadow_screen_roi_origin", (0, 0))
+    factor = max(1, int(metrics.get("shadow_screen_downsample_factor", 1)))
+    full_width = int(metrics.get("shadow_screen_width", 0))
+    full_height = int(metrics.get("shadow_screen_height", 0))
+    if full_width < 2 or full_height < 2:
+        return candidate, {**base_metrics, "shadow_screen_refine_reason": "capture-size"}
+    try:
+        origin_x, origin_y = float(origin[0]), float(origin[1])
+    except (IndexError, TypeError, ValueError):
+        return candidate, {**base_metrics, "shadow_screen_refine_reason": "roi-origin"}
+
+    pair_v0 = np.asarray(geometry.get("pair_v0", ()), dtype=np.int32).reshape(-1)
+    pair_v1 = np.asarray(geometry.get("pair_v1", ()), dtype=np.int32).reshape(-1)
+    centers = np.asarray(geometry.get("centers", ()), dtype=np.float64)
+    vertices = np.asarray(geometry.get("world_vertices", ()), dtype=np.float64)
+    vertex_space = geometry.get("vertex_id_space")
+    cache_key = (
+        int(state.get("shadow_capture_generation", 0)),
+        buffers.get("key"),
+    )
+    refine_cache = state.get("shadow_screen_boundary_refine_cache")
+    if not isinstance(refine_cache, dict) or refine_cache.get("key") != cache_key:
+        refine_cache = {"key": cache_key, "scores": {}}
+        state["shadow_screen_boundary_refine_cache"] = refine_cache
+    score_cache = refine_cache["scores"]
+    score_by_pair = {}
+    failed = 0
+
+    def project(point):
+        clip = projection @ np.r_[np.asarray(point, dtype=np.float64), 1.0]
+        if not np.all(np.isfinite(clip)) or abs(float(clip[3])) <= 1.0e-12:
+            return None
+        ndc = clip[:3] / float(clip[3])
+        x = (float(ndc[0]) * 0.5 + 0.5) * (full_width - 1.0)
+        y = (float(ndc[1]) * 0.5 + 0.5) * (full_height - 1.0)
+        if not np.isfinite(x) or not np.isfinite(y):
+            return None
+        return np.asarray((x, y), dtype=np.float64)
+
+    def sample(x, y, field):
+        # A 3x3 median on the immutable reduced grid makes the boundary score
+        # insensitive to one-pixel shader noise while retaining a thin line.
+        cx, cy = int(round(float((x - origin_x) / factor))), int(
+            round(float((y - origin_y) / factor))
+        )
+        if not (0 <= cx < analysis_w and 0 <= cy < analysis_h):
+            return None
+        xlo, xhi = max(0, cx - 1), min(analysis_w, cx + 2)
+        ylo, yhi = max(0, cy - 1), min(analysis_h, cy + 2)
+        values = np.asarray(field[ylo:yhi, xlo:xhi], dtype=np.float64).reshape(-1)
+        values = values[np.isfinite(values)]
+        return float(np.median(values)) if len(values) else None
+
+    # The physical edge midpoint/side samples are intentionally cached by
+    # pair row for all wheel stages in one capture generation.
+    for pair in sorted(edge_rows):
+        if pair in score_cache:
+            value = score_cache[pair]
+            if isinstance(value, dict) and bool(value.get("ok")):
+                score_by_pair[pair] = float(value.get("score", 0.0))
+            else:
+                failed += 1
+            continue
+        left, right = int(first[pair]), int(second[pair])
+        if not (0 <= left < count and 0 <= right < count):
+            score_cache[pair] = {"ok": False, "reason": "face-schema"}
+            failed += 1
+            continue
+        a = b = None
+        if (
+            len(pair_v0) == len(first) == len(pair_v1)
+            and int(pair_v0[pair]) >= 0
+            and int(pair_v1[pair]) >= 0
+            and len(vertices) > max(int(pair_v0[pair]), int(pair_v1[pair]))
+        ):
+            a = vertices[int(pair_v0[pair])]
+            b = vertices[int(pair_v1[pair])]
+        elif centers.shape == (count, 3):
+            # Synthetic/legacy graphs without endpoints use the two face
+            # centers as a safe projected contact approximation.
+            a, b = centers[left], centers[right]
+        pa, pb = project(a), project(b)
+        if pa is None or pb is None:
+            score_cache[pair] = {"ok": False, "reason": "projection"}
+            failed += 1
+            continue
+        edge_vec = pb - pa
+        edge_len = float(np.linalg.norm(edge_vec))
+        if not np.isfinite(edge_len) or edge_len <= 0.5:
+            score_cache[pair] = {"ok": False, "reason": "degenerate"}
+            failed += 1
+            continue
+        midpoint = (pa + pb) * 0.5
+        perp = np.asarray((-edge_vec[1], edge_vec[0]), dtype=np.float64) / edge_len
+        offset = max(0.75, min(2.5, 0.75 * float(factor)))
+        plus = sample(*(midpoint + perp * offset), denoised)
+        minus = sample(*(midpoint - perp * offset), denoised)
+        gmid = sample(float(midpoint[0]), float(midpoint[1]), gradient)
+        if plus is None or minus is None or gmid is None:
+            score_cache[pair] = {"ok": False, "reason": "side-sample"}
+            failed += 1
+            continue
+        value = float(abs(plus - minus) + 0.5 * max(0.0, gmid))
+        score_cache[pair] = {"ok": True, "score": value}
+        score_by_pair[pair] = value
+    scores = np.asarray(tuple(score_by_pair.values()), dtype=np.float64)
+    base_metrics["shadow_screen_refine_scored_edges"] = int(len(scores))
+    base_metrics["shadow_screen_refine_sample_failures"] = int(failed)
+    if not len(scores):
+        base_metrics["shadow_screen_refine_reason"] = "no-edge-samples"
+        return candidate, base_metrics
+    score_median = float(np.median(scores))
+    score_mad = float(1.4826 * np.median(np.abs(scores - score_median)))
+    score_min, score_max = float(np.min(scores)), float(np.max(scores))
+    span = max(score_max - score_min, 1.0e-8)
+    threshold = max(score_median + max(1.5 * score_mad, 0.10 * span), score_min + 0.25 * span)
+    high_pairs = {
+        int(pair) for pair, value in score_by_pair.items()
+        if float(value) >= threshold and float(value) > score_min + 1.0e-8
+    }
+    base_metrics.update({
+        "shadow_screen_refine_score_min": score_min,
+        "shadow_screen_refine_score_median": score_median,
+        "shadow_screen_refine_score_max": score_max,
+        "shadow_screen_refine_score_threshold": float(threshold),
+    })
+
+    # Grow only from the existing accepted side into the two-ring band.  A
+    # strong sampled edge is a true barrier, while unscored edges are closed
+    # conservatively.  This moves a staircase toward a continuous high-score
+    # chain without touching faces outside the band.
+    refined = candidate.copy()
+    local_sources = np.flatnonzero(candidate & band_mask).astype(np.int32, copy=False)
+    grow = deque(int(value) for value in local_sources)
+    pair_lookup = {}
+    for pair in edge_rows:
+        pair_lookup[(min(int(first[pair]), int(second[pair])), max(int(first[pair]), int(second[pair])))] = int(pair)
+    while grow:
+        face = int(grow.popleft())
+        for directed in range(int(offsets[face]), int(offsets[face + 1])):
+            neighbor = int(neighbors[directed])
+            if not (0 <= neighbor < count) or not band_mask[neighbor] or refined[neighbor]:
+                continue
+            if len(edge_indices) == len(neighbors):
+                pair = int(edge_indices[directed])
+            else:
+                pair = pair_lookup.get((min(face, neighbor), max(face, neighbor)), -1)
+            if pair < 0 or pair not in score_by_pair or pair in high_pairs:
+                continue
+            refined[neighbor] = True
+            grow.append(neighbor)
+
+    # Bounded opening: remove only a genuine one-face accepted leaf.  This is
+    # the local counterpart to Closing above and cannot disconnect the seed
+    # component because a leaf has at most one original accepted neighbor.
+    spikes_removed = 0
+    for face in np.flatnonzero(candidate & band_mask):
+        face = int(face)
+        if face == int(seed_face):
+            continue
+        start, stop = int(offsets[face]), int(offsets[face + 1])
+        adjacent = [int(value) for value in neighbors[start:stop] if 0 <= int(value) < count]
+        accepted_neighbors = sum(bool(candidate[value]) for value in adjacent)
+        outside_neighbors = sum(not bool(candidate[value]) for value in adjacent)
+        if accepted_neighbors > 1 or outside_neighbors < 2:
+            continue
+        incident = []
+        for directed in range(start, stop):
+            neighbor = int(neighbors[directed])
+            pair = (
+                int(edge_indices[directed]) if len(edge_indices) == len(neighbors)
+                else pair_lookup.get((min(face, neighbor), max(face, neighbor)), -1)
+            )
+            if pair in score_by_pair:
+                incident.append(float(score_by_pair[pair]))
+        if incident and max(incident) >= threshold:
+            continue
+        refined[face] = False
+        spikes_removed += 1
+
+    # Seed connectivity is checked on the refined candidate itself.  The
+    # graph walk is bounded by the existing candidate plus the two-ring band.
+    seed_connected = False
+    if 0 <= int(seed_face) < count and refined[int(seed_face)]:
+        connected = np.zeros(count, dtype=bool)
+        connected[int(seed_face)] = True
+        q = deque((int(seed_face),))
+        while q:
+            face = int(q.popleft())
+            for neighbor in neighbors[int(offsets[face]):int(offsets[face + 1])]:
+                neighbor = int(neighbor)
+                if 0 <= neighbor < count and refined[neighbor] and not connected[neighbor]:
+                    connected[neighbor] = True
+                    q.append(neighbor)
+        # Only the original accepted component must remain connected.  Newly
+        # added local faces are allowed to form the snapped boundary component.
+        seed_connected = bool(np.all(connected[candidate]))
+        if not seed_connected:
+            refined = candidate.copy()
+            spikes_removed = 0
+    after_boundary = (first >= 0) & (second >= 0) & (first < count) & (second < count)
+    after_boundary &= refined[first] != refined[second]
+    changed = np.flatnonzero(refined != candidate)
+    shifts = ring[changed]
+    base_metrics.update({
+        "shadow_screen_refine_boundary_after": int(np.count_nonzero(after_boundary)),
+        "shadow_screen_refine_moved_faces": int(len(changed)),
+        "shadow_screen_refine_max_ring_shift": int(np.max(shifts)) if len(shifts) else 0,
+        "shadow_screen_refine_spikes_removed": int(spikes_removed),
+        "shadow_screen_refine_seed_connected": bool(seed_connected),
+        "shadow_screen_refine_chain_count": 0,
+        "shadow_screen_refine_reason": "applied" if len(changed) else "no-interface-move",
+    })
+    # Count high-score chains through shared faces.  This is a bounded
+    # diagnostic; it never decides membership by itself.
+    if high_pairs:
+        by_face = {}
+        for pair in high_pairs:
+            by_face.setdefault(int(first[pair]), set()).add(pair)
+            by_face.setdefault(int(second[pair]), set()).add(pair)
+        unseen = set(high_pairs)
+        chains = 0
+        while unseen:
+            start = min(unseen)
+            unseen.remove(start)
+            pending = [start]
+            chains += 1
+            while pending:
+                pair = pending.pop()
+                for face in (int(first[pair]), int(second[pair])):
+                    for other in by_face.get(face, ()):
+                        if other in unseen:
+                            unseen.remove(other)
+                            pending.append(other)
+        base_metrics["shadow_screen_refine_chain_count"] = int(chains)
+    # The generic bounded pass above removes isolated teeth and can move a
+    # staircase toward a strong chain.  Apply the luminance-directed
+    # pre-shadow choice last so a boundary that sits inside the transition is
+    # pulled back to the seed/plateau side.  The caller still enforces wheel
+    # monotonicity for expand/shrink stages.
+    try:
+        pre_shadow, pre_metrics = _fill_preview_shadow_pre_shadow_snap(
+            state, geometry, buffers, metrics, refined, seed_face
+        )
+        refined = pre_shadow
+        base_metrics.update(pre_metrics)
+        if int(pre_metrics.get("shadow_screen_pre_shadow_shift_count", 0)):
+            base_metrics["shadow_screen_refine_moved_faces"] = int(
+                base_metrics.get("shadow_screen_refine_moved_faces", 0)
+            ) + int(pre_metrics["shadow_screen_pre_shadow_shift_count"])
+            post_boundary = (
+                (first >= 0) & (second >= 0)
+                & (first < count) & (second < count)
+                & (refined[first] != refined[second])
+            )
+            base_metrics["shadow_screen_refine_boundary_after"] = int(
+                np.count_nonzero(post_boundary)
+            )
+            base_metrics["shadow_screen_refine_reason"] = "applied-pre-shadow"
+    except (
+        AttributeError,
+        IndexError,
+        KeyError,
+        MemoryError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+        ZeroDivisionError,
+    ):
+        base_metrics.update({
+            "shadow_screen_pre_shadow_reason": "exception",
+            "shadow_screen_pre_shadow_no_valid_direction": int(len(boundary_rows)),
+        })
+    return refined, base_metrics
+
+
+def _fill_preview_shadow_screen_region(state, geometry, seed_face, step=0):
+    """Classify ordinary-E from one immutable screen-space grayscale image.
+
+    The analysis capture is deliberately separate from the geometry-strict
+    path.  A temporary int32 center-coverage raster maps visible face centers
+    to local face indices; the graph is used only for the final seed-connected
+    safety check and for emitting the exact accepted/rejected interface.  No
+    distance, radius, Face Set, normal, or curvature score participates in
+    this classifier.
+    """
+    return _fill_preview_shadow_screen_region_roi(
+        state, geometry, int(seed_face), int(step)
+    )
+    import numpy as np
+
+    count = int(geometry.get("count", 0))
+    capture = state.get("shadow_capture")
+    metrics = {
+        "shadow_screen_classifier_mode": "screen-grayscale-morphology",
+        "shadow_screen_fallback_reason": "capture-unavailable",
+        "shadow_screen_width": 0,
+        "shadow_screen_height": 0,
+        "shadow_screen_luminance_min": 0.0,
+        "shadow_screen_luminance_max": 0.0,
+        "shadow_screen_seed_luminance": 0.0,
+        "shadow_screen_raw_luminance_min": 0.0,
+        "shadow_screen_raw_luminance_max": 0.0,
+        "shadow_screen_raw_luminance_quantiles": (),
+        "shadow_screen_sharpened_luminance_min": 0.0,
+        "shadow_screen_sharpened_luminance_max": 0.0,
+        "shadow_screen_sharpened_luminance_quantiles": (),
+        "shadow_screen_sharpened_field_used": False,
+        "shadow_screen_sharpen_knee": 0.0,
+        "shadow_screen_sharpen_steepness": 0.0,
+        "shadow_screen_sharpen_curve_scale": 0.0,
+        "shadow_screen_transition_width_before_pixels": 0,
+        "shadow_screen_transition_width_after_pixels": 0,
+        "shadow_screen_transition_face_rows_before": 0,
+        "shadow_screen_transition_face_rows_after": 0,
+        "shadow_screen_sharpened_overlay_active": False,
+        "shadow_screen_sharpened_overlay_alpha": 0.0,
+        "shadow_screen_sharpened_overlay_restored": False,
+        "shadow_screen_denoise_kernel": 3,
+        "shadow_screen_gradient_kernel": 3,
+        "shadow_screen_closing_kernel": 3,
+        "shadow_screen_strong_threshold": 0.0,
+        "shadow_screen_weak_threshold": 0.0,
+        "shadow_screen_threshold": 0.0,
+        "shadow_screen_base_threshold": 0.0,
+        "shadow_screen_step": int(step),
+        "shadow_screen_mask_pixel_count": 0,
+        "shadow_screen_face_pixel_count": 0,
+        "shadow_screen_face_coverage_min": 0.0,
+        "shadow_screen_face_coverage_max": 0.0,
+        "shadow_screen_accepted_count": 0,
+        "shadow_screen_accepted_luminance_min": 0.0,
+        "shadow_screen_accepted_luminance_max": 0.0,
+        "shadow_screen_rejected_neighbor_count": 0,
+        "shadow_screen_boundary_count": 0,
+        "shadow_screen_raw_gradient_min": 0.0,
+        "shadow_screen_raw_gradient_median": 0.0,
+        "shadow_screen_raw_gradient_max": 0.0,
+        "shadow_screen_gradient_mad": 0.0,
+        "shadow_screen_closing_filled_pixels": 0,
+        "shadow_screen_top_hat_used": False,
+        "shadow_screen_black_hat_used": False,
+        "shadow_screen_monotonic_action": "initial",
+        "shadow_screen_initial_count": 0,
+        "shadow_screen_previous_count": 0,
+        "shadow_screen_preserved_count": 0,
+        "shadow_screen_face_set_independent": True,
+        "shadow_screen_id_raster_mode": "int32-face-center-depth-order",
+        "shadow_screen_occlusion_depth_used": False,
+    }
+    state["shadow_luminance_region_edges"] = set()
+    if count <= 0 or not isinstance(capture, dict) or not capture.get("ok"):
+        metrics["shadow_screen_fallback_reason"] = "capture-unavailable"
+        return np.asarray([int(seed_face)], dtype=np.int32), metrics
+    try:
+        image = np.asarray(capture.get("luminance", ()), dtype=np.float32)
+        if image.ndim != 2 or image.shape[0] < 8 or image.shape[1] < 8:
+            raise ValueError("screen-image-schema")
+        height, width = (int(image.shape[0]), int(image.shape[1]))
+        metrics["shadow_screen_width"] = width
+        metrics["shadow_screen_height"] = height
+        finite = np.isfinite(image)
+        if not np.any(finite):
+            raise ValueError("screen-image-empty")
+        image = np.where(finite, image, float(np.nanmedian(image))).astype(
+            np.float32, copy=False
+        )
+        metrics["shadow_screen_luminance_min"] = float(np.min(image))
+        metrics["shadow_screen_luminance_max"] = float(np.max(image))
+
+        # Small fixed median removes one-pixel shader/readback noise while
+        # retaining the visible toon-dark band.  The morphology is image
+        # based and independent of candidate size or wheel radius.
+        padded = np.pad(image, 1, mode="edge")
+        samples = np.stack(
+            tuple(
+                padded[dy:dy + height, dx:dx + width]
+                for dy in range(3) for dx in range(3)
+            ),
+            axis=0,
+        )
+        denoised = np.median(samples, axis=0).astype(np.float32, copy=False)
+        dilated = np.max(samples, axis=0)
+        eroded = np.min(samples, axis=0)
+        gradient = np.maximum(dilated - eroded, 0.0)
+        finite_gradient = gradient[np.isfinite(gradient)]
+        gradient_median = float(np.median(finite_gradient)) if len(finite_gradient) else 0.0
+        gradient_mad = float(
+            1.4826 * np.median(np.abs(finite_gradient - gradient_median))
+        ) if len(finite_gradient) else 0.0
+        metrics["shadow_screen_raw_gradient_min"] = float(np.min(gradient))
+        metrics["shadow_screen_raw_gradient_median"] = gradient_median
+        metrics["shadow_screen_raw_gradient_max"] = float(np.max(gradient))
+        metrics["shadow_screen_gradient_mad"] = gradient_mad
+        gradient_span = max(float(np.max(denoised) - np.min(denoised)), 1.0e-3)
+        strong_threshold = max(
+            gradient_median + 3.0 * max(gradient_mad, 1.0e-4),
+            gradient_span * 0.04,
+        )
+        weak_threshold = max(
+            gradient_median + 1.5 * max(gradient_mad, 1.0e-4),
+            strong_threshold * 0.5,
+        )
+        metrics["shadow_screen_strong_threshold"] = float(strong_threshold)
+        metrics["shadow_screen_weak_threshold"] = float(weak_threshold)
+        strong = gradient >= strong_threshold
+        weak = gradient >= weak_threshold
+        # Hysteresis: only weak pixels connected to a strong seed are barriers.
+        hysteresis = np.zeros_like(strong, dtype=bool)
+        strong_rows, strong_cols = np.nonzero(strong)
+        frontier = [(int(y), int(x)) for y, x in zip(strong_rows, strong_cols)]
+        hysteresis[strong] = True
+        while frontier:
+            y, x = frontier.pop()
+            for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < height and 0 <= nx < width and weak[ny, nx] and not hysteresis[ny, nx]:
+                    hysteresis[ny, nx] = True
+                    frontier.append((ny, nx))
+        # Closing bridges a one/two pixel gap in one continuous line.  It is
+        # applied to the scalar-derived barrier, never to selected faces.
+        barrier_pad = np.pad(hysteresis, 1, mode="constant")
+        barrier_samples = np.stack(
+            tuple(
+                barrier_pad[dy:dy + height, dx:dx + width]
+                for dy in range(3) for dx in range(3)
+            ),
+            axis=0,
+        )
+        dilated_barrier = np.max(barrier_samples, axis=0)
+        closed_pad = np.pad(dilated_barrier, 1, mode="constant")
+        closed_samples = np.stack(
+            tuple(
+                closed_pad[dy:dy + height, dx:dx + width]
+                for dy in range(3) for dx in range(3)
+            ),
+            axis=0,
+        )
+        closed_barrier = np.min(closed_samples, axis=0).astype(bool)
+        metrics["shadow_screen_closing_filled_pixels"] = int(
+            np.count_nonzero(closed_barrier & ~hysteresis)
+        )
+
+        projection = np.asarray(capture.get("view_projection"), dtype=np.float64)
+        centers = np.asarray(geometry.get("centers", ()), dtype=np.float64)
+        hidden = np.asarray(
+            geometry.get("hidden", np.zeros(count, dtype=bool)), dtype=bool
+        ).reshape(-1)
+        source_hard = np.asarray(
+            geometry.get("source_hard", np.zeros(count, dtype=bool)), dtype=bool
+        ).reshape(-1)
+        if projection.shape != (4, 4) or centers.shape != (count, 3):
+            raise ValueError("screen-projection-schema")
+        if len(hidden) != count:
+            hidden = np.zeros(count, dtype=bool)
+        if len(source_hard) != count:
+            source_hard = np.zeros(count, dtype=bool)
+        clip = np.c_[centers, np.ones(count, dtype=np.float64)] @ projection.T
+        valid = np.all(np.isfinite(clip), axis=1) & (np.abs(clip[:, 3]) > 1.0e-12)
+        ndc = np.zeros((count, 3), dtype=np.float64)
+        ndc[valid] = clip[valid, :3] / clip[valid, 3, None]
+        xs = np.rint((ndc[:, 0] * 0.5 + 0.5) * (width - 1)).astype(np.int64)
+        ys = np.rint((ndc[:, 1] * 0.5 + 0.5) * (height - 1)).astype(np.int64)
+        inside = (
+            valid & ~hidden & ~source_hard
+            & (xs >= 0) & (xs < width) & (ys >= 0) & (ys < height)
+        )
+        depth_image = np.asarray(capture.get("depth", ()), dtype=np.float32)
+        if depth_image.shape == (height, width):
+            projected_depth = ndc[:, 2] * 0.5 + 0.5
+            sampled_depth = np.full(count, np.nan, dtype=np.float64)
+            sampled_depth[inside] = depth_image[ys[inside], xs[inside]]
+            depth_valid = inside & np.isfinite(sampled_depth)
+            # GPU depth readback is only used when the buffer has the normal
+            # [0,1] range.  A conservative tolerance avoids discarding a
+            # visible center due to polygon-center interpolation differences.
+            plausible = depth_valid & (sampled_depth >= -1.0e-4) & (sampled_depth <= 1.0001)
+            if np.any(plausible):
+                inside &= ~plausible | (
+                    np.abs(sampled_depth - projected_depth) <= 0.05
+                )
+                metrics["shadow_screen_occlusion_depth_used"] = True
+        id_raster = np.full((height, width), -1, dtype=np.int32)
+        depth_raster = np.full((height, width), np.inf, dtype=np.float64)
+        valid_ids = np.flatnonzero(inside)
+        if len(valid_ids) == 0:
+            raise ValueError("screen-id-raster-empty")
+        flat = ys[valid_ids] * width + xs[valid_ids]
+        # OpenGL NDC z is ordered from near to far in increasing depth for
+        # this comparison.  Stable sorting makes ties deterministic.
+        order = np.argsort(ndc[valid_ids, 2], kind="stable")
+        flat_ordered = flat[order]
+        id_flat = id_raster.ravel()
+        depth_flat = depth_raster.ravel()
+        id_flat[flat_ordered] = valid_ids[order].astype(np.int32, copy=False)
+        depth_flat[flat_ordered] = ndc[valid_ids[order], 2]
+        metrics["shadow_screen_face_pixel_count"] = int(np.count_nonzero(id_raster >= 0))
+        coverage = np.bincount(id_raster[id_raster >= 0], minlength=count)
+        nonzero_coverage = coverage[coverage > 0]
+        if len(nonzero_coverage):
+            metrics["shadow_screen_face_coverage_min"] = float(np.min(nonzero_coverage))
+            metrics["shadow_screen_face_coverage_max"] = float(np.max(nonzero_coverage))
+
+        seed = int(seed_face)
+        if seed < 0 or seed >= count or not inside[seed]:
+            raise ValueError("screen-seed-raster-missing")
+        seed_x, seed_y = int(xs[seed]), int(ys[seed])
+        seed_patch = image[max(0, seed_y - 1):min(height, seed_y + 2), max(0, seed_x - 1):min(width, seed_x + 2)]
+        seed_luminance = float(np.median(seed_patch)) if seed_patch.size else float(image[seed_y, seed_x])
+        metrics["shadow_screen_seed_luminance"] = seed_luminance
+        all_values = denoised[np.isfinite(denoised)]
+        global_median = float(np.median(all_values)) if len(all_values) else seed_luminance
+        plateau_values = seed_patch[np.isfinite(seed_patch)]
+        plateau_median = float(np.median(plateau_values)) if len(plateau_values) else seed_luminance
+        plateau_mad = float(1.4826 * np.median(np.abs(plateau_values - plateau_median))) if len(plateau_values) else 0.0
+        bright = bool(seed_luminance >= global_median)
+        tolerance = max(3.0 * plateau_mad, 0.02 * max(abs(plateau_median), 1.0e-2), 1.0e-3)
+        cache = state.get("shadow_screen_classifier_cache")
+        generation = int(state.get("shadow_capture_generation", 0))
+        if not isinstance(cache, dict) or cache.get("generation") != generation:
+            values_sorted = np.sort(np.unique(all_values))
+            if bright:
+                side = values_sorted[values_sorted <= seed_luminance + 1.0e-9]
+                gaps = np.diff(side) if len(side) >= 2 else np.empty(0)
+                if len(gaps) and float(np.max(gaps)) > max(2.0 * tolerance, 0.01):
+                    idx = int(np.argmax(gaps)); base_threshold = float((side[idx] + side[idx + 1]) * 0.5)
+                else:
+                    base_threshold = float(plateau_median - tolerance)
+            else:
+                side = values_sorted[values_sorted >= seed_luminance - 1.0e-9]
+                gaps = np.diff(side) if len(side) >= 2 else np.empty(0)
+                if len(gaps) and float(np.max(gaps)) > max(2.0 * tolerance, 0.01):
+                    idx = int(np.argmax(gaps)); base_threshold = float((side[idx] + side[idx + 1]) * 0.5)
+                else:
+                    base_threshold = float(plateau_median + tolerance)
+            cache = {
+                "generation": generation,
+                "base_threshold": float(base_threshold),
+                "bright": bool(bright),
+                "seed_luminance": float(seed_luminance),
+                "tolerance": float(tolerance),
+            }
+            state["shadow_screen_classifier_cache"] = cache
+        base_threshold = float(cache.get("base_threshold", seed_luminance))
+        bright = bool(cache.get("bright", bright))
+        threshold_delta = max(
+            float(cache.get("tolerance", tolerance)) * 0.5,
+            (float(np.percentile(all_values, 90.0)) - float(np.percentile(all_values, 10.0))) * 0.05
+            if len(all_values) else 0.01,
+            0.01,
+        )
+        threshold = base_threshold + ((-int(step)) if bright else int(step)) * threshold_delta
+        threshold = float(np.clip(threshold, float(np.min(all_values)), float(np.max(all_values))))
+        metrics["shadow_screen_base_threshold"] = base_threshold
+        metrics["shadow_screen_threshold"] = threshold
+        metrics["shadow_screen_seed_luminance"] = float(cache.get("seed_luminance", seed_luminance))
+        class_mask = denoised >= threshold if bright else denoised <= threshold
+        # 2-D seed flood through the luminance class; closed strong gradients
+        # are the only image-space barriers.  No screen edge overlap test is
+        # used as the primary classifier.
+        region = np.zeros((height, width), dtype=bool)
+        if not class_mask[seed_y, seed_x]:
+            class_mask[seed_y, seed_x] = True
+        region[seed_y, seed_x] = True
+        frontier = [(seed_y, seed_x)]
+        while frontier:
+            y, x = frontier.pop()
+            for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                ny, nx = y + dy, x + dx
+                if not (0 <= ny < height and 0 <= nx < width):
+                    continue
+                if region[ny, nx] or not class_mask[ny, nx]:
+                    continue
+                # Luminance class membership is the primary barrier.  A
+                # strong gradient pixel inside the same class must not split
+                # a wide bright plateau into one-pixel islands; the closed
+                # hysteresis map is retained for diagnostics and for
+                # opposite-class transitions only.
+                if (
+                    (closed_barrier[ny, nx] or closed_barrier[y, x])
+                    and bool(class_mask[ny, nx]) != bool(class_mask[y, x])
+                ):
+                    continue
+                region[ny, nx] = True
+                frontier.append((ny, nx))
+        metrics["shadow_screen_mask_pixel_count"] = int(np.count_nonzero(region))
+        pixel_faces = id_raster[region]
+        pixel_faces = pixel_faces[pixel_faces >= 0]
+        candidates = np.zeros(count, dtype=bool)
+        if len(pixel_faces):
+            candidates[np.unique(pixel_faces)] = True
+        candidates[seed] = True
+        # Graph connectivity is a topology safety check only.  It does not
+        # add any geometry score or radius condition to normal E.
+        offsets = np.asarray(geometry.get("offsets", ()), dtype=np.int64).reshape(-1)
+        neighbors = np.asarray(geometry.get("neighbors", ()), dtype=np.int32).reshape(-1)
+        connected = np.zeros(count, dtype=bool)
+        if len(offsets) == count + 1 and int(offsets[-1]) == len(neighbors):
+            connected[seed] = True
+            frontier_faces = [seed]
+            while frontier_faces:
+                face = int(frontier_faces.pop())
+                for neighbor in neighbors[int(offsets[face]):int(offsets[face + 1])]:
+                    neighbor = int(neighbor)
+                    if 0 <= neighbor < count and candidates[neighbor] and not connected[neighbor]:
+                        connected[neighbor] = True
+                        frontier_faces.append(neighbor)
+        else:
+            connected = candidates
+            connected[seed] = True
+        connected &= ~hidden & ~source_hard
+        connected[seed] = True
+        candidate_ids = np.flatnonzero(connected).astype(np.int32, copy=False)
+
+        face_ids = np.asarray(
+            geometry.get("face_ids", np.arange(count, dtype=np.int32)), dtype=np.int32
+        ).reshape(-1)
+        if len(face_ids) != count:
+            face_ids = np.arange(count, dtype=np.int32)
+        candidate_stable = np.unique(face_ids[candidate_ids]).astype(np.int32, copy=False)
+        initial_stable = np.asarray(state.get("shadow_screen_initial_ids", ()), dtype=np.int32).reshape(-1)
+        previous_stable = np.asarray(state.get("shadow_screen_previous_ids", ()), dtype=np.int32).reshape(-1)
+        if int(step) == 0:
+            if len(initial_stable) == 0:
+                initial_stable = candidate_stable.copy()
+                state["shadow_screen_initial_ids"] = initial_stable.copy()
+                action = "initial"
+            else:
+                candidate_stable = initial_stable.copy()
+                action = "return-to-initial"
+        elif int(step) > 0:
+            candidate_stable = np.unique(np.concatenate((candidate_stable, initial_stable, previous_stable))).astype(np.int32, copy=False)
+            action = "expand-union"
+        else:
+            candidate_stable = np.intersect1d(candidate_stable, initial_stable)
+            if len(previous_stable) and int(state.get("shadow_screen_previous_step", 0)) > int(step):
+                candidate_stable = np.intersect1d(candidate_stable, previous_stable)
+            action = "shrink-intersection"
+        final = np.isin(face_ids, candidate_stable) & ~hidden & ~source_hard
+        final[seed] = True
+        selected_ids = np.flatnonzero(final).astype(np.int32, copy=False)
+        state["shadow_screen_previous_ids"] = candidate_stable.copy()
+        state["shadow_screen_previous_step"] = int(step)
+        metrics["shadow_screen_monotonic_action"] = action
+        metrics["shadow_screen_initial_count"] = int(len(initial_stable))
+        metrics["shadow_screen_previous_count"] = int(len(previous_stable))
+        metrics["shadow_screen_preserved_count"] = int(len(np.intersect1d(candidate_stable, initial_stable)))
+        metrics["shadow_screen_accepted_count"] = int(len(selected_ids))
+        accepted_values = denoised[ys[selected_ids], xs[selected_ids]] if len(selected_ids) else np.empty(0)
+        if len(accepted_values):
+            metrics["shadow_screen_accepted_luminance_min"] = float(np.min(accepted_values))
+            metrics["shadow_screen_accepted_luminance_max"] = float(np.max(accepted_values))
+        first = np.asarray(geometry.get("first", ()), dtype=np.int32).reshape(-1)
+        second = np.asarray(geometry.get("second", ()), dtype=np.int32).reshape(-1)
+        edge_keys = set()
+        for pair_index, (left, right) in enumerate(zip(first, second)):
+            left, right = int(left), int(right)
+            if 0 <= left < count and 0 <= right < count and bool(final[left]) != bool(final[right]):
+                key = _fill_preview_shadow_edge_key(geometry, pair_index)
+                if key is not None:
+                    edge_keys.add(key)
+        state["shadow_luminance_region_edges"] = edge_keys
+        metrics["shadow_screen_boundary_count"] = int(len(edge_keys))
+        metrics["shadow_screen_rejected_neighbor_count"] = int(max(0, len(edge_keys)))
+        metrics["shadow_screen_fallback_reason"] = "ok"
+        return selected_ids, metrics
+    except (AttributeError, IndexError, KeyError, MemoryError, RuntimeError, TypeError, ValueError, ZeroDivisionError):
+        metrics["shadow_screen_fallback_reason"] = "screen-raster-or-morphology-failed"
+        return np.asarray([int(seed_face)], dtype=np.int32), metrics
+
+
+def _fill_preview_shadow_screen_region_roi(state, geometry, seed_face, step=0):
+    """Bounded ordinary-E screen classifier for one immutable cursor ROI.
+
+    Capture and projection are still performed once per invoke, but all image
+    morphology and flood work is cropped to a brush-sized circle.  The mesh
+    map is deliberately center-sample based: each visible projected face
+    center owns one ROI pixel and the final interface is the physical edge
+    between accepted and rejected center samples.  This keeps the experimental
+    path predictable on dense meshes without pretending to be polygon coverage.
+    """
+    import numpy as np
+    from collections import deque
+
+    count = int(geometry.get("count", 0))
+    seed = int(seed_face)
+    generation = int(state.get("shadow_capture_generation", 0))
+    metrics = {
+        "shadow_screen_classifier_mode": "screen-grayscale-morphology-roi",
+        "shadow_screen_fallback_reason": "capture-unavailable",
+        "shadow_screen_width": 0,
+        "shadow_screen_height": 0,
+        "shadow_screen_roi_origin": (0, 0),
+        "shadow_screen_roi_bounds": (0, 0, 0, 0),
+        "shadow_screen_roi_radius": int(state.get("shadow_screen_roi_radius", 320)),
+        "shadow_screen_roi_pixel_count": 0,
+        "shadow_screen_roi_circle_pixels": 0,
+        "shadow_screen_analysis_width": 0,
+        "shadow_screen_analysis_height": 0,
+        "shadow_screen_downsample_factor": 1,
+        "shadow_screen_projected_median_edge_spacing": 0.0,
+        "shadow_screen_analysis_pixel_count": 0,
+        "shadow_screen_luminance_min": 0.0,
+        "shadow_screen_luminance_max": 0.0,
+        "shadow_screen_seed_luminance": 0.0,
+        "shadow_screen_raw_luminance_min": 0.0,
+        "shadow_screen_raw_luminance_max": 0.0,
+        "shadow_screen_raw_luminance_quantiles": (),
+        "shadow_screen_sharpened_luminance_min": 0.0,
+        "shadow_screen_sharpened_luminance_max": 0.0,
+        "shadow_screen_sharpened_luminance_quantiles": (),
+        "shadow_screen_sharpened_field_used": False,
+        "shadow_screen_sharpen_knee": 0.0,
+        "shadow_screen_sharpen_steepness": 0.0,
+        "shadow_screen_sharpen_curve_scale": 0.0,
+        "shadow_screen_transition_width_before_pixels": 0,
+        "shadow_screen_transition_width_after_pixels": 0,
+        "shadow_screen_transition_face_rows_before": 0,
+        "shadow_screen_transition_face_rows_after": 0,
+        "shadow_screen_sharpened_overlay_active": False,
+        "shadow_screen_sharpened_overlay_alpha": 0.0,
+        "shadow_screen_sharpened_overlay_restored": False,
+        "shadow_screen_denoise_kernel": 3,
+        "shadow_screen_gradient_kernel": 3,
+        "shadow_screen_closing_kernel": 3,
+        "shadow_screen_strong_threshold": 0.0,
+        "shadow_screen_weak_threshold": 0.0,
+        "shadow_screen_threshold": 0.0,
+        "shadow_screen_base_threshold": 0.0,
+        "shadow_screen_step": int(step),
+        "shadow_screen_mask_pixel_count": 0,
+        "shadow_screen_face_pixel_count": 0,
+        "shadow_screen_face_coverage_min": 0.0,
+        "shadow_screen_face_coverage_max": 0.0,
+        "shadow_screen_accepted_count": 0,
+        "shadow_screen_accepted_luminance_min": 0.0,
+        "shadow_screen_accepted_luminance_max": 0.0,
+        "shadow_screen_rejected_neighbor_count": 0,
+        "shadow_screen_boundary_count": 0,
+        "shadow_screen_raw_gradient_min": 0.0,
+        "shadow_screen_raw_gradient_median": 0.0,
+        "shadow_screen_raw_gradient_max": 0.0,
+        "shadow_screen_gradient_mad": 0.0,
+        "shadow_screen_closing_filled_pixels": 0,
+        "shadow_screen_top_hat_used": False,
+        "shadow_screen_black_hat_used": False,
+        "shadow_screen_monotonic_action": "initial",
+        "shadow_screen_initial_count": 0,
+        "shadow_screen_previous_count": 0,
+        "shadow_screen_preserved_count": 0,
+        "shadow_screen_face_set_independent": True,
+        "shadow_screen_id_raster_mode": "int32-visible-face-center-depth-order",
+        "shadow_screen_center_sample_mode": True,
+        "shadow_screen_centers_considered": 0,
+        "shadow_screen_centers_visible": 0,
+        "shadow_screen_centers_in_region": 0,
+        "shadow_screen_duplicate_center_pixel_count": 0,
+        "shadow_screen_max_centers_per_pixel": 0,
+        "shadow_screen_candidates_after_connectivity": 0,
+        "shadow_screen_collapse_reason": "none",
+        "shadow_screen_pixels_visited": 0,
+        "shadow_screen_traversal_chunks": 0,
+        "shadow_screen_work_budget": 0,
+        "shadow_screen_work_budget_cap": 0,
+        "shadow_screen_cancel_state": "not-requested",
+        "shadow_screen_barrier_pixels_rejected": 0,
+        "shadow_screen_barrier_crossings_rejected": 0,
+        "shadow_screen_frontier_count": 0,
+        "shadow_screen_refine_reason": "not-run",
+        "shadow_screen_boundary_before": 0,
+        "shadow_screen_boundary_after": 0,
+        "shadow_screen_refine_scored_edges": 0,
+        "shadow_screen_refine_score_min": 0.0,
+        "shadow_screen_refine_score_median": 0.0,
+        "shadow_screen_refine_score_max": 0.0,
+        "shadow_screen_refine_score_threshold": 0.0,
+        "shadow_screen_refine_moved_faces": 0,
+        "shadow_screen_refine_max_ring_shift": 0,
+        "shadow_screen_refine_sample_failures": 0,
+        "shadow_screen_refine_chain_count": 0,
+        "shadow_screen_refine_spikes_removed": 0,
+        "shadow_screen_refine_seed_connected": False,
+    }
+    state["shadow_luminance_region_edges"] = set()
+
+    def seed_only(reason):
+        metrics["shadow_screen_fallback_reason"] = str(reason)
+        metrics["shadow_screen_accepted_count"] = 1 if 0 <= seed < count else 0
+        return np.asarray([seed], dtype=np.int32) if 0 <= seed < count else np.empty(0, dtype=np.int32), metrics
+
+    capture = state.get("shadow_capture")
+    if count <= 0 or not isinstance(capture, dict) or not capture.get("ok"):
+        return seed_only("capture-unavailable")
+    try:
+        full = np.asarray(capture.get("luminance", ()), dtype=np.float32)
+        if full.ndim != 2 or full.shape[0] < 8 or full.shape[1] < 8:
+            return seed_only("screen-image-schema")
+        height, width = int(full.shape[0]), int(full.shape[1])
+        metrics["shadow_screen_width"] = width
+        metrics["shadow_screen_height"] = height
+        seed_screen = state.get("seed_screen", capture.get("seed_screen"))
+        try:
+            sx, sy = int(round(float(seed_screen[0]))), int(round(float(seed_screen[1])))
+        except (IndexError, TypeError, ValueError):
+            sx, sy = width // 2, height // 2
+        sx = max(0, min(width - 1, sx))
+        sy = max(0, min(height - 1, sy))
+        roi_radius = 320
+        x0, x1 = max(0, sx - roi_radius), min(width, sx + roi_radius + 1)
+        y0, y1 = max(0, sy - roi_radius), min(height, sy + roi_radius + 1)
+        if x1 - x0 < 8 or y1 - y0 < 8:
+            return seed_only("roi-too-small")
+        metrics["shadow_screen_roi_origin"] = (int(x0), int(y0))
+        metrics["shadow_screen_roi_bounds"] = (int(x0), int(y0), int(x1), int(y1))
+        roi_w, roi_h = int(x1 - x0), int(y1 - y0)
+        yy, xx = np.ogrid[:roi_h, :roi_w]
+        circle = ((xx + x0 - sx) ** 2 + (yy + y0 - sy) ** 2) <= roi_radius ** 2
+        metrics["shadow_screen_roi_pixel_count"] = int(circle.size)
+        metrics["shadow_screen_roi_circle_pixels"] = int(np.count_nonzero(circle))
+
+        buffers = state.get("shadow_screen_buffers")
+        # Estimate a robust projected face-center spacing before building the
+        # image buffers.  Two-to-four analysis samples per typical face keeps
+        # a 640px context while avoiding a Python walk over hundreds of
+        # thousands of mostly redundant pixels.
+        projection_probe = np.asarray(capture.get("view_projection"), dtype=np.float64)
+        centers_probe = np.asarray(geometry.get("centers", ()), dtype=np.float64)
+        edge_spacing = np.empty(0, dtype=np.float64)
+        if projection_probe.shape == (4, 4) and centers_probe.shape == (count, 3):
+            clip_probe = np.c_[centers_probe, np.ones(count, dtype=np.float64)] @ projection_probe.T
+            valid_probe = np.all(np.isfinite(clip_probe), axis=1) & (np.abs(clip_probe[:, 3]) > 1.0e-12)
+            ndc_probe = np.zeros((count, 3), dtype=np.float64)
+            ndc_probe[valid_probe] = clip_probe[valid_probe, :3] / clip_probe[valid_probe, 3, None]
+            px_probe = np.rint((ndc_probe[:, 0] * 0.5 + 0.5) * (width - 1)).astype(np.int64)
+            py_probe = np.rint((ndc_probe[:, 1] * 0.5 + 0.5) * (height - 1)).astype(np.int64)
+            first_probe = np.asarray(geometry.get("first", ()), dtype=np.int32).reshape(-1)
+            second_probe = np.asarray(geometry.get("second", ()), dtype=np.int32).reshape(-1)
+            valid_pairs = (
+                (first_probe >= 0) & (second_probe >= 0)
+                & (first_probe < count) & (second_probe < count)
+                & valid_probe[first_probe] & valid_probe[second_probe]
+            ) if len(first_probe) == len(second_probe) else np.zeros(0, dtype=bool)
+            if np.any(valid_pairs):
+                dx = px_probe[first_probe[valid_pairs]] - px_probe[second_probe[valid_pairs]]
+                dy = py_probe[first_probe[valid_pairs]] - py_probe[second_probe[valid_pairs]]
+                edge_spacing = np.hypot(dx, dy).astype(np.float64)
+                edge_spacing = edge_spacing[np.isfinite(edge_spacing) & (edge_spacing > 0.0)]
+        median_spacing = float(np.median(edge_spacing)) if len(edge_spacing) else 4.0
+        downsample = int(max(2, min(8, round(median_spacing / 3.0))))
+        metrics["shadow_screen_projected_median_edge_spacing"] = median_spacing
+        buffer_key = (generation, int(x0), int(y0), int(x1), int(y1), int(roi_radius), downsample)
+        if not isinstance(buffers, dict) or buffers.get("key") != buffer_key:
+            source_h, source_w = int(y1 - y0), int(x1 - x0)
+            source_circle = circle
+            image = full[y0:y1, x0:x1].copy()
+            finite = np.isfinite(image)
+            if not np.any(finite):
+                return seed_only("screen-image-empty")
+            fill = float(np.median(image[finite]))
+            image = np.where(finite, image, fill).astype(np.float32, copy=False)
+            analysis_h = int((source_h + downsample - 1) // downsample)
+            analysis_w = int((source_w + downsample - 1) // downsample)
+            padded_image = np.pad(
+                image,
+                ((0, analysis_h * downsample - source_h),
+                 (0, analysis_w * downsample - source_w)),
+                mode="edge",
+            )
+            image = np.median(
+                padded_image.reshape(analysis_h, downsample, analysis_w, downsample),
+                axis=(1, 3),
+            ).astype(np.float32, copy=False)
+            roi_h, roi_w = analysis_h, analysis_w
+            analysis_x = x0 + (np.arange(roi_w, dtype=np.float64) + 0.5) * downsample
+            analysis_y = y0 + (np.arange(roi_h, dtype=np.float64) + 0.5) * downsample
+            ay, ax = np.meshgrid(analysis_y, analysis_x, indexing="ij")
+            circle = ((ax - sx) ** 2 + (ay - sy) ** 2) <= roi_radius ** 2
+            metrics["shadow_screen_analysis_width"] = int(roi_w)
+            metrics["shadow_screen_analysis_height"] = int(roi_h)
+            metrics["shadow_screen_analysis_pixel_count"] = int(circle.size)
+            pad = np.pad(image, 1, mode="edge")
+            samples = np.stack(tuple(
+                pad[dy:dy + roi_h, dx:dx + roi_w]
+                for dy in range(3) for dx in range(3)
+            ), axis=0)
+            raw_denoised = np.median(samples, axis=0).astype(np.float32, copy=False)
+            # The visible toon_dark field can contain a broad studio-light
+            # ramp.  Keep its ordering but apply a monotonic, adaptive sigmoid
+            # around the robust seed-class knee so morphology and boundary
+            # scoring see the same narrow transition instead of a wide gray
+            # shelf.  Raw values remain available for diagnostics.
+            raw_values = raw_denoised[circle]
+            raw_values = raw_values[np.isfinite(raw_values)]
+            seed_cell_x = int(np.clip((sx - x0) // downsample, 0, roi_w - 1))
+            seed_cell_y = int(np.clip((sy - y0) // downsample, 0, roi_h - 1))
+            raw_seed = float(raw_denoised[seed_cell_y, seed_cell_x])
+            raw_q05 = float(np.percentile(raw_values, 5.0)) if len(raw_values) else raw_seed
+            raw_q95 = float(np.percentile(raw_values, 95.0)) if len(raw_values) else raw_seed
+            raw_span = max(raw_q95 - raw_q05, 1.0e-6)
+            raw_median = float(np.median(raw_values)) if len(raw_values) else raw_seed
+            seed_window = raw_denoised[
+                max(0, seed_cell_y - 1):min(roi_h, seed_cell_y + 2),
+                max(0, seed_cell_x - 1):min(roi_w, seed_cell_x + 2),
+            ]
+            seed_window = seed_window[np.isfinite(seed_window)]
+            seed_ref = float(np.median(seed_window)) if len(seed_window) else raw_seed
+            seed_mad = float(1.4826 * np.median(np.abs(seed_window - seed_ref))) if len(seed_window) else 0.0
+            seed_tolerance = max(3.0 * seed_mad, 0.02 * max(abs(seed_ref), 1.0e-2), 1.0e-3)
+            raw_sorted = np.sort(np.unique(raw_values)) if len(raw_values) else np.empty(0)
+            raw_bright = bool(seed_ref >= raw_median)
+            raw_side = (
+                raw_sorted[raw_sorted <= seed_ref + 1.0e-9]
+                if raw_bright else raw_sorted[raw_sorted >= seed_ref - 1.0e-9]
+            )
+            raw_gaps = np.diff(raw_side) if len(raw_side) >= 2 else np.empty(0)
+            raw_gap_index = int(np.argmax(raw_gaps)) if len(raw_gaps) else -1
+            if raw_gap_index >= 0 and float(raw_gaps[raw_gap_index]) > max(2.0 * seed_tolerance, 0.01):
+                raw_knee = float((raw_side[raw_gap_index] + raw_side[raw_gap_index + 1]) * 0.5)
+            else:
+                raw_knee = float(seed_ref - seed_tolerance if raw_bright else seed_ref + seed_tolerance)
+            raw_knee = float(np.clip(raw_knee, raw_q05, raw_q95))
+            curve_scale = max(0.06 * raw_span, 2.0 * seed_tolerance, 1.0e-3)
+            steepness = float(np.clip(raw_span / curve_scale * 0.85, 3.0, 14.0))
+            if raw_span > max(1.0e-4, 4.0 * seed_tolerance):
+                normalized = np.clip((raw_denoised.astype(np.float64) - raw_q05) / raw_span, 0.0, 1.0)
+                knee_normalized = float(np.clip((raw_knee - raw_q05) / raw_span, 0.0, 1.0))
+                exponent = np.clip(-steepness * (normalized - knee_normalized), -40.0, 40.0)
+                sigmoid = 1.0 / (1.0 + np.exp(exponent))
+                denoised = (raw_q05 + raw_span * sigmoid).astype(np.float32, copy=False)
+                sharpened_active = True
+                sharpened_knee = float(raw_q05 + raw_span * 0.5)
+            else:
+                denoised = raw_denoised.copy()
+                sharpened_active = False
+                sharpened_knee = raw_seed
+            denoised_pad = np.pad(denoised, 1, mode="edge")
+            denoised_samples = np.stack(tuple(
+                denoised_pad[dy:dy + roi_h, dx:dx + roi_w]
+                for dy in range(3) for dx in range(3)
+            ), axis=0)
+            gradient = (
+                np.max(denoised_samples, axis=0)
+                - np.min(denoised_samples, axis=0)
+            ).astype(np.float32, copy=False)
+            values = denoised[circle]
+            values = values[np.isfinite(values)]
+            raw_transition = (
+                (raw_denoised >= raw_q05 + 0.10 * raw_span)
+                & (raw_denoised <= raw_q05 + 0.90 * raw_span)
+                & circle
+            )
+            sharpened_transition = (
+                (denoised >= raw_q05 + 0.10 * raw_span)
+                & (denoised <= raw_q05 + 0.90 * raw_span)
+                & circle
+            )
+            def longest_run(mask):
+                best = 0
+                for axis in (0, 1):
+                    rows = np.moveaxis(mask, axis, 0)
+                    for row in rows:
+                        indices = np.flatnonzero(row)
+                        if not len(indices):
+                            continue
+                        cuts = np.flatnonzero(np.diff(indices) > 1)
+                        starts = np.r_[0, cuts + 1]
+                        ends = np.r_[cuts + 1, len(indices)]
+                        best = max(best, int(np.max(ends - starts)))
+                return int(best)
+            transition_before = longest_run(raw_transition)
+            sharpened_values = denoised[circle]
+            sharpened_values = sharpened_values[np.isfinite(sharpened_values)]
+            sharpened_q05 = float(np.percentile(sharpened_values, 5.0)) if len(sharpened_values) else raw_q05
+            sharpened_q95 = float(np.percentile(sharpened_values, 95.0)) if len(sharpened_values) else raw_q95
+            sharpened_span = max(sharpened_q95 - sharpened_q05, 1.0e-6)
+            sharpened_transition = (
+                (denoised >= sharpened_q05 + 0.10 * sharpened_span)
+                & (denoised <= sharpened_q05 + 0.90 * sharpened_span)
+                & circle
+            )
+            transition_after = longest_run(sharpened_transition)
+            gvalues = gradient[circle]
+            gradient_median = float(np.median(gvalues)) if len(gvalues) else 0.0
+            gradient_mad = float(1.4826 * np.median(np.abs(gvalues - gradient_median))) if len(gvalues) else 0.0
+            value_span = max(float(np.max(values) - np.min(values)), 1.0e-3) if len(values) else 1.0e-3
+            strong_threshold = max(gradient_median + 3.0 * max(gradient_mad, 1.0e-4), value_span * 0.04)
+            weak_threshold = max(gradient_median + 1.5 * max(gradient_mad, 1.0e-4), strong_threshold * 0.5)
+            strong = (gradient >= strong_threshold) & circle
+            weak = (gradient >= weak_threshold) & circle
+            hysteresis = np.zeros_like(strong, dtype=bool)
+            q = deque((int(y), int(x)) for y, x in zip(*np.nonzero(strong)))
+            hysteresis[strong] = True
+            while q:
+                cy, cx = q.popleft()
+                for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    ny, nx = cy + dy, cx + dx
+                    if 0 <= ny < roi_h and 0 <= nx < roi_w and weak[ny, nx] and not hysteresis[ny, nx]:
+                        hysteresis[ny, nx] = True
+                        q.append((ny, nx))
+            # Closing is causal: it bridges short gaps in a detected line,
+            # and the resulting pixels are non-traversable in the flood.
+            bpad = np.pad(hysteresis, 1, mode="constant")
+            bd = np.max(np.stack(tuple(bpad[dy:dy + roi_h, dx:dx + roi_w] for dy in range(3) for dx in range(3)), axis=0), axis=0)
+            cpad = np.pad(bd, 1, mode="constant")
+            closed = np.min(np.stack(tuple(cpad[dy:dy + roi_h, dx:dx + roi_w] for dy in range(3) for dx in range(3)), axis=0), axis=0).astype(bool)
+            closed &= circle
+
+            projection = np.asarray(capture.get("view_projection"), dtype=np.float64)
+            centers = np.asarray(geometry.get("centers", ()), dtype=np.float64)
+            hidden = np.asarray(geometry.get("hidden", np.zeros(count, dtype=bool)), dtype=bool).reshape(-1)
+            source_hard = np.asarray(geometry.get("source_hard", np.zeros(count, dtype=bool)), dtype=bool).reshape(-1)
+            if projection.shape != (4, 4) or centers.shape != (count, 3):
+                return seed_only("screen-projection-schema")
+            if len(hidden) != count:
+                hidden = np.zeros(count, dtype=bool)
+            if len(source_hard) != count:
+                source_hard = np.zeros(count, dtype=bool)
+            clip = np.c_[centers, np.ones(count, dtype=np.float64)] @ projection.T
+            valid = np.all(np.isfinite(clip), axis=1) & (np.abs(clip[:, 3]) > 1.0e-12)
+            ndc = np.zeros((count, 3), dtype=np.float64)
+            ndc[valid] = clip[valid, :3] / clip[valid, 3, None]
+            px = np.rint((ndc[:, 0] * 0.5 + 0.5) * (width - 1)).astype(np.int64)
+            py = np.rint((ndc[:, 1] * 0.5 + 0.5) * (height - 1)).astype(np.int64)
+            center_inside = valid & ~hidden & ~source_hard & (px >= x0) & (px < x1) & (py >= y0) & (py < y1)
+            local_x = np.floor((px - x0) / float(downsample)).astype(np.int64)
+            local_y = np.floor((py - y0) / float(downsample)).astype(np.int64)
+            center_inside &= circle[np.clip(local_y, 0, roi_h - 1), np.clip(local_x, 0, roi_w - 1)]
+            depth_image = np.asarray(capture.get("depth", ()), dtype=np.float32)
+            if depth_image.shape == (height, width):
+                sampled = np.full(count, np.nan, dtype=np.float64)
+                sampled[center_inside] = depth_image[py[center_inside], px[center_inside]]
+                plausible = center_inside & np.isfinite(sampled) & (sampled >= -1.0e-4) & (sampled <= 1.0001)
+                center_inside &= ~plausible | (np.abs(sampled - (ndc[:, 2] * 0.5 + 0.5)) <= 0.05)
+            id_raster = np.full((roi_h, roi_w), -1, dtype=np.int32)
+            depth_raster = np.full((roi_h, roi_w), np.inf, dtype=np.float64)
+            ids = np.flatnonzero(center_inside)
+            if len(ids):
+                flat = local_y[ids] * roi_w + local_x[ids]
+                order = np.argsort(ndc[ids, 2], kind="stable")
+                flat_ordered = flat[order]
+                id_flat, depth_flat = id_raster.ravel(), depth_raster.ravel()
+                id_flat[flat_ordered] = ids[order].astype(np.int32, copy=False)
+                depth_flat[flat_ordered] = ndc[ids[order], 2]
+            buffers = {
+                "key": buffer_key,
+                "generation": generation,
+                "image": image,
+                "raw_denoised": raw_denoised,
+                "denoised": denoised,
+                "gradient": gradient,
+                "hysteresis": hysteresis,
+                "closed_barrier": closed,
+                "raw_transition": raw_transition,
+                "sharpened_transition": sharpened_transition,
+                "circle": circle,
+                "id_raster": id_raster,
+                "center_inside": center_inside,
+                "center_x": local_x,
+                "center_y": local_y,
+                "strong_threshold": float(strong_threshold),
+                "weak_threshold": float(weak_threshold),
+                "gradient_median": gradient_median,
+                "gradient_mad": gradient_mad,
+                "seed_xy": (int((sx - x0) // downsample), int((sy - y0) // downsample)),
+                "downsample_factor": int(downsample),
+                "source_roi_size": (int(source_w), int(source_h)),
+                "sharpened_field_used": bool(sharpened_active),
+                "sharpen_raw_q05": float(raw_q05),
+                "sharpen_raw_q95": float(raw_q95),
+                "sharpen_raw_knee": float(raw_knee),
+                "sharpen_knee": float(sharpened_knee),
+                "sharpen_steepness": float(steepness),
+                "sharpen_curve_scale": float(curve_scale),
+                "transition_width_before": int(transition_before),
+                "transition_width_after": int(transition_after),
+                "centers_considered": int(np.count_nonzero(valid)),
+                "centers_visible": int(len(ids)),
+            }
+            state["shadow_screen_buffers"] = buffers
+        else:
+            image = buffers["image"]
+            denoised = buffers["denoised"]
+            gradient = buffers["gradient"]
+            closed = buffers["closed_barrier"]
+            circle = buffers["circle"]
+            id_raster = buffers["id_raster"]
+            center_inside = buffers["center_inside"]
+            local_x, local_y = buffers["center_x"], buffers["center_y"]
+            roi_h, roi_w = int(image.shape[0]), int(image.shape[1])
+        metrics["shadow_screen_analysis_width"] = int(roi_w)
+        metrics["shadow_screen_analysis_height"] = int(roi_h)
+        metrics["shadow_screen_analysis_pixel_count"] = int(circle.size)
+        metrics["shadow_screen_downsample_factor"] = int(buffers.get("downsample_factor", 1))
+        metrics["shadow_screen_strong_threshold"] = float(buffers.get("strong_threshold", 0.0))
+        metrics["shadow_screen_weak_threshold"] = float(buffers.get("weak_threshold", 0.0))
+        metrics["shadow_screen_raw_gradient_min"] = float(np.min(gradient[circle])) if np.any(circle) else 0.0
+        metrics["shadow_screen_raw_gradient_median"] = float(np.median(gradient[circle])) if np.any(circle) else 0.0
+        metrics["shadow_screen_raw_gradient_max"] = float(np.max(gradient[circle])) if np.any(circle) else 0.0
+        metrics["shadow_screen_gradient_mad"] = float(buffers.get("gradient_mad", 0.0))
+        metrics["shadow_screen_closing_filled_pixels"] = int(np.count_nonzero(buffers["closed_barrier"] & ~buffers["hysteresis"]))
+        metrics["shadow_screen_centers_considered"] = int(buffers.get("centers_considered", 0))
+        metrics["shadow_screen_centers_visible"] = int(buffers.get("centers_visible", 0))
+        visible_for_transition = np.flatnonzero(center_inside)
+        if len(visible_for_transition):
+            tx = np.clip(local_x[visible_for_transition], 0, roi_w - 1)
+            ty = np.clip(local_y[visible_for_transition], 0, roi_h - 1)
+            raw_transition_field = np.asarray(
+                buffers.get("raw_transition", np.zeros_like(circle)), dtype=bool
+            )
+            sharp_transition_field = np.asarray(
+                buffers.get("sharpened_transition", np.zeros_like(circle)), dtype=bool
+            )
+            if raw_transition_field.shape == circle.shape:
+                metrics["shadow_screen_transition_face_rows_before"] = int(
+                    np.count_nonzero(raw_transition_field[ty, tx])
+                )
+            if sharp_transition_field.shape == circle.shape:
+                metrics["shadow_screen_transition_face_rows_after"] = int(
+                    np.count_nonzero(sharp_transition_field[ty, tx])
+                )
+        metrics["shadow_screen_face_pixel_count"] = int(
+            np.count_nonzero(np.asarray(buffers.get("id_raster"), dtype=np.int32) >= 0)
+        )
+        # This is center-sample occupancy, not polygon coverage.  Keep the
+        # legacy field populated only as a clearly documented 0/1 sample
+        # count so diagnostics cannot mistake it for rasterized area.
+        metrics["shadow_screen_face_coverage_min"] = 1.0 if metrics["shadow_screen_face_pixel_count"] else 0.0
+        metrics["shadow_screen_face_coverage_max"] = 1.0 if metrics["shadow_screen_face_pixel_count"] else 0.0
+        raw_field = np.asarray(
+            buffers.get("raw_denoised", denoised), dtype=np.float32
+        )
+        raw_field_values = raw_field[circle] if raw_field.shape == denoised.shape else np.empty(0)
+        raw_field_values = raw_field_values[np.isfinite(raw_field_values)]
+        sharp_values = denoised[circle]
+        sharp_values = sharp_values[np.isfinite(sharp_values)]
+        if len(raw_field_values):
+            metrics["shadow_screen_raw_luminance_min"] = float(np.min(raw_field_values))
+            metrics["shadow_screen_raw_luminance_max"] = float(np.max(raw_field_values))
+            metrics["shadow_screen_raw_luminance_quantiles"] = tuple(
+                float(value) for value in np.percentile(raw_field_values, (5.0, 25.0, 50.0, 75.0, 95.0))
+            )
+        if len(sharp_values):
+            metrics["shadow_screen_sharpened_luminance_min"] = float(np.min(sharp_values))
+            metrics["shadow_screen_sharpened_luminance_max"] = float(np.max(sharp_values))
+            metrics["shadow_screen_sharpened_luminance_quantiles"] = tuple(
+                float(value) for value in np.percentile(sharp_values, (5.0, 25.0, 50.0, 75.0, 95.0))
+            )
+        metrics["shadow_screen_sharpened_field_used"] = bool(
+            buffers.get("sharpened_field_used", False)
+        )
+        metrics["shadow_screen_sharpen_knee"] = float(
+            buffers.get("sharpen_knee", 0.0)
+        )
+        metrics["shadow_screen_sharpen_steepness"] = float(
+            buffers.get("sharpen_steepness", 0.0)
+        )
+        metrics["shadow_screen_sharpen_curve_scale"] = float(
+            buffers.get("sharpen_curve_scale", 0.0)
+        )
+        metrics["shadow_screen_transition_width_before_pixels"] = int(
+            buffers.get("transition_width_before", 0)
+        )
+        metrics["shadow_screen_transition_width_after_pixels"] = int(
+            buffers.get("transition_width_after", 0)
+        )
+        roi_values = denoised[circle]
+        if len(roi_values):
+            metrics["shadow_screen_luminance_min"] = float(np.min(roi_values))
+            metrics["shadow_screen_luminance_max"] = float(np.max(roi_values))
+        seed_x, seed_y = (int(v) for v in buffers.get("seed_xy", (0, 0)))
+        if not (0 <= seed_x < roi_w and 0 <= seed_y < roi_h):
+            return seed_only("screen-seed-roi-missing")
+        seed_luminance = float(denoised[seed_y, seed_x])
+        metrics["shadow_screen_seed_luminance"] = seed_luminance
+        values = denoised[circle]
+        values = values[np.isfinite(values)]
+        if not len(values):
+            return seed_only("screen-roi-empty")
+        roi_median = float(np.median(values))
+        seed_patch = denoised[max(0, seed_y - 1):min(roi_h, seed_y + 2), max(0, seed_x - 1):min(roi_w, seed_x + 2)]
+        seed_patch = seed_patch[np.isfinite(seed_patch)]
+        seed_ref = float(np.median(seed_patch)) if len(seed_patch) else seed_luminance
+        seed_mad = float(1.4826 * np.median(np.abs(seed_patch - seed_ref))) if len(seed_patch) else 0.0
+        tolerance = max(3.0 * seed_mad, 0.02 * max(abs(seed_ref), 1.0e-2), 1.0e-3)
+        cache = state.get("shadow_screen_classifier_cache")
+        if not isinstance(cache, dict) or cache.get("generation") != generation or cache.get("roi_key") != buffers.get("key"):
+            sorted_values = np.sort(np.unique(values))
+            bright = bool(seed_ref >= roi_median)
+            side = sorted_values[sorted_values <= seed_ref + 1.0e-9] if bright else sorted_values[sorted_values >= seed_ref - 1.0e-9]
+            gaps = np.diff(side) if len(side) >= 2 else np.empty(0)
+            largest = int(np.argmax(gaps)) if len(gaps) else -1
+            if largest >= 0 and float(gaps[largest]) > max(2.0 * tolerance, 0.01):
+                base_threshold = float((side[largest] + side[largest + 1]) * 0.5)
+            else:
+                base_threshold = float(seed_ref - tolerance if bright else seed_ref + tolerance)
+            cache = {"generation": generation, "roi_key": buffers.get("key"), "base_threshold": base_threshold, "bright": bright, "seed_luminance": seed_luminance, "tolerance": tolerance}
+            state["shadow_screen_classifier_cache"] = cache
+        base_threshold = float(cache.get("base_threshold", seed_luminance))
+        bright = bool(cache.get("bright", seed_ref >= roi_median))
+        threshold_delta = max(float(cache.get("tolerance", tolerance)) * 0.5, float(np.percentile(values, 90.0) - np.percentile(values, 10.0)) * 0.05, 0.01)
+        threshold = base_threshold + ((-int(step)) if bright else int(step)) * threshold_delta
+        threshold = float(np.clip(threshold, float(np.min(values)), float(np.max(values))))
+        metrics["shadow_screen_base_threshold"] = base_threshold
+        metrics["shadow_screen_threshold"] = threshold
+        class_mask = (denoised >= threshold) if bright else (denoised <= threshold)
+        class_mask &= circle
+        if not class_mask[seed_y, seed_x]:
+            class_mask[seed_y, seed_x] = True
+
+        region = np.zeros((roi_h, roi_w), dtype=bool)
+        region[seed_y, seed_x] = True
+        q = deque(((seed_y, seed_x),))
+        circle_pixels = int(np.count_nonzero(circle))
+        # The fixed 320px radius has about 322k pixels.  Permit the whole
+        # circle plus a small margin, while retaining a deterministic hard
+        # cap for malformed/oversized future configurations.
+        work_cap = 380000
+        work_budget = min(int(circle.size), work_cap, circle_pixels + 8192)
+        metrics["shadow_screen_work_budget"] = int(work_budget)
+        metrics["shadow_screen_work_budget_cap"] = int(work_cap)
+        visited = 0
+        barrier_rejected = 0
+        barrier_crossings = 0
+        cancelled = False
+        while q and visited < work_budget:
+            y, x = q.popleft()
+            visited += 1
+            if visited % 4096 == 0 and bool(state.get("cancel_requested", False)):
+                cancelled = True
+                break
+            for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                ny, nx = y + dy, x + dx
+                if not (0 <= ny < roi_h and 0 <= nx < roi_w) or region[ny, nx] or not circle[ny, nx] or not class_mask[ny, nx]:
+                    continue
+                # A closed morphology barrier is a real non-traversable
+                # image boundary, even when both pixels share the class.
+                if ((closed[y, x] or closed[ny, nx]) and (y, x) != (seed_y, seed_x) and (ny, nx) != (seed_y, seed_x)):
+                    barrier_rejected += 1
+                    barrier_crossings += 1
+                    continue
+                region[ny, nx] = True
+                q.append((ny, nx))
+        metrics["shadow_screen_pixels_visited"] = int(visited)
+        metrics["shadow_screen_traversal_chunks"] = int((visited + 4095) // 4096)
+        metrics["shadow_screen_barrier_pixels_rejected"] = int(barrier_rejected)
+        metrics["shadow_screen_barrier_crossings_rejected"] = int(barrier_crossings)
+        metrics["shadow_screen_cancel_state"] = "cancelled" if cancelled else ("work-budget" if q else "complete")
+        metrics["shadow_screen_mask_pixel_count"] = int(np.count_nonzero(region))
+        metrics["shadow_screen_frontier_count"] = int(len(q))
+        # The diagnostic ID raster keeps one deterministic winner per pixel,
+        # but it is not authoritative: dense meshes routinely place several
+        # visible centers on the same pixel.  Sample every cached center
+        # directly so a collision cannot erase faces before graph safety.
+        visible_ids = np.flatnonzero(center_inside)
+        if len(visible_ids):
+            center_flat = local_y[visible_ids] * roi_w + local_x[visible_ids]
+            center_counts = np.bincount(center_flat, minlength=roi_h * roi_w)
+            metrics["shadow_screen_duplicate_center_pixel_count"] = int(
+                np.count_nonzero(center_counts > 1)
+            )
+            metrics["shadow_screen_max_centers_per_pixel"] = int(
+                np.max(center_counts) if len(center_counts) else 0
+            )
+            center_in_region = region[local_y[visible_ids], local_x[visible_ids]]
+            region_ids = visible_ids[center_in_region]
+        else:
+            region_ids = np.empty(0, dtype=np.int32)
+        metrics["shadow_screen_centers_in_region"] = int(len(region_ids))
+        candidates = np.zeros(count, dtype=bool)
+        if len(region_ids):
+            candidates[region_ids] = True
+        if 0 <= seed < count:
+            candidates[seed] = True
+        hidden = np.asarray(geometry.get("hidden", np.zeros(count, dtype=bool)), dtype=bool).reshape(-1)
+        source_hard = np.asarray(geometry.get("source_hard", np.zeros(count, dtype=bool)), dtype=bool).reshape(-1)
+        offsets = np.asarray(geometry.get("offsets", ()), dtype=np.int64).reshape(-1)
+        neighbors = np.asarray(geometry.get("neighbors", ()), dtype=np.int32).reshape(-1)
+        connected = np.zeros(count, dtype=bool)
+        if len(offsets) == count + 1 and int(offsets[-1]) == len(neighbors):
+            connected[seed] = True
+            face_q = deque((seed,))
+            while face_q:
+                face = int(face_q.popleft())
+                for neighbor in neighbors[int(offsets[face]):int(offsets[face + 1])]:
+                    neighbor = int(neighbor)
+                    if 0 <= neighbor < count and candidates[neighbor] and not connected[neighbor] and center_inside[neighbor]:
+                        connected[neighbor] = True
+                        face_q.append(neighbor)
+        else:
+            connected = candidates
+        connected &= ~hidden & ~source_hard
+        if 0 <= seed < count:
+            connected[seed] = True
+        metrics["shadow_screen_candidates_after_connectivity"] = int(
+            np.count_nonzero(connected)
+        )
+        if len(region_ids) and not np.count_nonzero(connected):
+            metrics["shadow_screen_collapse_reason"] = "connectivity-empty"
+        elif len(region_ids) and np.count_nonzero(connected) < len(region_ids):
+            metrics["shadow_screen_collapse_reason"] = "connectivity-pruned"
+        else:
+            metrics["shadow_screen_collapse_reason"] = "none"
+        face_ids = np.asarray(geometry.get("face_ids", np.arange(count, dtype=np.int32)), dtype=np.int32).reshape(-1)
+        if len(face_ids) != count:
+            face_ids = np.arange(count, dtype=np.int32)
+        candidate_stable = np.unique(face_ids[np.flatnonzero(connected)]).astype(np.int32, copy=False)
+        initial_stable = np.asarray(state.get("shadow_screen_initial_ids", ()), dtype=np.int32).reshape(-1)
+        previous_stable = np.asarray(state.get("shadow_screen_previous_ids", ()), dtype=np.int32).reshape(-1)
+        if int(step) == 0:
+            if len(initial_stable) == 0:
+                initial_stable = candidate_stable.copy()
+                state["shadow_screen_initial_ids"] = initial_stable.copy()
+                action = "initial"
+            else:
+                candidate_stable = initial_stable.copy()
+                action = "return-to-initial"
+        elif int(step) > 0:
+            candidate_stable = np.unique(np.concatenate((candidate_stable, initial_stable, previous_stable))).astype(np.int32, copy=False)
+            action = "expand-union"
+        else:
+            candidate_stable = np.intersect1d(candidate_stable, initial_stable)
+            if len(previous_stable) and int(state.get("shadow_screen_previous_step", 0)) > int(step):
+                candidate_stable = np.intersect1d(candidate_stable, previous_stable)
+            action = "shrink-intersection"
+        final = np.isin(face_ids, candidate_stable) & ~hidden & ~source_hard
+        if 0 <= seed < count:
+            final[seed] = True
+        # Refine only the current physical interface using the same immutable
+        # reduced grayscale buffers.  Monotonic wheel semantics remain the
+        # authority: expand may add but never remove, shrink may remove but
+        # never add, and step zero records the refined baseline.
+        refine_metrics = {}
+        try:
+            buffers_for_refine = state.get("shadow_screen_buffers")
+            if isinstance(buffers_for_refine, dict):
+                refined_final, refine_metrics = _fill_preview_shadow_refine_boundary(
+                    state,
+                    geometry,
+                    buffers_for_refine,
+                    metrics,
+                    final,
+                    seed,
+                )
+                if int(step) > 0:
+                    refined_final |= final
+                elif int(step) < 0:
+                    refined_final &= final
+                refined_final[seed] = True
+                final = refined_final
+                candidate_stable = np.unique(
+                    face_ids[np.flatnonzero(final)]
+                ).astype(np.int32, copy=False)
+                if int(step) == 0:
+                    initial_stable = candidate_stable.copy()
+                    state["shadow_screen_initial_ids"] = initial_stable.copy()
+        except (
+            AttributeError,
+            IndexError,
+            KeyError,
+            MemoryError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+            ZeroDivisionError,
+        ):
+            refine_metrics = {
+                "shadow_screen_refine_reason": "refine-exception",
+                "shadow_screen_refine_seed_connected": bool(final[seed]),
+            }
+        metrics.update(refine_metrics)
+        selected_ids = np.flatnonzero(final).astype(np.int32, copy=False)
+        state["shadow_screen_previous_ids"] = candidate_stable.copy()
+        state["shadow_screen_previous_step"] = int(step)
+        metrics["shadow_screen_monotonic_action"] = action
+        metrics["shadow_screen_initial_count"] = int(len(initial_stable))
+        metrics["shadow_screen_previous_count"] = int(len(previous_stable))
+        metrics["shadow_screen_preserved_count"] = int(len(np.intersect1d(candidate_stable, initial_stable)))
+        metrics["shadow_screen_accepted_count"] = int(len(selected_ids))
+        if len(selected_ids):
+            selected_x = np.clip(local_x[selected_ids], 0, roi_w - 1)
+            selected_y = np.clip(local_y[selected_ids], 0, roi_h - 1)
+            accepted_values = denoised[selected_y, selected_x]
+            metrics["shadow_screen_accepted_luminance_min"] = float(np.min(accepted_values))
+            metrics["shadow_screen_accepted_luminance_max"] = float(np.max(accepted_values))
+        edge_keys = set()
+        first = np.asarray(geometry.get("first", ()), dtype=np.int32).reshape(-1)
+        second = np.asarray(geometry.get("second", ()), dtype=np.int32).reshape(-1)
+        for pair_index, (left, right) in enumerate(zip(first, second)):
+            left, right = int(left), int(right)
+            if 0 <= left < count and 0 <= right < count and bool(final[left]) != bool(final[right]):
+                key = _fill_preview_shadow_edge_key(geometry, pair_index)
+                if key is not None:
+                    edge_keys.add(key)
+        state["shadow_luminance_region_edges"] = edge_keys
+        metrics["shadow_screen_boundary_count"] = int(len(edge_keys))
+        metrics["shadow_screen_rejected_neighbor_count"] = int(len(edge_keys))
+        metrics["shadow_screen_fallback_reason"] = "roi-work-budget-provisional" if q else ("roi-cancelled" if cancelled else "ok")
+        return selected_ids, metrics
+    except (AttributeError, IndexError, KeyError, MemoryError, RuntimeError, TypeError, ValueError, ZeroDivisionError):
+        return seed_only("screen-roi-morphology-failed")
+
+
+def _fill_preview_shadow_region(
+    state, local, distances, radius, seed_local, source_geometry=None,
+    source_distances=None
+):
+    """Grow through distance-domain faces, stopping only at shadow line edges."""
+    import numpy as np
+
+    count = int(local.get("count", 0))
+    metrics = {
+        "shadow_capture_ok": bool(
+            isinstance(state.get("shadow_capture"), dict)
+            and state["shadow_capture"].get("ok")
+        ),
+        "shadow_capture_reason": (
+            state.get("shadow_capture", {}).get("reason", "not-captured")
+            if isinstance(state.get("shadow_capture"), dict)
+            else "not-captured"
+        ),
+        "shadow_capture_size": tuple(
+            state.get("shadow_capture", {}).get("capture_size", (0, 0))
+            if isinstance(state.get("shadow_capture"), dict) else (0, 0)
+        ),
+        "shadow_luminance_min": float(state.get("shadow_capture", {}).get("luminance_min", 0.0))
+        if isinstance(state.get("shadow_capture"), dict) else 0.0,
+        "shadow_luminance_max": float(state.get("shadow_capture", {}).get("luminance_max", 0.0))
+        if isinstance(state.get("shadow_capture"), dict) else 0.0,
+        "shadow_seed_luminance": float(state.get("shadow_capture", {}).get("luminance_seed", 0.0))
+        if isinstance(state.get("shadow_capture"), dict) else 0.0,
+        "shadow_noise_scale": float(state.get("shadow_capture", {}).get("noise_scale", 0.0))
+        if isinstance(state.get("shadow_capture"), dict) else 0.0,
+        "shadow_line_pixel_count": int(state.get("shadow_capture", {}).get("line_pixel_count", 0))
+        if isinstance(state.get("shadow_capture"), dict) else 0,
+        "shadow_total_pairs": 0,
+        "shadow_skipped_hard": 0,
+        "shadow_skipped_domain": 0,
+        "shadow_invalid_endpoint": 0,
+        "shadow_projection_no_sample": 0,
+        "shadow_line_no_hit": 0,
+        "shadow_cache_edge_count": 0,
+        "shadow_cache_generation": int(state.get("shadow_capture_generation", 0)),
+        "shadow_tested_crossings": 0,
+        "shadow_barrier_count": 0,
+        "shadow_gentle_crossings_passed": 0,
+        "shadow_brightening_passed": 0,
+        "shadow_knee_crossings": 0,
+        "shadow_knee_candidates": 0,
+        "shadow_knee_adopted": 0,
+        "shadow_raw_high_edges": 0,
+        "shadow_raw_s_min": 0.0,
+        "shadow_raw_s_median": 0.0,
+        "shadow_raw_s_max": 0.0,
+        "shadow_raw_s_mad": 0.0,
+        "shadow_baseline_tolerance": 0.0,
+        "shadow_plateau_median": 0.0,
+        "shadow_plateau_mad": 0.0,
+        "shadow_smoothed_face_count": 0,
+        "shadow_closing_filled_gaps": 0,
+        "shadow_component_count": 0,
+        "shadow_post_close_component_count": 0,
+        "shadow_component_lengths": (),
+        "shadow_traced_sequence_count": 0,
+        "shadow_junction_pair_count": 0,
+        "shadow_junction_split_count": 0,
+        "shadow_junction_ambiguous_count": 0,
+        "shadow_junction_fallback_count": 0,
+        "shadow_closing_window_physical": 0.0,
+        "shadow_closing_window_n": 0,
+        "shadow_closing_filled_physical": 0.0,
+        "shadow_free_endpoint_count": 0,
+        "shadow_closed_chain_count": 0,
+        "shadow_domain_spanning_chain_count": 0,
+        "shadow_adopted_edge_count": 0,
+        "shadow_adopted_after_coherence": 0,
+        "shadow_no_context_rejected": 0,
+        "shadow_sampled_face_count": 0,
+        "shadow_visible_face_count": 0,
+        "shadow_unsampled_face_count": 0,
+        "shadow_seed_luminance_used": False,
+        "shadow_local_trend_median": 0.0,
+        "shadow_local_trend_mad": 0.0,
+        "shadow_connected_line_count": 0,
+        "shadow_face_set_neutral": True,
+        "shadow_restore_verified": bool(state.get("shadow_capture", {}).get("restore_verified", False))
+        if isinstance(state.get("shadow_capture"), dict) else False,
+        "shadow_reason": "distance-only-capture-unavailable",
+    }
+    if count <= 0:
+        return np.empty(0, dtype=np.int32), metrics
+    distances = np.asarray(distances, dtype=np.float64).reshape(-1)
+    offsets = np.asarray(local.get("offsets", ()), dtype=np.int64).reshape(-1)
+    neighbors = np.asarray(local.get("neighbors", ()), dtype=np.int32).reshape(-1)
+    first = np.asarray(local.get("first", ()), dtype=np.int32).reshape(-1)
+    second = np.asarray(local.get("second", ()), dtype=np.int32).reshape(-1)
+    if (
+        len(distances) < count or len(offsets) != count + 1
+        or int(offsets[-1]) != len(neighbors)
+        or len(first) != len(second)
+    ):
+        metrics["shadow_reason"] = "shadow-graph-schema"
+        return np.asarray([int(seed_local)], dtype=np.int32), metrics
+    local_distances = distances[:count]
+    tolerance = max(float(radius) * 1.0e-8, 1.0e-9)
+    domain = np.isfinite(local_distances) & (local_distances <= float(radius) + tolerance)
+    hidden = np.asarray(local.get("hidden", np.zeros(count, dtype=bool)), dtype=bool).reshape(-1)
+    source_hard = np.asarray(local.get("source_hard", np.zeros(count, dtype=bool)), dtype=bool).reshape(-1)
+    if len(hidden) != count:
+        hidden = np.zeros(count, dtype=bool)
+    if len(source_hard) != count:
+        source_hard = np.zeros(count, dtype=bool)
+    safety_hard = hidden | source_hard
+    hard = safety_hard | ~domain
+    protected = np.zeros(count, dtype=bool)
+    edge_barrier = np.zeros(len(first), dtype=bool)
+    shadow_luminance_cache = None
+    if metrics["shadow_capture_ok"]:
+        source_geometry = source_geometry if source_geometry is not None else local
+        source_count = int(source_geometry.get("count", count))
+        cache_distances = np.full(source_count, np.inf, dtype=np.float64)
+        if source_distances is not None:
+            source_values = np.asarray(source_distances, dtype=np.float64).reshape(-1)
+            if len(source_values) >= source_count:
+                cache_distances[:] = source_values[:source_count]
+        local_global_ids = np.asarray(
+            local.get("_global_face_ids", np.arange(count, dtype=np.int32)),
+            dtype=np.int64,
+        ).reshape(-1)
+        valid_map = np.zeros(count, dtype=bool)
+        map_limit = min(count, len(local_global_ids))
+        if map_limit:
+            valid_map[:map_limit] = (
+                (local_global_ids[:map_limit] >= 0)
+                & (local_global_ids[:map_limit] < source_count)
+            )
+        if np.any(valid_map):
+            cache_distances[local_global_ids[:count][valid_map]] = local_distances[valid_map]
+        else:
+            cache_distances[: min(source_count, count)] = local_distances[: min(source_count, count)]
+        seed_geometry_face = (
+            int(local_global_ids[int(seed_local)])
+            if 0 <= int(seed_local) < len(local_global_ids)
+            else int(seed_local)
+        )
+        shadow_luminance_cache = _fill_preview_shadow_luminance_edge_cache(
+            state, source_geometry, cache_distances, seed_geometry_face
+        )
+        metrics["shadow_total_pairs"] = int(shadow_luminance_cache.get("total_pairs", 0))
+        metrics["shadow_cache_edge_count"] = int(
+            len(shadow_luminance_cache.get("edges", {}))
+        )
+        metrics["shadow_skipped_hard"] = int(shadow_luminance_cache.get("skipped_hard", 0))
+        metrics["shadow_tested_crossings"] = int(shadow_luminance_cache.get("tested", 0))
+        metrics["shadow_sampled_face_count"] = int(
+            _fill_preview_shadow_face_luminance_cache(state, source_geometry).get("sampled", 0)
+        )
+        metrics["shadow_visible_face_count"] = int(
+            _fill_preview_shadow_face_luminance_cache(state, source_geometry).get("visible", 0)
+        )
+        metrics["shadow_unsampled_face_count"] = int(
+            _fill_preview_shadow_face_luminance_cache(state, source_geometry).get("unsampled", 0)
+        )
+        metrics["shadow_seed_luminance_used"] = bool(
+            shadow_luminance_cache.get("seed_luminance_used", False)
+        )
+        if shadow_luminance_cache.get("seed_luminance") is not None:
+            metrics["shadow_seed_luminance"] = float(
+                shadow_luminance_cache["seed_luminance"]
+            )
+        metrics["shadow_gentle_crossings_passed"] = int(
+            shadow_luminance_cache.get("gentle", 0)
+        )
+        metrics["shadow_brightening_passed"] = int(
+            shadow_luminance_cache.get("brightening", 0)
+        )
+        metrics["shadow_knee_candidates"] = int(
+            shadow_luminance_cache.get("knee_candidates", 0)
+        )
+        metrics["shadow_knee_adopted"] = int(
+            shadow_luminance_cache.get("knee_adopted", 0)
+        )
+        metrics["shadow_knee_crossings"] = int(
+            shadow_luminance_cache.get("knee_adopted", 0)
+        )
+        metrics["shadow_raw_high_edges"] = int(
+            shadow_luminance_cache.get("raw_high_edges", 0)
+        )
+        metrics["shadow_raw_s_min"] = float(
+            shadow_luminance_cache.get("raw_s_min", 0.0)
+        )
+        metrics["shadow_raw_s_median"] = float(
+            shadow_luminance_cache.get("raw_s_median", 0.0)
+        )
+        metrics["shadow_raw_s_max"] = float(
+            shadow_luminance_cache.get("raw_s_max", 0.0)
+        )
+        metrics["shadow_raw_s_mad"] = float(
+            shadow_luminance_cache.get("raw_s_mad", 0.0)
+        )
+        metrics["shadow_baseline_tolerance"] = float(
+            shadow_luminance_cache.get("baseline_tolerance", 0.0)
+        )
+        metrics["shadow_plateau_median"] = float(
+            shadow_luminance_cache.get("plateau_median", 0.0) or 0.0
+        )
+        metrics["shadow_plateau_mad"] = float(
+            shadow_luminance_cache.get("plateau_mad", 0.0)
+        )
+        metrics["shadow_smoothed_face_count"] = int(
+            shadow_luminance_cache.get("smoothed_count", 0)
+        )
+        metrics["shadow_closing_filled_gaps"] = int(
+            shadow_luminance_cache.get("closing_filled_gaps", 0)
+        )
+        metrics["shadow_component_count"] = int(
+            shadow_luminance_cache.get("component_count", 0)
+        )
+        metrics["shadow_post_close_component_count"] = int(
+            shadow_luminance_cache.get("post_close_component_count", 0)
+        )
+        metrics["shadow_component_lengths"] = tuple(
+            float(value) for value in shadow_luminance_cache.get("component_lengths", ())
+        )
+        metrics["shadow_adopted_after_coherence"] = int(
+            shadow_luminance_cache.get("adopted_after_coherence", 0)
+        )
+        metrics["shadow_no_context_rejected"] = int(
+            shadow_luminance_cache.get("no_context_rejected", 0)
+        )
+        metrics["shadow_traced_sequence_count"] = int(
+            shadow_luminance_cache.get("traced_sequence_count", 0)
+        )
+        metrics["shadow_junction_pair_count"] = int(
+            shadow_luminance_cache.get("junction_pair_count", 0)
+        )
+        metrics["shadow_junction_split_count"] = int(
+            shadow_luminance_cache.get("junction_split_count", 0)
+        )
+        metrics["shadow_junction_ambiguous_count"] = int(
+            shadow_luminance_cache.get("junction_ambiguous_count", 0)
+        )
+        metrics["shadow_junction_fallback_count"] = int(
+            shadow_luminance_cache.get("junction_fallback_count", 0)
+        )
+        metrics["shadow_closing_window_physical"] = float(
+            shadow_luminance_cache.get("closing_window_physical", 0.0)
+        )
+        metrics["shadow_closing_window_n"] = int(
+            shadow_luminance_cache.get("closing_window_n", 0)
+        )
+        metrics["shadow_closing_filled_physical"] = float(
+            shadow_luminance_cache.get("closing_filled_physical", 0.0)
+        )
+        metrics["shadow_free_endpoint_count"] = int(
+            shadow_luminance_cache.get("free_endpoint_count", 0)
+        )
+        metrics["shadow_closed_chain_count"] = int(
+            shadow_luminance_cache.get("closed_chain_count", 0)
+        )
+        metrics["shadow_domain_spanning_chain_count"] = int(
+            shadow_luminance_cache.get("domain_spanning_chain_count", 0)
+        )
+        metrics["shadow_adopted_edge_count"] = int(
+            shadow_luminance_cache.get("adopted_edge_count", 0)
+        )
+        metrics["shadow_local_trend_median"] = float(
+            shadow_luminance_cache.get("local_trend_median", 0.0)
+        )
+        metrics["shadow_local_trend_mad"] = float(
+            shadow_luminance_cache.get("local_trend_mad", 0.0)
+        )
+        for pair_index in range(len(first)):
+            left, right = int(first[pair_index]), int(second[pair_index])
+            if safety_hard[left] or safety_hard[right]:
+                metrics["shadow_skipped_hard"] += 1
+                continue
+            key = _fill_preview_shadow_edge_key(local, pair_index)
+            entry = (
+                shadow_luminance_cache.get("edges", {}).get(key, {})
+                if isinstance(shadow_luminance_cache, dict)
+                else {}
+            )
+            tested = int(entry.get("tested", 0))
+            if tested and bool(entry.get("barrier", False)):
+                edge_barrier[pair_index] = True
+                metrics["shadow_barrier_count"] += 1
+            # Gentle/brightening totals are computed once by the immutable
+            # source edge map above; the local slice must not count them again.
+    cache = state.get("shadow_luminance_edge_cache")
+    selected = np.zeros(count, dtype=bool)
+    seed_local = int(seed_local)
+    if seed_local < 0 or seed_local >= count or hard[seed_local]:
+        metrics["shadow_reason"] = "shadow-seed-unsafe"
+        return np.empty(0, dtype=np.int32), metrics
+    selected[seed_local] = True
+    pair_lookup = {}
+    for pair_index, (left, right) in enumerate(zip(first, second)):
+        pair_lookup.setdefault((int(left), int(right)), []).append(pair_index)
+        pair_lookup.setdefault((int(right), int(left)), []).append(pair_index)
+    pending = [seed_local]
+    while pending:
+        face = int(pending.pop())
+        for edge_position in range(int(offsets[face]), int(offsets[face + 1])):
+            neighbor = int(neighbors[edge_position])
+            if neighbor < 0 or neighbor >= count or selected[neighbor] or hard[neighbor]:
+                continue
+            blocked = any(edge_barrier[p] for p in pair_lookup.get((face, neighbor), ()))
+            if blocked or protected[neighbor]:
+                continue
+            selected[neighbor] = True
+            pending.append(neighbor)
+    metrics["shadow_reason"] = "shadow-barrier-region" if metrics["shadow_capture_ok"] else "distance-only-provisional"
+    metrics["shadow_connected_line_count"] = int(metrics["shadow_barrier_count"] > 0)
+    return np.flatnonzero(selected).astype(np.int32), metrics
+
+
+def _fill_preview_gray_local_threshold(values):
+    """Return fixed-window robust hysteresis values for one local context."""
+    import numpy as np
+
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    values = values[np.isfinite(values)]
+    if len(values) == 0:
+        return 0.08, 0.06, 0.0, 0.0, "insufficient-local-window"
+    median = float(np.median(values))
+    mad = float(1.4826 * np.median(np.abs(values - median)))
+    scale = max(mad, 1.0e-3)
+    if mad <= 1.0e-6:
+        high = max(median, 0.08)
+        low = max(0.90 * median, 0.06)
+    else:
+        high = max(median + 2.0 * scale, 0.08)
+        low = max(median + scale, 0.06)
+        signal_range = float(np.ptp(values))
+        if signal_range > 0.0:
+            high = min(high, median + 0.75 * signal_range)
+            low = min(low, high)
+    return high, low, median, mad, "full-local-window" if len(values) >= 6 else "insufficient-local-window"
 
 
 def _fill_preview_initial_radius(geometry, seed_face):
@@ -9916,119 +16819,874 @@ def _fill_preview_shape_boundary_mask(crossing, outside_distance, radius, edge_i
     )
 
 
-def _fill_preview_compact_external_faces(geometry, distances, radius, selected_ids):
-    """Label unselected compact-domain faces reachable from the outside.
+def _fill_preview_resolve_enclosed_components(
+    geometry, distances, radius, selected_ids
+):
+    """Fill only enclosed missing components with at most 100 outer vertices.
 
-    This is the single topology assist used by an edge-only preview.  It is
-    intentionally limited to the already prepared cursor crop and current
-    radius domain.  A missing graph pair, hidden/crop edge, or face beyond the
-    radius is an outside opening.  Unselected components that cannot reach
-    one of those openings are enclosed pockets and are returned for inclusion;
-    no route, one-hop, or repeated global gap search is performed here.
+    This is the one compact-domain resolver used by the preview.  It has no
+    terminal/"tip" classification and does not use boundary colors.  Any
+    route to a distance, hidden, crop, mesh, non-manifold, or unmatched graph
+    boundary marks the complete missing component as open.
     """
     import numpy as np
 
-    count = int(geometry.get("count", 0))
-    distances = np.asarray(distances, dtype=np.float64).reshape(-1)
-    if count <= 0 or len(distances) < count:
-        return np.empty(0, dtype=np.int32), {
-            "compact_external_faces": 0,
-            "compact_enclosed_faces": 0,
-            "compact_external_seed_faces": 0,
-            "compact_external_reason": "distance-size",
-        }
-    edge_counts = geometry.get("face_edge_counts")
-    if edge_counts is None or len(edge_counts) != count:
-        return np.empty(0, dtype=np.int32), {
-            "compact_external_faces": 0,
-            "compact_enclosed_faces": 0,
-            "compact_external_seed_faces": 0,
-            "compact_external_reason": "edge-counts-unavailable",
-        }
-    hidden = np.asarray(
-        geometry.get("hidden", np.zeros(count, dtype=bool)), dtype=bool
-    )
+    metrics = {
+        "enclosed_component_faces": 0,
+        "enclosed_component_count": 0,
+        "enclosed_component_filled_faces": 0,
+        "enclosed_component_filled_components": 0,
+        "enclosed_component_max_outer_vertices": 0,
+        "enclosed_component_rejected_large_components": 0,
+        "enclosed_component_rejected_face_ids": (),
+        "enclosed_component_reason": "ok",
+    }
+    try:
+        count = int(geometry["count"])
+        distances = np.asarray(distances, dtype=np.float64).reshape(-1)
+        edge_counts = np.asarray(geometry["face_edge_counts"], dtype=np.int32).reshape(-1)
+        hidden = np.asarray(geometry["hidden"], dtype=bool).reshape(-1)
+        offsets = np.asarray(geometry["offsets"], dtype=np.int64).reshape(-1)
+        neighbors = np.asarray(geometry["neighbors"], dtype=np.int32).reshape(-1)
+        face_vertices = geometry["face_vertex_ids"]
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+        metrics["enclosed_component_reason"] = "schema"
+        return np.empty(0, dtype=np.int32), metrics
+    if (
+        count <= 0
+        or len(distances) != count
+        or len(edge_counts) != count
+        or len(hidden) != count
+        or len(offsets) != count + 1
+        or int(offsets[-1]) != len(neighbors)
+        or len(face_vertices) != count
+        or np.any(edge_counts <= 0)
+        or np.any(offsets[1:] < offsets[:-1])
+        or np.any(neighbors < 0)
+        or np.any(neighbors >= count)
+    ):
+        metrics["enclosed_component_reason"] = "schema"
+        return np.empty(0, dtype=np.int32), metrics
     tolerance = max(float(radius) * 1.0e-8, 1.0e-9)
-    domain = np.isfinite(distances[:count]) & (
-        distances[:count] <= float(radius) + tolerance
-    ) & ~hidden
+    domain = (
+        np.isfinite(distances)
+        & (distances <= float(radius) + tolerance)
+        & ~hidden
+    )
+
     selected = np.zeros(count, dtype=bool)
-    selected_ids = np.asarray(selected_ids, dtype=np.int32).reshape(-1)
-    selected_ids = selected_ids[
-        (selected_ids >= 0) & (selected_ids < count)
-    ]
+    try:
+        selected_ids = np.asarray(selected_ids, dtype=np.int32).reshape(-1)
+    except (TypeError, ValueError):
+        metrics["enclosed_component_reason"] = "selected-schema"
+        return np.empty(0, dtype=np.int32), metrics
+    selected_ids = selected_ids[(selected_ids >= 0) & (selected_ids < count)]
     selected[selected_ids] = True
     missing = domain & ~selected
+    metrics["enclosed_component_faces"] = int(np.count_nonzero(missing))
     if not np.any(missing):
-        return np.empty(0, dtype=np.int32), {
-            "compact_external_faces": 0,
-            "compact_enclosed_faces": 0,
-            "compact_external_seed_faces": 0,
-        }
-
-    offsets = np.asarray(geometry["offsets"], dtype=np.int64)
-    neighbors = np.asarray(geometry["neighbors"], dtype=np.int32)
+        return np.empty(0, dtype=np.int32), metrics
     degree = np.diff(offsets)
-    outside = missing & (degree < np.asarray(edge_counts, dtype=np.int32))
-    missing_ids = np.flatnonzero(missing)
-    for face in missing_ids:
-        start, end = int(offsets[face]), int(offsets[face + 1])
-        for neighbor in neighbors[start:end]:
+    outside = missing & (degree < edge_counts)
+    touches_selected = np.zeros(count, dtype=bool)
+    for face in np.flatnonzero(missing):
+        face = int(face)
+        for neighbor in neighbors[int(offsets[face]) : int(offsets[face + 1])]:
             neighbor = int(neighbor)
-            if not domain[neighbor]:
+            if selected[neighbor]:
+                touches_selected[face] = True
+            elif not domain[neighbor]:
                 outside[face] = True
-                break
-
+    # Propagate protected-boundary reachability through missing components.
     external = np.zeros(count, dtype=bool)
     pending = deque(int(face) for face in np.flatnonzero(outside))
     external[outside] = True
     while pending:
         face = pending.popleft()
-        start, end = int(offsets[face]), int(offsets[face + 1])
-        for neighbor in neighbors[start:end]:
+        for neighbor in neighbors[int(offsets[face]) : int(offsets[face + 1])]:
             neighbor = int(neighbor)
             if missing[neighbor] and not external[neighbor]:
                 external[neighbor] = True
                 pending.append(neighbor)
-
     enclosed = missing & ~external
-    # Keep only pockets belonging to the current candidate.  A disconnected
-    # closed sheet inside the crop is not a hole in the seed region and must
-    # remain untouched.  This visits each enclosed component once while
-    # collecting the outer-boundary decision above; it is still one compact
-    # domain assist, not the retired repeated global gapfill.
     fills = []
+    rejected_ids = []
     visited = np.zeros(count, dtype=bool)
-    enclosed_components = 0
+    component_count = 0
+    filled_components = 0
+    max_outer = 0
+    rejected_large_components = 0
     for start_face in np.flatnonzero(enclosed):
         start_face = int(start_face)
         if visited[start_face]:
             continue
-        pending = [start_face]
+        component_count += 1
         visited[start_face] = True
+        pending = [start_face]
         component = []
-        touches_selected = False
+        interface_faces = set()
         while pending:
-            face = pending.pop()
+            face = int(pending.pop())
             component.append(face)
-            start, end = int(offsets[face]), int(offsets[face + 1])
-            for neighbor in neighbors[start:end]:
+            for neighbor in neighbors[int(offsets[face]) : int(offsets[face + 1])]:
                 neighbor = int(neighbor)
                 if selected[neighbor]:
-                    touches_selected = True
+                    interface_faces.add(neighbor)
                 elif enclosed[neighbor] and not visited[neighbor]:
                     visited[neighbor] = True
                     pending.append(neighbor)
-        if touches_selected:
+        if not interface_faces:
+            continue
+        component_vertices = set()
+        interface_vertices = set()
+        valid_vertices = True
+        try:
+            for face in component:
+                values = tuple(int(value) for value in face_vertices[face])
+                if not values:
+                    valid_vertices = False
+                    break
+                component_vertices.update(values)
+            if valid_vertices:
+                for face in interface_faces:
+                    interface_vertices.update(
+                        int(value) for value in face_vertices[face]
+                    )
+        except (IndexError, TypeError, ValueError):
+            valid_vertices = False
+        if not valid_vertices:
+            continue
+        outer_count = int(len(component_vertices - interface_vertices))
+        max_outer = max(max_outer, outer_count)
+        if outer_count <= 100:
             fills.extend(component)
-            enclosed_components += 1
-    fills = np.asarray(fills, dtype=np.int32)
-    return np.unique(fills), {
-        "compact_external_faces": int(np.count_nonzero(external)),
-        "compact_enclosed_faces": int(len(fills)),
-        "compact_external_seed_faces": int(np.count_nonzero(outside)),
-        "compact_enclosed_components": int(enclosed_components),
+            filled_components += 1
+        else:
+            rejected_ids.extend(component)
+            rejected_large_components += 1
+    metrics.update(
+        {
+            "enclosed_component_count": int(component_count),
+            "enclosed_component_filled_faces": int(len(fills)),
+            "enclosed_component_filled_components": int(filled_components),
+            "enclosed_component_max_outer_vertices": int(max_outer),
+            "enclosed_component_rejected_large_components": int(
+                rejected_large_components
+            ),
+            "enclosed_component_rejected_face_ids": tuple(sorted(set(rejected_ids))),
+        }
+    )
+    return np.unique(np.asarray(fills, dtype=np.int32)), metrics
+
+
+def _fill_preview_boundary_topology_metrics(
+    mesh, pair_edge_indices, boundary, pair_v0=None, pair_v1=None
+):
+    """Summarize the copied physical boundary without changing selection.
+
+    The normal progressive path draws from the full prepared graph.  The
+    retained pair endpoint arrays are the authoritative physical-edge
+    identity; ``pair_edge_indices`` is only a legacy mesh-edge hint and may
+    be stale after a cursor-expanded graph is rebuilt.  Invalid/crop rows are
+    counted explicitly rather than silently dropped.
+    """
+    try:
+        import numpy as np
+
+        pair_edge_indices = np.asarray(pair_edge_indices, dtype=np.int32).reshape(-1)
+        boundary = np.asarray(boundary, dtype=bool).reshape(-1)
+        pair_v0 = np.asarray(
+            pair_v0 if pair_v0 is not None else (), dtype=np.int32
+        ).reshape(-1)
+        pair_v1 = np.asarray(
+            pair_v1 if pair_v1 is not None else (), dtype=np.int32
+        ).reshape(-1)
+        use_pair_vertices = len(pair_v0) == len(boundary) and len(pair_v1) == len(boundary)
+        if len(pair_edge_indices) != len(boundary) and not use_pair_vertices:
+            return {
+                "boundary_components": 0,
+                "boundary_free_endpoints": 0,
+                "boundary_missing_neighbor_fallback_count": int(np.count_nonzero(boundary)),
+                "boundary_topology_reason": "schema",
+            }
+        rows = []
+        for row in np.flatnonzero(boundary):
+            row = int(row)
+            if use_pair_vertices:
+                if int(pair_v0[row]) >= 0 and int(pair_v1[row]) >= 0:
+                    rows.append(row)
+            elif int(pair_edge_indices[row]) >= 0:
+                rows.append(row)
+        missing = int(np.count_nonzero(boundary)) - len(rows)
+        if not rows or (mesh is None and not use_pair_vertices):
+            return {
+                "boundary_components": 0,
+                "boundary_free_endpoints": 0,
+                "boundary_missing_neighbor_fallback_count": missing,
+                "boundary_topology_reason": "no-physical-edge-rows",
+            }
+        parent = {row: row for row in rows}
+
+        def find(value):
+            value = int(value)
+            while parent[value] != value:
+                parent[value] = parent[parent[value]]
+                value = parent[value]
+            return value
+
+        def union(left, right):
+            left, right = find(left), find(right)
+            if left != right:
+                parent[right] = left
+
+        vertex_rows = {}
+        for row in rows:
+            if use_pair_vertices:
+                vertices = (int(pair_v0[row]), int(pair_v1[row]))
+            else:
+                edge = mesh.edges[int(pair_edge_indices[row])]
+                vertices = tuple(int(value) for value in edge.vertices)
+            for vertex in vertices:
+                vertex_rows.setdefault(vertex, []).append(row)
+        for incident in vertex_rows.values():
+            for row in incident[1:]:
+                union(incident[0], row)
+        endpoint_count = sum(1 for incident in vertex_rows.values() if len(incident) == 1)
+        return {
+            "boundary_components": int(len({find(row) for row in rows})),
+            "boundary_free_endpoints": int(endpoint_count),
+            "boundary_missing_neighbor_fallback_count": int(max(0, missing)),
+            "boundary_topology_reason": (
+                "pair-vertex-physical-interface"
+                if use_pair_vertices
+                else "validated-mesh-edge-interface"
+            ),
+        }
+    except (AttributeError, IndexError, KeyError, RuntimeError, TypeError, ValueError):
+        return {
+            "boundary_components": 0,
+            "boundary_free_endpoints": 0,
+            "boundary_missing_neighbor_fallback_count": int(
+                np.count_nonzero(boundary) if "np" in locals() else 0
+            ),
+            "boundary_topology_reason": "schema-exception",
+        }
+
+
+def _fill_preview_resolve_sandwiched_bands(
+    geometry, distances, radius, selected_ids
+):
+    """Close narrow missing face-graph bands without changing the base.
+
+    The resolver intentionally does not classify a terminal, a valley, or a
+    boundary colour.  It computes graph morphology from the immutable base
+    candidate in the current radius domain.  A newly created component is
+    accepted only when its original base interface consists of at least two
+    spatially separated boundary arcs.  Thus a one-sided bulge cannot be
+    mistaken for a shore pair, while a long narrow gap is closed independently
+    of its length.  Each scale is recomputed from the same base; accepted
+    faces never seed a later scale.
+    """
+    import numpy as np
+
+    metrics = {
+        "sandwiched_band_faces": 0,
+        "sandwiched_band_components": 0,
+        "sandwiched_band_interface_edges": 0,
+        "sandwiched_band_closing_attempts": 0,
+        "sandwiched_band_closing_components": 0,
+        "sandwiched_band_closing_added_faces": 0,
+        "sandwiched_band_filled_faces": 0,
+        "sandwiched_band_filled_components": 0,
+        "sandwiched_band_contact_arcs": 0,
+        "sandwiched_band_rejected_protected": 0,
+        "sandwiched_band_rejected_single_arc": 0,
+        "sandwiched_band_rejected_hard_distance": 0,
+        "sandwiched_band_closing_max_n": 0,
+        "sandwiched_band_graph_walks": 0,
+        "sandwiched_band_reason": "ok",
     }
+    try:
+        count = int(geometry["count"])
+        distances = np.asarray(distances, dtype=np.float64).reshape(-1)
+        edge_counts = np.asarray(
+            geometry["face_edge_counts"], dtype=np.int32
+        ).reshape(-1)
+        hidden = np.asarray(geometry["hidden"], dtype=bool).reshape(-1)
+        offsets = np.asarray(geometry["offsets"], dtype=np.int64).reshape(-1)
+        neighbors = np.asarray(geometry["neighbors"], dtype=np.int32).reshape(-1)
+        first = np.asarray(geometry["first"], dtype=np.int32).reshape(-1)
+        second = np.asarray(geometry["second"], dtype=np.int32).reshape(-1)
+        pair_points = np.asarray(
+            geometry["pair_edge_points"], dtype=np.float64
+        )
+        pair_edge_indices = np.asarray(
+            geometry["pair_edge_indices"], dtype=np.int32
+        ).reshape(-1)
+        centers = np.asarray(geometry["centers"], dtype=np.float64)
+        normals = np.asarray(geometry["normals"], dtype=np.float64)
+        face_vertices = geometry["face_vertex_ids"]
+        world_vertices = np.asarray(
+            geometry["world_vertices"], dtype=np.float64
+        )
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+        metrics["sandwiched_band_reason"] = "schema"
+        return np.empty(0, dtype=np.int32), metrics
+    if (
+        count <= 0
+        or len(distances) != count
+        or len(edge_counts) != count
+        or len(hidden) != count
+        or len(offsets) != count + 1
+        or np.any(offsets[1:] < offsets[:-1])
+        or int(offsets[-1]) != len(neighbors)
+        or len(first) != len(second)
+        or pair_points.shape != (len(first), 2, 3)
+        or len(pair_edge_indices) != len(first)
+        or np.any(pair_edge_indices < 0)
+        or len(set(int(value) for value in pair_edge_indices)) != len(pair_edge_indices)
+        or len(centers) != count
+        or normals.shape != (count, 3)
+        or len(face_vertices) != count
+        or world_vertices.ndim != 2
+        or world_vertices.shape[1] != 3
+        or np.any(neighbors < 0)
+        or np.any(neighbors >= count)
+        or np.any(first < 0)
+        or np.any(second < 0)
+        or np.any(first >= count)
+        or np.any(second >= count)
+        or not np.all(np.isfinite(centers))
+        or not np.all(np.isfinite(normals))
+        or not np.all(np.isfinite(pair_points))
+        or not np.all(np.isfinite(world_vertices))
+    ):
+        metrics["sandwiched_band_reason"] = "schema"
+        return np.empty(0, dtype=np.int32), metrics
+    try:
+        selected_ids = np.asarray(selected_ids, dtype=np.int32).reshape(-1)
+    except (TypeError, ValueError):
+        metrics["sandwiched_band_reason"] = "selected-schema"
+        return np.empty(0, dtype=np.int32), metrics
+
+    selected = np.zeros(count, dtype=bool)
+    selected_ids = selected_ids[
+        (selected_ids >= 0) & (selected_ids < count)
+    ]
+    selected[selected_ids] = True
+    tolerance = max(float(radius) * 1.0e-8, 1.0e-9)
+    domain = (
+        np.isfinite(distances)
+        & (distances <= float(radius) + tolerance)
+        & ~hidden
+    )
+    # Closing is defined on the induced graph of the requested radius.  A
+    # finite face beyond that radius is deliberately not a dilation target and
+    # is not an erosion requirement: this is a neutral/reflecting radius cut,
+    # rather than a zero-valued boundary.  Crop/unknown boundaries are kept
+    # distinct and fail closed below using the original polygon edge count.
+    base = selected & domain
+    missing = domain & ~base
+    metrics["sandwiched_band_faces"] = int(np.count_nonzero(missing))
+    if not np.any(missing) or not np.any(base):
+        return np.empty(0, dtype=np.int32), metrics
+
+    degree = np.diff(offsets).astype(np.int64, copy=False)
+    pair_map = {}
+    for pair_index, (left, right) in enumerate(zip(first, second)):
+        left = int(left)
+        right = int(right)
+        if left == right:
+            continue
+        key = (min(left, right), max(left, right))
+        # Duplicate graph rows are malformed for boundary evidence.  Keep the
+        # first source-of-truth edge and reject duplicate interfaces below.
+        pair_map.setdefault(key, int(pair_index))
+
+    # A finite face outside radius is a clipping endpoint, not a hard
+    # protection boundary.  Hidden, non-finite, missing-edge, and malformed
+    # graph links remain barriers and cannot participate in Closing.  A degree
+    # deficit on any adjacent prepared face is also unknown: it may be a crop,
+    # non-manifold, or unmatched seam, so it is never crossed or treated as a
+    # soft radius cut.
+    hard_face = (
+        hidden
+        | ~np.isfinite(distances)
+        | (degree < edge_counts)
+    )
+    protected = missing & hard_face
+    for face in np.flatnonzero(missing):
+        face = int(face)
+        for neighbor in neighbors[int(offsets[face]) : int(offsets[face + 1])]:
+            neighbor = int(neighbor)
+            if bool(hard_face[neighbor]):
+                protected[face] = True
+
+    # Closing is evaluated only for N=1..max_n.  Compute shortest graph-hop
+    # distance to a hard/unknown boundary once, from all relevant finite
+    # sources.  A finite face outside the radius is traversable for this
+    # *diagnostic* only; it remains outside the induced Closing graph.  Thus a
+    # normal radius clip contributes no source, while a crop/non-manifold or
+    # hidden/non-finite continuation is found at its true shortest depth.
+    max_n = 8
+    finite_faces = np.isfinite(distances)
+    hard_distance = np.full(count, max_n + 1, dtype=np.int32)
+    hard_queue = deque()
+    for face in np.flatnonzero(finite_faces & hard_face):
+        face = int(face)
+        hard_distance[face] = 0
+        hard_queue.append(face)
+    # Non-finite/hidden hard faces are not traversed, but their finite
+    # neighbors still need a distance-one source so a two-hop crop is not
+    # mistaken for a soft radius cut.
+    for face in np.flatnonzero(finite_faces):
+        face = int(face)
+        if hard_distance[face] == 0:
+            continue
+        start = int(offsets[face])
+        end = int(offsets[face + 1])
+        if any(bool(hard_face[int(neighbor)]) and not bool(finite_faces[int(neighbor)])
+               for neighbor in neighbors[start:end]):
+            hard_distance[face] = 1
+            hard_queue.append(face)
+    while hard_queue:
+        face = int(hard_queue.popleft())
+        depth = int(hard_distance[face])
+        if depth >= max_n:
+            continue
+        next_depth = depth + 1
+        start = int(offsets[face])
+        end = int(offsets[face + 1])
+        for neighbor in neighbors[start:end]:
+            neighbor = int(neighbor)
+            if not finite_faces[neighbor] or next_depth >= int(hard_distance[neighbor]):
+                continue
+            hard_distance[neighbor] = next_depth
+            hard_queue.append(neighbor)
+
+    component_of = np.full(count, -1, dtype=np.int32)
+    components = []
+    for start_face in np.flatnonzero(missing):
+        start_face = int(start_face)
+        if component_of[start_face] >= 0:
+            continue
+        component_id = len(components)
+        component_of[start_face] = component_id
+        pending = [start_face]
+        component = []
+        while pending:
+            face = int(pending.pop())
+            component.append(face)
+            for neighbor in neighbors[
+                int(offsets[face]) : int(offsets[face + 1])
+            ]:
+                neighbor = int(neighbor)
+                if missing[neighbor] and component_of[neighbor] < 0:
+                    component_of[neighbor] = component_id
+                    pending.append(neighbor)
+        components.append(np.asarray(component, dtype=np.int32))
+    metrics["sandwiched_band_components"] = int(len(components))
+    component_protected = np.asarray(
+        [bool(np.any(protected[component])) for component in components],
+        dtype=bool,
+    )
+    component_hard_distance = np.asarray(
+        [
+            int(np.min(hard_distance[component])) if len(component)
+            else max_n + 1
+            for component in components
+        ],
+        dtype=np.int32,
+    )
+    # Cache the component-level hard decision once; the N loop below only
+    # checks the candidate component's precomputed per-face distance.
+    component_protected |= component_hard_distance <= 0
+    # Per-face local scale is used only to choose a stable endpoint tolerance.
+    # It never creates a global acceptance threshold shared by components.
+    face_scale_cache = {}
+
+    def face_scale(face):
+        face = int(face)
+        cached = face_scale_cache.get(face)
+        if cached is not None:
+            return cached
+        scale = 0.0
+        try:
+            ids = np.asarray(
+                tuple(int(value) for value in face_vertices[face]),
+                dtype=np.int64,
+            )
+            if len(ids) >= 2 and not np.any(ids < 0) and not np.any(
+                ids >= len(world_vertices)
+            ):
+                points = world_vertices[ids]
+                lengths = np.linalg.norm(
+                    points - np.roll(points, -1, axis=0), axis=1
+                )
+                lengths = lengths[
+                    np.isfinite(lengths) & (lengths > 1.0e-12)
+                ]
+                if len(lengths):
+                    scale = float(np.percentile(lengths, 25.0))
+        except (IndexError, TypeError, ValueError):
+            scale = 0.0
+        face_scale_cache[face] = scale
+        return scale
+
+    component_interfaces = []
+    total_interfaces = 0
+    rejected_protected = 0
+    for component_index, component in enumerate(components):
+        records = []
+        malformed = False
+        for missing_face in component:
+            missing_face = int(missing_face)
+            for neighbor in neighbors[
+                int(offsets[missing_face]) : int(offsets[missing_face + 1])
+            ]:
+                neighbor = int(neighbor)
+                if not base[neighbor]:
+                    continue
+                pair_index = pair_map.get(
+                    (min(missing_face, neighbor), max(missing_face, neighbor))
+                )
+                if pair_index is None:
+                    malformed = True
+                    continue
+                edge = pair_points[pair_index]
+                if edge.shape != (2, 3) or not np.all(np.isfinite(edge)):
+                    malformed = True
+                    continue
+                edge_length = float(np.linalg.norm(edge[1] - edge[0]))
+                if edge_length <= 1.0e-12:
+                    malformed = True
+                    continue
+                records.append(
+                    {
+                        "missing_face": missing_face,
+                        "selected_face": neighbor,
+                        "pair_index": int(pair_index),
+                        "edge": edge.copy(),
+                        "edge_length": edge_length,
+                    }
+                )
+        total_interfaces += len(records)
+        if bool(component_protected[component_index]):
+            rejected_protected += 1
+            component_interfaces.append(())
+        elif malformed or len(records) < 2:
+            component_interfaces.append(())
+        else:
+            component_interfaces.append(tuple(records))
+    metrics["sandwiched_band_interface_edges"] = int(total_interfaces)
+    metrics["sandwiched_band_rejected_protected"] = int(rejected_protected)
+
+    eligible = [
+        index
+        for index, records in enumerate(component_interfaces)
+        if records and not bool(component_protected[index])
+    ]
+    if not eligible:
+        metrics["sandwiched_band_reason"] = (
+            "protected-or-no-interface"
+            if rejected_protected
+            else "no-interface"
+        )
+        return np.empty(0, dtype=np.int32), metrics
+
+    allowed = domain & ~hard_face
+
+    graph_walks = 0
+
+    def dilate_once(seed):
+        nonlocal graph_walks
+        graph_walks += 1
+        result = np.asarray(seed, dtype=bool)
+        expanded = result.copy()
+        # Protected faces may remain in the immutable base for the sake of
+        # base preservation, but they must never act as dilation seeds.
+        for face in np.flatnonzero(result & ~hard_face):
+            start = int(offsets[int(face)])
+            end = int(offsets[int(face) + 1])
+            for neighbor in neighbors[start:end]:
+                neighbor = int(neighbor)
+                if allowed[neighbor]:
+                    expanded[neighbor] = True
+        return expanded
+
+    def erode(mask, steps):
+        nonlocal graph_walks
+        result = np.asarray(mask, dtype=bool).copy()
+        for _ in range(int(steps)):
+            graph_walks += 1
+            reduced = result.copy()
+            for face in np.flatnonzero(result):
+                start = int(offsets[int(face)])
+                end = int(offsets[int(face) + 1])
+                for neighbor in neighbors[start:end]:
+                    neighbor = int(neighbor)
+                    # Radius-cut neighbors are outside the induced graph and
+                    # therefore neutral for erosion.  Every domain neighbor
+                    # must still survive and be allowed.
+                    if domain[neighbor] and (
+                        not allowed[neighbor] or not result[neighbor]
+                    ):
+                        reduced[int(face)] = False
+                        break
+            result = reduced
+        return result
+
+    def endpoint_key(point, quantum):
+        return tuple(
+            int(round(float(value) / quantum)) for value in point
+        )
+
+    def contact_arcs(new_faces, records):
+        """Group original-base contact edges into separated arcs."""
+        if not records:
+            return (), "none"
+        segments = []
+        for face in new_faces:
+            face = int(face)
+            for neighbor in neighbors[
+                int(offsets[face]) : int(offsets[face + 1])
+            ]:
+                neighbor = int(neighbor)
+                if not base[neighbor]:
+                    continue
+                pair_index = pair_map.get(
+                    (min(face, neighbor), max(face, neighbor))
+                )
+                if pair_index is None:
+                    return (), "malformed"
+                edge = pair_points[pair_index]
+                if edge.shape != (2, 3) or not np.all(np.isfinite(edge)):
+                    return (), "malformed"
+                edge_length = float(np.linalg.norm(edge[1] - edge[0]))
+                if edge_length <= 1.0e-12:
+                    return (), "malformed"
+                segments.append(
+                    {
+                        "p0": edge[0],
+                        "p1": edge[1],
+                        "selected_face": neighbor,
+                        "length": edge_length,
+                    }
+                )
+        if not segments:
+            return (), "none"
+        scale_values = np.asarray(
+            [
+                max(
+                    item["length"],
+                    face_scale(item["selected_face"]),
+                )
+                for item in segments
+            ],
+            dtype=np.float64,
+        )
+        scale_values = scale_values[
+            np.isfinite(scale_values) & (scale_values > 1.0e-12)
+        ]
+        quantum = max(
+            (float(np.median(scale_values)) if len(scale_values) else 1.0)
+            * 1.0e-6,
+            1.0e-9,
+        )
+        parent = list(range(len(segments)))
+
+        def find(index):
+            while parent[index] != index:
+                parent[index] = parent[parent[index]]
+                index = parent[index]
+            return index
+
+        def union(left, right):
+            left = find(left)
+            right = find(right)
+            if left != right:
+                parent[right] = left
+
+        endpoint_map = {}
+        for index, item in enumerate(segments):
+            for point in (item["p0"], item["p1"]):
+                endpoint_map.setdefault(
+                    endpoint_key(point, quantum), []
+                ).append(index)
+        for indices in endpoint_map.values():
+            if indices:
+                first_index = indices[0]
+                for index in indices[1:]:
+                    union(first_index, index)
+        groups = {}
+        for index in range(len(segments)):
+            groups.setdefault(find(index), []).append(index)
+        arcs = []
+        for indices in groups.values():
+            selected_faces = set(
+                int(segments[index]["selected_face"]) for index in indices
+            )
+            points = np.asarray(
+                [
+                    point
+                    for index in indices
+                    for point in (segments[index]["p0"], segments[index]["p1"])
+                ],
+                dtype=np.float64,
+            )
+            arcs.append(
+                {
+                    "indices": tuple(indices),
+                    "selected_faces": selected_faces,
+                    "center": np.mean(points, axis=0),
+                }
+            )
+        if len(arcs) < 2:
+            return tuple(arcs), "single"
+        separated = []
+        for first_index, first_arc in enumerate(arcs):
+            for second_index in range(first_index + 1, len(arcs)):
+                second_arc = arcs[second_index]
+                span = float(
+                    np.linalg.norm(
+                        second_arc["center"] - first_arc["center"]
+                    )
+                )
+                # Endpoint connectivity already defines one contact arc.  Do
+                # not compare arc spacing with the long edge of an
+                # anisotropic quad; only discard numerical duplicate arcs.
+                if span <= quantum * 4.0:
+                    continue
+                direct_adjacency = False
+                for first_face in first_arc["selected_faces"]:
+                    start = int(offsets[first_face])
+                    end = int(offsets[first_face + 1])
+                    if any(
+                        int(value) in second_arc["selected_faces"]
+                        for value in neighbors[start:end]
+                    ):
+                        direct_adjacency = True
+                        break
+                if not direct_adjacency:
+                    separated.append((first_index, second_index, span))
+        if not separated:
+            return tuple(arcs), "single"
+        return tuple(arcs), "separated"
+
+    accepted = np.zeros(count, dtype=bool)
+    accepted_component_count = 0
+    rejected_single_arc = 0
+    contact_arc_count = 0
+    closing_components = 0
+    attempts = 0
+    visit_marks = np.zeros(count, dtype=np.int32)
+    candidate_marks = np.zeros(count, dtype=np.int32)
+    visit_token = 0
+    candidate_token = 0
+    # Build the dilation frontier once.  Each erosion still starts from the
+    # immutable-base dilation at this scale, so scales remain independent and
+    # accepted faces never seed a later one.  This reduces the former
+    # 2*(1+...+8)=72 graph walks to 8+36=44 without changing the Closing.
+    dilation = base.copy()
+    rejected_hard_distance = 0
+    for steps in range(1, max_n + 1):
+        dilation = dilate_once(dilation)
+        closing = erode(dilation, steps)
+        # Each scale starts from the immutable base.  Existing accepted faces
+        # remain output-only state; they are deliberately not removed from
+        # this Closing result, so a wider band in the same missing component
+        # can be validated and added at a later N.
+        new_faces = closing & missing & domain
+        metrics["sandwiched_band_closing_max_n"] = int(steps)
+        for component_index in eligible:
+            component = components[component_index]
+            component_new_faces = component[new_faces[component]]
+            if len(component_new_faces) == 0:
+                continue
+            attempts += 1
+            candidate_token += 1
+            candidate_marks[component_new_faces] = candidate_token
+            for start_face in component_new_faces:
+                start_face = int(start_face)
+                if visit_marks[start_face] == candidate_token:
+                    continue
+                closing_components += 1
+                visit_marks[start_face] = candidate_token
+                pending = [start_face]
+                new_component = []
+                while pending:
+                    face = int(pending.pop())
+                    new_component.append(face)
+                    for neighbor in neighbors[
+                        int(offsets[face]) : int(offsets[face + 1])
+                    ]:
+                        neighbor = int(neighbor)
+                        if (
+                            candidate_marks[neighbor] == candidate_token
+                            and visit_marks[neighbor] != candidate_token
+                        ):
+                            visit_marks[neighbor] = candidate_token
+                            pending.append(neighbor)
+                arcs, arc_status = contact_arcs(
+                    np.asarray(new_component, dtype=np.int32),
+                    component_interfaces[component_index],
+                )
+                if arc_status in {"malformed", "none"}:
+                    continue
+                contact_arc_count = max(contact_arc_count, len(arcs))
+                if arc_status != "separated":
+                    rejected_single_arc += 1
+                    continue
+                new_component = np.asarray(new_component, dtype=np.int32)
+                # The accepted Closing component must not be within N graph
+                # hops of a hard/unknown boundary.  The per-face shortest
+                # distance makes this scale-sensitive: a one-step closing can
+                # survive a four-hop crop, while an eight-step closing cannot.
+                if int(np.min(hard_distance[new_component])) <= int(steps):
+                    rejected_hard_distance += 1
+                    continue
+                additions = new_component[~accepted[new_component]]
+                if len(additions) == 0:
+                    continue
+                accepted[additions] = True
+                accepted_component_count += 1
+    fills = np.flatnonzero(accepted & missing & domain).astype(np.int32)
+    metrics.update(
+        {
+            "sandwiched_band_closing_attempts": int(attempts),
+            "sandwiched_band_closing_components": int(closing_components),
+            "sandwiched_band_closing_added_faces": int(len(fills)),
+            "sandwiched_band_filled_faces": int(len(fills)),
+            "sandwiched_band_filled_components": int(accepted_component_count),
+            "sandwiched_band_contact_arcs": int(contact_arc_count),
+            "sandwiched_band_rejected_single_arc": int(rejected_single_arc),
+            "sandwiched_band_rejected_hard_distance": int(rejected_hard_distance),
+            "sandwiched_band_graph_walks": int(graph_walks),
+        }
+    )
+    if not len(fills):
+        metrics["sandwiched_band_reason"] = (
+            "no-separated-base-arcs"
+            if rejected_single_arc
+            else "no-closing-addition"
+        )
+        return fills, metrics
+    return np.unique(fills), metrics
+
+def _fill_preview_compact_external_faces(
+    geometry, distances, radius, selected_ids, blocked_ids=()
+):
+    """Compatibility entry point for the unified enclosed-component resolver."""
+    return _fill_preview_resolve_enclosed_components(
+        geometry, distances, radius, selected_ids
+    )
+
+
+def _fill_preview_tip_external_faces(geometry, distances, radius, selected_ids):
+    """Compatibility entry point; no separate terminal-tip pass remains."""
+    return _fill_preview_resolve_enclosed_components(
+        geometry, distances, radius, selected_ids
+    )
 
 
 def _fill_preview_boundary_route(
@@ -10513,9 +18171,9 @@ def _fill_preview_boundary_route(
 
 def _fill_preview_boundary_one_hop(
     state, geometry, local, distances, analysis_ids, radius,
-    preview_local_ids, protected_geometry_ids=(),
+    preview_local_ids, protected_geometry_ids=(), allowed_shape_rows=None,
 ):
-    """Add at most one current shape-boundary face row, with gap fallback.
+    """Propose a bounded one-row Closing, with gap fallback.
 
     This is a bounded post-pass over the candidate already produced for this
     radius.  It does not expand from an added face, and it never adds a face
@@ -10567,6 +18225,12 @@ def _fill_preview_boundary_one_hop(
             edge_indices,
         )
         shape_pairs = np.flatnonzero(shape & (edge_indices >= 0)).astype(np.int32)
+        if allowed_shape_rows is not None:
+            allowed_shape_rows = np.asarray(allowed_shape_rows, dtype=bool).reshape(-1)
+            if len(allowed_shape_rows) != len(first):
+                fallback["one_hop_reason"] = "interval-schema"
+                return original_ids, fallback
+            shape_pairs = shape_pairs[allowed_shape_rows[shape_pairs]]
         fallback["one_hop_shape_pairs"] = int(len(shape_pairs))
         if len(shape_pairs) == 0:
             fallback["one_hop_reason"] = "shape-interval-short"
@@ -10590,6 +18254,9 @@ def _fill_preview_boundary_one_hop(
             dtype=bool,
         )
         tolerance = max(float(radius) * 1.0e-8, 1.0e-9)
+        protected_ids = np.asarray(
+            tuple(protected_geometry_ids), dtype=np.int32
+        )
         eligible = shape_pairs[
             (~selected[outside_shape])
             & np.isfinite(local_distances[outside_shape])
@@ -10597,6 +18264,10 @@ def _fill_preview_boundary_one_hop(
             & ~hidden[outside_shape]
             & visible
         ]
+        if len(protected_ids):
+            eligible = eligible[
+                ~np.isin(local_global_ids[outside[eligible]], protected_ids)
+            ]
         added_local = np.unique(outside[eligible]).astype(np.int32)
         fallback["one_hop_eligible_pairs"] = int(len(eligible))
         if len(added_local) == 0:
@@ -10710,43 +18381,2878 @@ def _fill_preview_boundary_one_hop(
         return original_ids, fallback
 
 
+def _fill_preview_boundary_endpoint_schema(
+    state, geometry, local, edge_indices, pair_v0, pair_v1
+):
+    """Validate the declared endpoint id space before any boundary scoring.
+
+    Cursor graphs use compact indices into ``world_vertices``; the full mesh
+    graph uses explicitly declared mesh-global indices.  An omitted or
+    inconsistent schema is not recoverable by guessing, because an integer
+    that is valid in one space can silently name an unrelated vertex in the
+    other space.  Return a short rejection reason instead of allowing a
+    proposal to be generated from ambiguous coordinates.
+    """
+    import numpy as np
+
+    vertex_id_space = local.get("vertex_id_space")
+    if vertex_id_space not in {"compact", "mesh-global"}:
+        return "endpoint-schema"
+    edge_indices = np.asarray(edge_indices, dtype=np.int32).reshape(-1)
+    pair_v0 = np.asarray(pair_v0, dtype=np.int32).reshape(-1)
+    pair_v1 = np.asarray(pair_v1, dtype=np.int32).reshape(-1)
+    if (
+        len(edge_indices) == 0
+        or len(pair_v0) != len(edge_indices)
+        or len(pair_v1) != len(edge_indices)
+        or np.any(pair_v0 < 0)
+        or np.any(pair_v1 < 0)
+    ):
+        return "endpoint-schema"
+    if vertex_id_space == "compact":
+        world_vertices = np.asarray(
+            local.get("world_vertices", geometry.get("world_vertices", ())),
+            dtype=np.float64,
+        )
+        if (
+            world_vertices.ndim != 2
+            or world_vertices.shape[1] != 3
+            or not np.all(np.isfinite(world_vertices))
+            or np.any(pair_v0 >= len(world_vertices))
+            or np.any(pair_v1 >= len(world_vertices))
+        ):
+            return "endpoint-schema"
+        return None
+    mesh = getattr(state.get("obj"), "data", None)
+    matrix = getattr(state.get("obj"), "matrix_world", None)
+    if mesh is None or matrix is None:
+        return "endpoint-schema"
+    try:
+        vertex_count = int(len(mesh.vertices))
+    except (AttributeError, TypeError, ValueError):
+        return "endpoint-schema"
+    if np.any(pair_v0 >= vertex_count) or np.any(pair_v1 >= vertex_count):
+        return "endpoint-schema"
+    return None
+
+
+def _fill_preview_boundary_trim_bulge(
+    state, geometry, local, distances, analysis_ids, radius,
+    preview_local_ids, protected_geometry_ids=(), allowed_shape_rows=None,
+):
+    """Propose a bounded complement Opening for one off-level bulge.
+
+    The complement of Closing is useful only as a proposal here: this helper
+    does not open the whole candidate.  It first fits each existing orange
+    edge chain, finds a repeated one/two-ring edge plateau that sits away from
+    the chain's robust median level, and returns only the selected face
+    component touching that plateau.  The caller still applies the shared
+    shape score and all seed/cyan/barrier/connectivity gates.
+    """
+    import numpy as np
+
+    original_ids = np.asarray(preview_local_ids, dtype=np.int32).reshape(-1)
+    fallback = {
+        "boundary_trim_applied": False,
+        "boundary_trim_reason": "not-run",
+        "boundary_trim_changed_faces": 0,
+        "boundary_trim_edges": 0,
+    }
+    try:
+        count = int(local["count"])
+        first = np.asarray(local["first"], dtype=np.int32).reshape(-1)
+        second = np.asarray(local["second"], dtype=np.int32).reshape(-1)
+        edge_indices = np.asarray(
+            local.get("pair_edge_indices", ()), dtype=np.int32
+        ).reshape(-1)
+        local_global_ids = np.asarray(
+            local.get("_global_face_ids", ()), dtype=np.int32
+        ).reshape(-1)
+        pair_v0 = np.asarray(local.get("pair_v0", ()), dtype=np.int32).reshape(-1)
+        pair_v1 = np.asarray(local.get("pair_v1", ()), dtype=np.int32).reshape(-1)
+        analysis_ids = np.asarray(analysis_ids, dtype=np.int32).reshape(-1)
+        distances = np.asarray(distances, dtype=np.float64).reshape(-1)
+        offsets = np.asarray(local["offsets"], dtype=np.int64).reshape(-1)
+        neighbors = np.asarray(local["neighbors"], dtype=np.int32).reshape(-1)
+        if (
+            count <= 0
+            or len(first) == 0
+            or len(first) != len(second)
+            or len(first) != len(edge_indices)
+            or len(local_global_ids) != count
+            or len(analysis_ids) != count
+            or len(offsets) != count + 1
+            or int(offsets[-1]) != len(neighbors)
+            or np.any(first < 0)
+            or np.any(second < 0)
+            or np.any(first >= count)
+            or np.any(second >= count)
+            or np.any(analysis_ids < 0)
+            or np.any(analysis_ids >= len(distances))
+        ):
+            fallback["boundary_trim_reason"] = "schema"
+            return original_ids, fallback
+        local_distances = distances[analysis_ids]
+        selected = np.isin(local_global_ids, original_ids)
+        crossing = selected[first] != selected[second]
+        outside = np.where(selected[first], second, first)
+        shape = _fill_preview_shape_boundary_mask(
+            crossing, local_distances[outside], float(radius), edge_indices
+        )
+        shape_pairs = np.flatnonzero(shape & (edge_indices >= 0)).astype(np.int32)
+        if allowed_shape_rows is not None:
+            allowed_shape_rows = np.asarray(allowed_shape_rows, dtype=bool).reshape(-1)
+            if len(allowed_shape_rows) != len(first):
+                fallback["boundary_trim_reason"] = "interval-schema"
+                return original_ids, fallback
+            shape_pairs = shape_pairs[allowed_shape_rows[shape_pairs]]
+        if len(shape_pairs) < 6:
+            fallback["boundary_trim_reason"] = "shape-interval-short"
+            return original_ids, fallback
+
+        endpoint_reason = _fill_preview_boundary_endpoint_schema(
+            state, geometry, local, edge_indices, pair_v0, pair_v1
+        )
+        if endpoint_reason is not None:
+            fallback["boundary_trim_reason"] = endpoint_reason
+            return original_ids, fallback
+
+        world_vertices = np.asarray(
+            local.get("world_vertices", geometry.get("world_vertices", ())),
+            dtype=np.float64,
+        )
+        mesh = getattr(state.get("obj"), "data", None)
+        matrix = getattr(state.get("obj"), "matrix_world", None)
+        vertex_id_space = str(local.get("vertex_id_space"))
+        point_cache = {}
+
+        def point(vertex):
+            vertex = int(vertex)
+            if vertex in point_cache:
+                return point_cache[vertex]
+            if vertex_id_space == "mesh-global" and mesh is not None and matrix is not None:
+                value = np.asarray(matrix @ mesh.vertices[vertex].co, dtype=np.float64)
+            elif vertex_id_space == "compact" and (
+                world_vertices.ndim == 2
+                and world_vertices.shape[1] == 3
+                and 0 <= vertex < len(world_vertices)
+            ):
+                value = np.asarray(world_vertices[vertex], dtype=np.float64)
+            else:
+                raise ValueError("edge endpoint data unavailable")
+            if value.shape != (3,) or not np.all(np.isfinite(value)):
+                raise ValueError("edge endpoint data unavailable")
+            point_cache[vertex] = value
+            return value
+
+        edge_vertices = {}
+
+        def vertices_for_edge(pair):
+            edge = int(edge_indices[int(pair)])
+            if edge in edge_vertices:
+                return edge_vertices[edge]
+            if (
+                0 <= int(pair) < len(pair_v0)
+                and len(pair_v0) == len(edge_indices)
+                and len(pair_v1) == len(edge_indices)
+                and int(pair_v0[int(pair)]) >= 0
+                and int(pair_v1[int(pair)]) >= 0
+            ):
+                values = int(pair_v0[int(pair)]), int(pair_v1[int(pair)])
+                edge_vertices[edge] = values
+                return values
+            return None
+
+        # Split shape edges into the same physical chains used by the score.
+        edge_to_pairs = {}
+        vertex_edges = {}
+        for pair in shape_pairs:
+            edge = int(edge_indices[int(pair)])
+            values = vertices_for_edge(pair)
+            if values is None:
+                continue
+            edge_to_pairs.setdefault(edge, []).append(int(pair))
+            for vertex in values:
+                vertex_edges.setdefault(int(vertex), []).append(edge)
+        remaining = set(edge_to_pairs)
+        components = []
+        while remaining:
+            edge = min(remaining)
+            remaining.remove(edge)
+            pending = [edge]
+            component = []
+            while pending:
+                edge = pending.pop()
+                component.append(edge)
+                values = edge_vertices.get(edge, ())
+                for vertex in values:
+                    for other in vertex_edges.get(vertex, ()):
+                        if other in remaining:
+                            remaining.remove(other)
+                            pending.append(other)
+            components.append(component)
+        if not components:
+            fallback["boundary_trim_reason"] = "edge-data-unavailable"
+            return original_ids, fallback
+
+        centers = np.asarray(local.get("centers"), dtype=np.float64)
+        if centers.shape != (count, 3):
+            fallback["boundary_trim_reason"] = "center-schema"
+            return original_ids, fallback
+        protected_ids = np.asarray(tuple(protected_geometry_ids), dtype=np.int32)
+        protected = np.isin(local_global_ids, protected_ids)
+        seed_matches = np.flatnonzero(
+            local_global_ids == int(state.get("seed_local", -1))
+        )
+        if len(seed_matches) == 0:
+            fallback["boundary_trim_reason"] = "seed-missing"
+            return original_ids, fallback
+        seed_local = int(seed_matches[0])
+        spacing_values = np.asarray(
+            local.get("pair_lengths", local.get("neighbor_lengths", ())),
+            dtype=np.float64,
+        )
+        spacing = float(np.median(spacing_values)) if len(spacing_values) else 0.0
+        if not np.isfinite(spacing) or spacing <= 1.0e-12:
+            fallback["boundary_trim_reason"] = "spacing-unavailable"
+            return original_ids, fallback
+
+        # Prefer the first repeated plateau that has at least two physical
+        # edges.  A single isolated edge, a plane, and a wide basin therefore
+        # never become an opening proposal.
+        best_remove = None
+        for component in components:
+            if len(component) < 6:
+                continue
+            pairs = [pair for edge in component for pair in edge_to_pairs.get(edge, ())]
+            if len(pairs) < 6:
+                continue
+            vertices = sorted(
+                {
+                    vertex
+                    for edge in component
+                    for vertex in edge_vertices.get(edge, ())
+                }
+            )
+            if len(vertices) < 4:
+                continue
+            points = np.asarray([point(vertex) for vertex in vertices], dtype=np.float64)
+            center = points.mean(axis=0)
+            _u, _s, vh = np.linalg.svd(points - center, full_matrices=False)
+            direction = np.asarray(vh[0], dtype=np.float64)
+            direction /= max(float(np.linalg.norm(direction)), 1.0e-20)
+            normal = np.asarray(vh[1], dtype=np.float64)
+            normal -= direction * np.dot(normal, direction)
+            normal_norm = float(np.linalg.norm(normal))
+            if normal_norm <= 1.0e-12:
+                continue
+            normal /= normal_norm
+            edge_offsets = []
+            edge_pairs = {}
+            for edge in component:
+                pair = edge_to_pairs[edge][0]
+                values = edge_vertices[edge]
+                midpoint = (point(values[0]) + point(values[1])) * 0.5
+                edge_offsets.append(float(np.dot(midpoint - center, normal)))
+                edge_pairs[edge] = pair
+            edge_offsets = np.asarray(edge_offsets, dtype=np.float64)
+            baseline = float(np.median(edge_offsets))
+            outlier_edges = [
+                edge
+                for edge, offset in zip(component, edge_offsets)
+                if abs(float(offset) - baseline) >= spacing * 0.40
+            ]
+            if len(outlier_edges) < 2:
+                continue
+            outlier_delta = float(
+                np.median(
+                    [
+                        edge_offsets[index]
+                        for index, edge in enumerate(component)
+                        if edge in outlier_edges
+                    ]
+                )
+                - baseline
+            )
+            outlier_side = 1.0 if outlier_delta >= 0.0 else -1.0
+            # The selected face immediately behind an outlier edge seeds a
+            # local component.  Expand only through faces with the same
+            # off-level signal; this is the one/two-ring bulge corridor.
+            face_offsets = (centers - center) @ normal
+            high_face = (
+                (face_offsets - baseline) * outlier_side >= spacing * 0.20
+            )
+            starts = set()
+            boundary_inside_faces = set()
+            for edge in outlier_edges:
+                pair = edge_pairs[edge]
+                inside = int(first[pair]) if selected[int(first[pair])] else int(second[pair])
+                boundary_inside_faces.add(inside)
+                if (
+                    selected[inside]
+                    and not protected[inside]
+                    and inside != seed_local
+                    and high_face[inside]
+                ):
+                    starts.add(inside)
+            if not starts:
+                continue
+            candidate_faces = set()
+            trim_corridor = np.zeros(count, dtype=bool)
+            boundary_inside_array = np.asarray(sorted(boundary_inside_faces), dtype=np.int32)
+            trim_corridor[boundary_inside_array] = True
+            for face in boundary_inside_array:
+                trim_corridor[
+                    neighbors[int(offsets[face]) : int(offsets[face + 1])]
+                ] = True
+            pending = list(starts)
+            while pending:
+                face = int(pending.pop())
+                if (
+                    face in candidate_faces
+                    or not trim_corridor[face]
+                    or not selected[face]
+                    or protected[face]
+                    or face == seed_local
+                ):
+                    continue
+                if not high_face[face]:
+                    continue
+                candidate_faces.add(face)
+                # Opening is intentionally one graph layer.  Do not flood
+                # through an arbitrary high-face component: the caller's
+                # complete-geometry validation remains the final safety gate.
+            if len(candidate_faces) < 2:
+                continue
+            if best_remove is None or len(candidate_faces) > len(best_remove):
+                best_remove = candidate_faces
+                fallback["boundary_trim_edges"] = int(len(outlier_edges))
+        if not best_remove:
+            fallback["boundary_trim_reason"] = "no-local-bulge"
+            return original_ids, fallback
+        candidate_mask = selected.copy()
+        candidate_mask[np.asarray(sorted(best_remove), dtype=np.int32)] = False
+        corrected = local_global_ids[np.flatnonzero(candidate_mask)].astype(np.int32)
+        fallback.update(
+            {
+                "boundary_trim_applied": True,
+                "boundary_trim_reason": "proposal",
+                "boundary_trim_changed_faces": int(len(best_remove)),
+            }
+        )
+        return corrected, fallback
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError, RuntimeError, OverflowError):
+        fallback["boundary_trim_reason"] = "error-fallback"
+        return original_ids, fallback
+
+
+def _fill_preview_gray_partition_intervals(
+    edge_ids, edge_vertices, edge_signal, edge_face_normals, point,
+):
+    """Partition physical edges into deterministic simple intervals.
+
+    Proposal generation and candidate scoring must agree on where a physical
+    edge chain starts, ends, and crosses a junction.  The local tangent plane
+    is therefore resolved in this one helper.  A degenerate averaged normal
+    is deliberately ambiguous: falling back to 3D directions would make the
+    two callers disagree on folded surfaces.
+    """
+    import numpy as np
+
+    edge_ids = tuple(sorted(int(edge) for edge in edge_ids))
+    if not edge_ids:
+        return (), 0, 0, 0
+    vertex_edges = {}
+    for edge in edge_ids:
+        values = edge_vertices.get(edge)
+        if values is None or len(values) != 2:
+            continue
+        a, b = int(values[0]), int(values[1])
+        vertex_edges.setdefault(a, []).append(edge)
+        vertex_edges.setdefault(b, []).append(edge)
+    remaining = set(edge_ids)
+    components = []
+    while remaining:
+        start = min(remaining)
+        remaining.remove(start)
+        pending = [start]
+        component = []
+        while pending:
+            edge = pending.pop()
+            component.append(edge)
+            values = edge_vertices.get(edge)
+            if values is None or len(values) != 2:
+                continue
+            for vertex in (int(values[0]), int(values[1])):
+                for other in vertex_edges.get(vertex, ()):
+                    if other in remaining:
+                        remaining.remove(other)
+                        pending.append(other)
+        components.append(tuple(sorted(component)))
+
+    intervals = []
+    junction_count = 0
+    junction_pair_count = 0
+    junction_ambiguous_count = 0
+    for component in components:
+        component_set = set(component)
+        incident = {}
+        for edge in component:
+            values = edge_vertices.get(edge)
+            if values is None or len(values) != 2:
+                continue
+            incident.setdefault(int(values[0]), []).append(edge)
+            incident.setdefault(int(values[1]), []).append(edge)
+        junctions = sorted(
+            vertex for vertex, values in incident.items() if len(values) > 2
+        )
+        junction_count += len(junctions)
+        transition = {}
+        for vertex, raw_values in incident.items():
+            values = tuple(sorted(int(value) for value in raw_values))
+            if len(values) == 2:
+                transition[(int(vertex), values[0])] = values[1]
+                transition[(int(vertex), values[1])] = values[0]
+                continue
+            if len(values) <= 2:
+                continue
+            origin = point(vertex)
+            directions = {}
+            normal_values = []
+            for edge in values:
+                edge_points = edge_vertices.get(edge)
+                if edge_points is None or len(edge_points) != 2:
+                    continue
+                a, b = int(edge_points[0]), int(edge_points[1])
+                other = b if vertex == a else a
+                direction = np.asarray(point(other), dtype=np.float64) - origin
+                length = float(np.linalg.norm(direction))
+                if not np.isfinite(length) or length <= 1.0e-12:
+                    continue
+                directions[edge] = direction / length
+                normals = edge_face_normals.get(edge, ())
+                normals = np.asarray(normals, dtype=np.float64).reshape(-1, 3)
+                if len(normals):
+                    normal_values.extend(normals)
+            if len(directions) < 2 or len(normal_values) == 0:
+                junction_ambiguous_count += 1
+                continue
+            normal = np.sum(np.asarray(normal_values, dtype=np.float64), axis=0)
+            normal_length = float(np.linalg.norm(normal))
+            if not np.isfinite(normal_length) or normal_length <= 1.0e-12:
+                # No 3D fallback: the tangent plane is undefined, so this
+                # junction is intentionally split as ambiguous.
+                junction_ambiguous_count += 1
+                continue
+            normal /= normal_length
+            pair_scores = []
+            ordered_values = sorted(directions)
+            for left_index, left_edge in enumerate(ordered_values):
+                for right_edge in ordered_values[left_index + 1:]:
+                    left_direction = directions[left_edge] - normal * float(
+                        np.dot(directions[left_edge], normal)
+                    )
+                    right_direction = directions[right_edge] - normal * float(
+                        np.dot(directions[right_edge], normal)
+                    )
+                    left_length = float(np.linalg.norm(left_direction))
+                    right_length = float(np.linalg.norm(right_direction))
+                    if left_length <= 1.0e-12 or right_length <= 1.0e-12:
+                        continue
+                    left_direction /= left_length
+                    right_direction /= right_length
+                    dot = float(np.clip(np.dot(left_direction, right_direction), -1.0, 1.0))
+                    straightness = 0.5 * (1.0 - dot)
+                    signal_continuity = 1.0 - abs(
+                        float(edge_signal.get(left_edge, 0.0))
+                        - float(edge_signal.get(right_edge, 0.0))
+                    )
+                    pair_scores.append((
+                        float(0.75 * straightness + 0.25 * signal_continuity),
+                        left_edge,
+                        right_edge,
+                    ))
+            pair_scores.sort(key=lambda value: (-value[0], value[1], value[2]))
+            used_at_junction = set()
+            accepted_at_junction = 0
+            for pair_score, left_edge, right_edge in pair_scores:
+                if pair_score < 0.72:
+                    continue
+                if left_edge in used_at_junction or right_edge in used_at_junction:
+                    continue
+                alternatives = [
+                    value[0]
+                    for value in pair_scores
+                    if (value[1], value[2]) != (left_edge, right_edge)
+                    and (value[1] in (left_edge, right_edge) or value[2] in (left_edge, right_edge))
+                ]
+                if alternatives and pair_score - max(alternatives) < 0.08:
+                    continue
+                transition[(int(vertex), left_edge)] = right_edge
+                transition[(int(vertex), right_edge)] = left_edge
+                used_at_junction.update((left_edge, right_edge))
+                accepted_at_junction += 1
+            junction_pair_count += accepted_at_junction
+            if accepted_at_junction == 0:
+                junction_ambiguous_count += 1
+
+        starts = []
+        for edge in sorted(component_set):
+            values = edge_vertices.get(edge)
+            if values is None or len(values) != 2:
+                continue
+            for vertex in (int(values[0]), int(values[1])):
+                if (vertex, edge) not in transition:
+                    starts.append((edge, vertex))
+        used_edges = set()
+        for start_edge, start_vertex in sorted(starts):
+            if start_edge in used_edges:
+                continue
+            path = []
+            edge = int(start_edge)
+            vertex = int(start_vertex)
+            while edge not in used_edges and edge in component_set:
+                used_edges.add(edge)
+                path.append(edge)
+                values = edge_vertices.get(edge)
+                if values is None or len(values) != 2:
+                    break
+                a, b = int(values[0]), int(values[1])
+                next_vertex = b if vertex == a else a
+                next_edge = transition.get((next_vertex, edge))
+                if next_edge is None or next_edge in used_edges:
+                    break
+                vertex = next_vertex
+                edge = next_edge
+            if path:
+                intervals.append(tuple(path))
+    return tuple(intervals), int(junction_count), int(junction_pair_count), int(junction_ambiguous_count)
+
+
+def _fill_preview_boundary_grayscale_proposals(
+    state, geometry, local, distances, analysis_ids, radius,
+    preview_local_ids, protected_geometry_ids=(), usable_shape_rows=None,
+):
+    """Generate bounded grayscale Closing/Opening proposals.
+
+    The signal is attached to physical mesh edges and filtered only along
+    metric-length bounded chains.  A proposal is still a face-set delta from
+    the immutable input; all full-geometry safety checks remain in the caller.
+    """
+    import math
+    import numpy as np
+
+    original_ids = np.unique(np.asarray(preview_local_ids, dtype=np.int32).reshape(-1))
+    metrics = {
+        "shape_refine_gray_interval_count": 0,
+        "shape_refine_gray_usable_edges": 0,
+        "shape_refine_gray_guarded_edges": 0,
+        "shape_refine_gray_signal_median": 0.0,
+        "shape_refine_gray_signal_mad": 0.0,
+        "shape_refine_gray_close_response_max": 0.0,
+        "shape_refine_gray_open_response_max": 0.0,
+        "shape_refine_gray_add_edges": 0,
+        "shape_refine_gray_trim_edges": 0,
+        "shape_refine_gray_add_faces": 0,
+        "shape_refine_gray_corridor_band_faces": 0,
+        "shape_refine_gray_corridor_band_components": 0,
+        "shape_refine_gray_trim_faces": 0,
+        "shape_refine_gray_hysteresis_high": 0.0,
+        "shape_refine_gray_hysteresis_low": 0.0,
+        "shape_refine_gray_window_factor_min": 0.0,
+        "shape_refine_gray_window_factor_max": 0.0,
+        "shape_refine_gray_window_distance_min": 0.0,
+        "shape_refine_gray_window_distance_max": 0.0,
+        "shape_refine_gray_target_chain": (),
+        "shape_refine_gray_proposal_edge_signatures": (),
+        "shape_refine_gray_final_edge_signature": (),
+        "shape_refine_gray_adopted_proposal_edge_signature": (),
+        "shape_refine_gray_junction_count": 0,
+        "shape_refine_gray_junction_pairs": 0,
+        "shape_refine_gray_junction_ambiguous": 0,
+        "shape_refine_gray_rejection_reason": "not-run",
+        "shape_refine_gray_context_edge_count": 0,
+        "shape_refine_gray_context_window": 0.0,
+        "shape_refine_gray_context_status": "not-run",
+        "shape_refine_provisional": False,
+        "shape_refine_add_generated_faces": 0,
+        "shape_refine_add_reason": "not-run",
+        "shape_refine_add_eligible_pairs": 0,
+        "shape_refine_add_gap_faces": 0,
+        "shape_refine_add_proposal_count": 0,
+        "shape_refine_trim_generated_faces": 0,
+        "shape_refine_trim_reason": "not-run",
+        "shape_refine_trim_outlier_edges": 0,
+        "shape_refine_trim_gap_faces": 0,
+        "shape_refine_trim_proposal_count": 0,
+        "shape_refine_proposal_validation": (),
+        "shadow_tested_crossings": 0,
+        "shadow_barrier_count": 0,
+        "shadow_gentle_crossings_passed": 0,
+        "shadow_knee_crossings": 0,
+        "shadow_connected_line_count": 0,
+        "shadow_face_set_neutral": True,
+    }
+    empty = ((), (), metrics)
+    try:
+        count = int(local["count"])
+        first = np.asarray(local["first"], dtype=np.int32).reshape(-1)
+        second = np.asarray(local["second"], dtype=np.int32).reshape(-1)
+        edge_indices = np.asarray(local.get("pair_edge_indices", ()), dtype=np.int32).reshape(-1)
+        pair_v0 = np.asarray(local.get("pair_v0", ()), dtype=np.int32).reshape(-1)
+        pair_v1 = np.asarray(local.get("pair_v1", ()), dtype=np.int32).reshape(-1)
+        local_global_ids = np.asarray(local.get("_global_face_ids", ()), dtype=np.int32).reshape(-1)
+        analysis_ids = np.asarray(analysis_ids, dtype=np.int32).reshape(-1)
+        distances = np.asarray(distances, dtype=np.float64).reshape(-1)
+        if (
+            count <= 0 or len(first) != len(second) or len(first) != len(edge_indices)
+            or len(first) != len(pair_v0) or len(first) != len(pair_v1)
+            or len(local_global_ids) != count or len(analysis_ids) != count
+            or np.any(first < 0) or np.any(second < 0)
+            or np.any(first >= count) or np.any(second >= count)
+            or np.any(analysis_ids < 0) or np.any(analysis_ids >= len(distances))
+        ):
+            metrics["shape_refine_gray_rejection_reason"] = "schema"
+            metrics["shape_refine_add_reason"] = "schema"
+            metrics["shape_refine_trim_reason"] = "schema"
+            return empty
+        allowed = np.asarray(
+            usable_shape_rows if usable_shape_rows is not None else (), dtype=bool
+        ).reshape(-1)
+        if len(allowed) != len(first):
+            metrics["shape_refine_gray_rejection_reason"] = "interval-schema"
+            metrics["shape_refine_add_reason"] = "interval-schema"
+            metrics["shape_refine_trim_reason"] = "interval-schema"
+            return empty
+        endpoint_reason = _fill_preview_boundary_endpoint_schema(
+            state, geometry, local, edge_indices, pair_v0, pair_v1
+        )
+        if endpoint_reason is not None:
+            metrics["shape_refine_gray_rejection_reason"] = endpoint_reason
+            metrics["shape_refine_add_reason"] = endpoint_reason
+            metrics["shape_refine_trim_reason"] = endpoint_reason
+            return empty
+        selected = np.isin(local_global_ids, original_ids)
+        local_distances = distances[analysis_ids]
+        crossing = selected[first] != selected[second]
+        outside = np.where(selected[first], second, first)
+        shape = _fill_preview_shape_boundary_mask(
+            crossing, local_distances[outside], float(radius), edge_indices
+        )
+        shape_rows = np.flatnonzero(shape & (edge_indices >= 0) & allowed).astype(np.int32)
+        metrics["shape_refine_gray_usable_edges"] = int(len(shape_rows))
+        if len(shape_rows) < 6:
+            metrics["shape_refine_gray_rejection_reason"] = "usable-interval-short"
+            metrics["shape_refine_add_reason"] = "usable-interval-short"
+            metrics["shape_refine_trim_reason"] = "usable-interval-short"
+            return empty
+
+        offsets = np.asarray(local["offsets"], dtype=np.int64).reshape(-1)
+        neighbors = np.asarray(local["neighbors"], dtype=np.int32).reshape(-1)
+        hidden = np.asarray(local.get("hidden", np.zeros(count, dtype=bool)), dtype=bool).reshape(-1)
+        degree = np.diff(offsets) if len(offsets) == count + 1 else np.zeros(count, dtype=np.int32)
+        edge_counts = np.asarray(
+            local.get("face_edge_counts", degree), dtype=np.int32
+        ).reshape(-1)
+        if (
+            len(offsets) != count + 1 or int(offsets[-1]) != len(neighbors)
+            or len(hidden) != count or len(edge_counts) != count
+        ):
+            metrics["shape_refine_gray_rejection_reason"] = "graph-schema"
+            metrics["shape_refine_add_reason"] = "graph-schema"
+            metrics["shape_refine_trim_reason"] = "graph-schema"
+            return empty
+        hard = hidden | ~np.isfinite(local_distances) | (degree < edge_counts)
+        protected = np.isin(local_global_ids, np.asarray(tuple(protected_geometry_ids), dtype=np.int32))
+        protected |= hard
+        tolerance = max(float(radius) * 1.0e-8, 1.0e-9)
+        legal_face = (
+            np.isfinite(local_distances)
+            & (local_distances <= float(radius) + tolerance)
+            & ~hidden & ~hard
+        )
+
+        # Corridor is measured in graph faces only to bound the physical-edge
+        # field.  It is not a global N-ring morphology.
+        corridor = np.zeros(count, dtype=bool)
+        corridor[first[shape_rows]] = True
+        corridor[second[shape_rows]] = True
+        frontier = corridor.copy()
+        for _ in range(2):
+            grown = frontier.copy()
+            for face in np.flatnonzero(frontier):
+                grown[neighbors[int(offsets[face]) : int(offsets[face + 1])]] = True
+            corridor |= grown
+            frontier = grown
+
+        vertex_id_space = str(local.get("vertex_id_space"))
+        world_vertices = np.asarray(
+            local.get("world_vertices", geometry.get("world_vertices", ())), dtype=np.float64
+        )
+        mesh = getattr(state.get("obj"), "data", None)
+        matrix = getattr(state.get("obj"), "matrix_world", None)
+        point_cache = {}
+
+        def point(vertex):
+            vertex = int(vertex)
+            if vertex in point_cache:
+                return point_cache[vertex]
+            if vertex_id_space == "compact":
+                if world_vertices.ndim != 2 or world_vertices.shape[1] != 3 or not (0 <= vertex < len(world_vertices)):
+                    raise ValueError("endpoint-schema")
+                value = np.asarray(world_vertices[vertex], dtype=np.float64)
+            elif vertex_id_space == "mesh-global" and mesh is not None and matrix is not None:
+                if vertex < 0 or vertex >= len(mesh.vertices):
+                    raise ValueError("endpoint-schema")
+                value = np.asarray(matrix @ mesh.vertices[vertex].co, dtype=np.float64)
+            else:
+                raise ValueError("endpoint-schema")
+            if value.shape != (3,) or not np.all(np.isfinite(value)):
+                raise ValueError("endpoint-schema")
+            point_cache[vertex] = value
+            return value
+
+        # Build a bounded physical-edge field.  A duplicate edge row is
+        # ambiguous and fails closed rather than mixing face-local identities.
+        row_by_edge = {}
+        shape_edges = set()
+        corridor_rows = np.flatnonzero(
+            (edge_indices >= 0) & (corridor[first] | corridor[second])
+        ).astype(np.int32)
+        for row in corridor_rows:
+            edge = int(edge_indices[int(row)])
+            if edge in row_by_edge:
+                metrics["shape_refine_gray_rejection_reason"] = "duplicate-edge"
+                metrics["shape_refine_add_reason"] = "duplicate-edge"
+                metrics["shape_refine_trim_reason"] = "duplicate-edge"
+                return empty
+            if not (legal_face[int(first[row])] and legal_face[int(second[row])]):
+                continue
+            row_by_edge[edge] = int(row)
+        for row in shape_rows:
+            if int(edge_indices[int(row)]) in row_by_edge:
+                shape_edges.add(int(edge_indices[int(row)]))
+        if not shape_edges:
+            metrics["shape_refine_gray_rejection_reason"] = "no-legal-edge"
+            metrics["shape_refine_add_reason"] = "no-legal-edge"
+            metrics["shape_refine_trim_reason"] = "no-legal-edge"
+            return empty
+
+        # Feature signal is evaluated for every corridor edge, while current
+        # shape rows determine the interval baseline and face delta direction.
+        normals = np.asarray(local.get("normals"), dtype=np.float64)
+        contrast = np.asarray(local.get("contrast", np.zeros(count)), dtype=np.float64).reshape(-1)
+        concavity = np.asarray(local.get("concavity", np.zeros(count)), dtype=np.float64).reshape(-1)
+        directional = np.asarray(local.get("directional_valley", np.zeros(count)), dtype=np.float64).reshape(-1)
+        crease = np.asarray(local.get("crease", np.zeros(count)), dtype=np.float64).reshape(-1)
+        if (
+            normals.shape != (count, 3)
+            or any(len(values) != count for values in (contrast, concavity, directional, crease))
+            or not all(np.all(np.isfinite(values)) for values in (normals, contrast, concavity, directional, crease))
+        ):
+            metrics["shape_refine_gray_rejection_reason"] = "feature-schema"
+            metrics["shape_refine_add_reason"] = "feature-schema"
+            metrics["shape_refine_trim_reason"] = "feature-schema"
+            return empty
+        row_signal = {}
+        row_length = {}
+        row_midpoint = {}
+        for edge, row in row_by_edge.items():
+            left, right = int(first[row]), int(second[row])
+            dot = float(np.clip(np.dot(normals[left], normals[right]), -1.0, 1.0))
+            normal_signal = math.acos(dot) / math.pi
+            crease_signal = float(np.clip(max(crease[left], crease[right]) / math.pi, 0.0, 1.0))
+            scalar_signal = float(np.clip(max(contrast[left], contrast[right], concavity[left], directional[left], contrast[right], concavity[right], directional[right]) / 0.10, 0.0, 1.0))
+            values = (int(pair_v0[row]), int(pair_v1[row]))
+            point_a = point(values[0])
+            point_b = point(values[1])
+            length = float(np.linalg.norm(point_b - point_a))
+            if not np.isfinite(length) or length <= 1.0e-12:
+                continue
+            if bool(state.get("strict_mode", False)):
+                outside_distance = float(min(local_distances[left], local_distances[right]))
+                radius_prior = float(np.clip(1.0 - outside_distance / max(float(radius), 1.0e-20), 0.0, 1.0))
+                geodesic_prior = float(np.clip(1.0 - abs(local_distances[left] - local_distances[right]) / max(float(radius), 1.0e-20), 0.0, 1.0))
+                row_value = (
+                    0.45 * normal_signal
+                    + 0.20 * crease_signal
+                    + 0.25 * scalar_signal
+                    + 0.05 * radius_prior
+                    + 0.05 * geodesic_prior
+                )
+            else:
+                # Geometry-only signal. Radius/distance is a boundary
+                # classifier, never a feature-strength prior. Ordinary E
+                # uses only the fresh overlay-free viewport shadow sample;
+                # capture failure is intentionally a zero signal rather than
+                # a silent geometry fallback.
+                row_value, tested = _fill_preview_shadow_pair_signal(
+                    state, local, row
+                )
+                metrics["shadow_tested_crossings"] += int(tested > 0)
+                if tested and row_value >= 1.0:
+                    metrics["shadow_barrier_count"] += 1
+                    metrics["shadow_knee_crossings"] += 1
+                elif tested:
+                    metrics["shadow_gentle_crossings_passed"] += 1
+                metrics["shadow_face_set_neutral"] = True
+            row_signal[edge] = float(np.clip(row_value, 0.0, 1.0))
+            row_length[edge] = length
+            row_midpoint[edge] = (point_a + point_b) * 0.5
+        if not row_signal:
+            metrics["shape_refine_gray_rejection_reason"] = "edge-data-unavailable"
+            metrics["shape_refine_add_reason"] = "edge-data-unavailable"
+            metrics["shape_refine_trim_reason"] = "edge-data-unavailable"
+            return empty
+        shape_lengths = np.asarray(
+            [row_length[edge] for edge in sorted(shape_edges) if edge in row_length],
+            dtype=np.float64,
+        )
+        context_spacing = float(np.median(shape_lengths)) if len(shape_lengths) else 0.0
+        context_window = max(4.0 * context_spacing, context_spacing, 1.0e-12)
+        shape_points = [row_midpoint[edge] for edge in shape_edges if edge in row_midpoint]
+        context_edges = []
+        if shape_points:
+            for edge, midpoint in row_midpoint.items():
+                if any(
+                    float(np.linalg.norm(midpoint - anchor)) <= context_window + 1.0e-12
+                    for anchor in shape_points
+                ):
+                    context_edges.append(edge)
+        signal_values = np.asarray(
+            [row_signal[edge] for edge in sorted(set(context_edges)) if edge in row_signal],
+            dtype=np.float64,
+        )
+        metrics["shape_refine_gray_context_edge_count"] = int(len(signal_values))
+        metrics["shape_refine_gray_context_window"] = float(context_window)
+        metrics["shape_refine_gray_context_status"] = (
+            "full-local-window" if len(signal_values) >= 6 else "insufficient-local-window"
+        )
+        if len(signal_values) < 6:
+            # The normal E path keeps this boundary provisional so bootstrap
+            # may explore a bounded cyan shell. Ctrl+E remains conservative.
+            if not bool(state.get("strict_mode", False)):
+                metrics["shape_refine_provisional"] = True
+                metrics["shape_refine_gray_rejection_reason"] = "provisional-context-short"
+                metrics["shape_refine_add_reason"] = "provisional-context-short"
+                metrics["shape_refine_trim_reason"] = "provisional-context-short"
+            else:
+                metrics["shape_refine_gray_rejection_reason"] = "signal-short"
+                metrics["shape_refine_add_reason"] = "signal-short"
+                metrics["shape_refine_trim_reason"] = "signal-short"
+            return empty
+        median = float(np.median(signal_values))
+        mad = float(1.4826 * np.median(np.abs(signal_values - median)))
+        scale = max(mad, 1.0e-3)
+        if mad <= 1.0e-6:
+            # A constant strong edge field is valid, but it still needs a
+            # non-zero Closing/Opening response before it can move a face.
+            high = max(median, 0.08)
+            low = max(0.90 * median, 0.06)
+        else:
+            high = max(median + 2.0 * scale, 0.08)
+            low = max(median + scale, 0.06)
+            # A two-level field can have a large MAD even when its upper
+            # cluster is a legitimate short edge chain.  Cap the robust
+            # threshold by the observed signal range; this is data-derived,
+            # not a fixed feature-strength relaxation.
+            signal_range = float(np.ptp(signal_values))
+            if signal_range > 0.0:
+                high = min(high, median + 0.75 * signal_range)
+                low = min(low, high)
+        metrics.update({
+            "shape_refine_gray_signal_median": median,
+            "shape_refine_gray_signal_mad": mad,
+            "shape_refine_gray_hysteresis_high": high,
+            "shape_refine_gray_hysteresis_low": low,
+        })
+
+        # Physical-edge components are the intervals.  Only components that
+        # contain a current usable shape edge may produce a proposal.  The
+        # exact partition helper is shared with candidate scoring below.
+        edge_vertices = {}
+        edge_face_normals = {}
+        for edge in shape_edges:
+            row = row_by_edge[edge]
+            if edge not in row_signal:
+                continue
+            values = (int(pair_v0[row]), int(pair_v1[row]))
+            edge_vertices[edge] = values
+            left, right = int(first[row]), int(second[row])
+            edge_face_normals[edge] = (normals[left], normals[right])
+        intervals, junction_count, junction_pair_count, junction_ambiguous_count = (
+            _fill_preview_gray_partition_intervals(
+                tuple(edge_vertices),
+                edge_vertices,
+                row_signal,
+                edge_face_normals,
+                point,
+            )
+        )
+        metrics["shape_refine_gray_junction_count"] = int(junction_count)
+        metrics["shape_refine_gray_junction_pairs"] = int(junction_pair_count)
+        metrics["shape_refine_gray_junction_ambiguous"] = int(junction_ambiguous_count)
+        metrics["shape_refine_gray_interval_count"] = int(len(intervals))
+        add_proposals = []
+        trim_proposals = []
+        add_reasons = []
+        trim_reasons = []
+        target_signature = []
+        proposal_signatures = []
+        window_factors = []
+        window_distances = []
+        for interval_index, component in enumerate(intervals):
+            current_edges = [edge for edge in component if edge in shape_edges]
+            if len(current_edges) < 6:
+                add_reasons.append("interval-%d:short" % interval_index)
+                trim_reasons.append("interval-%d:short" % interval_index)
+                continue
+            lengths = np.asarray([row_length[edge] for edge in component], dtype=np.float64)
+            spacing = float(np.median(lengths))
+            if not np.isfinite(spacing) or spacing <= 1.0e-12:
+                continue
+            # A simple path is required for deterministic chain morphology.
+            incident = {}
+            for edge in component:
+                for vertex in edge_vertices[edge]:
+                    incident.setdefault(vertex, []).append(edge)
+            endpoints = [vertex for vertex, values in incident.items() if len(values) == 1]
+            if len(endpoints) != 2 or any(len(values) > 2 for values in incident.values()):
+                add_reasons.append("interval-%d:branch-or-cycle" % interval_index)
+                trim_reasons.append("interval-%d:branch-or-cycle" % interval_index)
+                continue
+            ordered = []
+            used = set()
+            vertex = min(endpoints)
+            while True:
+                options = [edge for edge in incident.get(vertex, ()) if edge not in used]
+                if not options:
+                    break
+                edge = min(options)
+                used.add(edge)
+                ordered.append(edge)
+                a, b = edge_vertices[edge]
+                vertex = b if vertex == a else a
+            if len(ordered) != len(component):
+                continue
+            values = np.asarray([row_signal[edge] for edge in ordered], dtype=np.float64)
+            ordered_lengths = np.asarray(
+                [row_length[edge] for edge in ordered], dtype=np.float64
+            )
+            positions = np.zeros(len(ordered), dtype=np.float64)
+            if len(ordered) > 1:
+                positions[1:] = np.cumsum(ordered_lengths[:-1])
+            # Derive a robust threshold independently at every physical
+            # edge from a fixed world-distance neighborhood.  This prevents
+            # extending the candidate, adding a remote ridge, or changing
+            # the wheel radius from changing the threshold of an unchanged
+            # local boundary.  Context comes from both sides of the current
+            # candidate whenever the prepared source graph contains it.
+            local_high = np.empty(len(values), dtype=np.float64)
+            local_low = np.empty(len(values), dtype=np.float64)
+            local_scale = np.empty(len(values), dtype=np.float64)
+            local_medians = []
+            local_mads = []
+            for index, edge in enumerate(ordered):
+                if bool(state.get("strict_mode", False)):
+                    local_high[index] = high
+                    local_low[index] = low
+                    local_scale[index] = scale
+                    local_medians.append(median)
+                    local_mads.append(mad)
+                    continue
+                anchor = row_midpoint.get(edge)
+                context_values = [
+                    row_signal[other]
+                    for other, midpoint in row_midpoint.items()
+                    if anchor is not None
+                    and float(np.linalg.norm(midpoint - anchor))
+                    <= context_window + 1.0e-12
+                    and other in row_signal
+                ]
+                if not context_values:
+                    context_values = [float(values[index])]
+                context_array = np.asarray(context_values, dtype=np.float64)
+                local_high[index], local_low[index], local_median, local_mad, _context_status = (
+                    _fill_preview_gray_local_threshold(context_array)
+                )
+                local_scale[index] = max(local_mad, 1.0e-3)
+                local_medians.append(local_median)
+                local_mads.append(local_mad)
+            if local_medians:
+                metrics["shape_refine_gray_signal_median"] = float(
+                    np.median(np.asarray(local_medians, dtype=np.float64))
+                )
+                metrics["shape_refine_gray_signal_mad"] = float(
+                    np.median(np.asarray(local_mads, dtype=np.float64))
+                )
+                metrics["shape_refine_gray_hysteresis_high"] = float(
+                    np.median(local_high)
+                )
+                metrics["shape_refine_gray_hysteresis_low"] = float(
+                    np.median(local_low)
+                )
+            # Keep the neighborhood metric-bounded, but adapt its width to
+            # the local field rather than collapsing to a fixed two-edge
+            # window.  A noisy/curved signal gets a little more context;
+            # strongly non-uniform edge lengths trim the span so a long edge
+            # cannot leap across a short local feature.  Both terms are
+            # dimensionless and are clamped to the documented 1.25--4.0x
+            # median-edge metric range.
+            interval_median = float(np.median(local_medians)) if local_medians else median
+            interval_mad = float(np.median(local_mads)) if local_mads else mad
+            signal_variation = float(
+                np.clip(interval_mad / max(abs(interval_median), 1.0e-6), 0.0, 2.0)
+            )
+            length_variation = float(
+                np.clip(np.std(ordered_lengths) / max(spacing, 1.0e-12), 0.0, 2.0)
+            )
+            window_factor = float(
+                np.clip(2.0 + 0.75 * signal_variation - 0.35 * length_variation, 1.25, 4.0)
+            )
+            window = window_factor * spacing
+            window_factors.append(window_factor)
+            window_distances.append(window)
+            dilation = np.empty(len(values), dtype=np.float64)
+            erosion = np.empty(len(values), dtype=np.float64)
+            for index in range(len(values)):
+                near = np.flatnonzero(np.abs(positions - positions[index]) <= window + 1.0e-12)
+                dilation[index] = float(np.max(values[near]))
+                erosion[index] = float(np.min(values[near]))
+            close = np.empty(len(values), dtype=np.float64)
+            opened = np.empty(len(values), dtype=np.float64)
+            for index in range(len(values)):
+                near = np.flatnonzero(np.abs(positions - positions[index]) <= window + 1.0e-12)
+                close[index] = float(np.min(dilation[near]))
+                opened[index] = float(np.max(erosion[near]))
+            # Explicit grayscale closing/opening responses.  Hysteresis keeps
+            # only a connected strong run and prevents isolated face spikes.
+            close_response = close - values
+            open_response = values - opened
+            metrics["shape_refine_gray_close_response_max"] = max(metrics["shape_refine_gray_close_response_max"], float(np.max(close_response)))
+            metrics["shape_refine_gray_open_response_max"] = max(metrics["shape_refine_gray_open_response_max"], float(np.max(open_response)))
+
+            def hysteresis(field, high_values, low_values):
+                strong = field >= high_values
+                weak = field >= low_values
+                keep = np.zeros(len(field), dtype=bool)
+                pending = list(np.flatnonzero(strong))
+                keep[strong] = True
+                while pending:
+                    index = int(pending.pop())
+                    for other in (index - 1, index + 1):
+                        if 0 <= other < len(field) and weak[other] and not keep[other]:
+                            keep[other] = True
+                            pending.append(other)
+                return keep
+
+            add_keep = hysteresis(close, local_high, local_low)
+            trim_keep = hysteresis(values, local_high, local_low)
+            # ``ordered.index`` makes a long physical chain quadratic.  Keep
+            # the same deterministic edge ordering while resolving current
+            # boundary positions in linear time.
+            ordered_position = {
+                edge: index for index, edge in enumerate(ordered)
+            }
+            shape_positions = {
+                ordered_position[edge]
+                for edge in current_edges
+                if edge in ordered_position
+            }
+            # Only response-supported current boundary rows become face deltas.
+            add_response_positions = {
+                index for index in shape_positions
+                if add_keep[index]
+                and close_response[index] >= max(0.10 * local_scale[index], 0.01)
+            }
+            opening_anchor_positions = {
+                index for index in shape_positions
+                if open_response[index] >= max(0.10 * local_scale[index], 0.01)
+            }
+            # A complete hysteretic run with multiple Opening anchors is a
+            # narrow overrun interval, even when an interior plateau has zero
+            # point-wise response.  Permit the full current run as one
+            # connected trim proposal; score/validator still decide whether
+            # the immutable full candidate may adopt it.
+            trim_full_interval = (
+                len(current_edges) >= 6
+                and shape_positions
+                and shape_positions <= set(np.flatnonzero(trim_keep))
+                and len(opening_anchor_positions) >= 2
+            )
+            # A Closing response may be concentrated in a short valley.  Once
+            # it has two anchors, carry the hysteretic run across the whole
+            # physical interval so the proposal remains one continuous chain.
+            add_rows = [
+                row_by_edge[ordered[index]] for index in shape_positions
+                if len(add_response_positions) >= 2 and add_keep[index]
+            ]
+            trim_rows = [
+                row_by_edge[ordered[index]] for index in shape_positions
+                if trim_keep[index]
+                and (
+                    open_response[index] >= max(0.10 * local_scale[index], 0.01)
+                    or trim_full_interval
+                )
+            ]
+            if len(add_rows) >= 2:
+                add_faces = []
+                for row in add_rows:
+                    out = int(outside[row])
+                    if not selected[out] and legal_face[out] and not protected[out]:
+                        add_faces.append(out)
+                add_faces = np.unique(np.asarray(add_faces, dtype=np.int32))
+                if len(add_faces) >= 2:
+                    # Reconstruct a bounded local corridor band from the
+                    # sparse boundary seeds.  The old implementation used
+                    # one outside face per row, which can leave a valid
+                    # physical chain represented by two disconnected face
+                    # islands on a real mesh.  Flood only the already-built
+                    # two-ring corridor and stop at the same immutable
+                    # barriers as validation; this is a local graph
+                    # reconstruction, not a global N-ring morphology.
+                    # Include every face directly opposite the complete
+                    # hysteretic target chain as a seed.  Then flood only
+                    # through faces that do not sit on a further
+                    # out-of-radius front; this prevents a local band from
+                    # leaking into a remote sheet/escape branch while still
+                    # bridging sparse real-mesh boundary rows.
+                    target_band_faces = []
+                    for index in np.flatnonzero(add_keep):
+                        target_row = row_by_edge[ordered[int(index)]]
+                        out = int(outside[target_row])
+                        if (
+                            not selected[out]
+                            and legal_face[out]
+                            and not protected[out]
+                        ):
+                            target_band_faces.append(out)
+                    target_band_faces = np.unique(
+                        np.asarray(target_band_faces, dtype=np.int32)
+                    )
+                    band_allowed = corridor & ~selected & legal_face & ~protected
+                    near_external_front = np.zeros(count, dtype=bool)
+                    for face in np.flatnonzero(band_allowed):
+                        for neighbor in neighbors[int(offsets[face]) : int(offsets[face + 1])]:
+                            neighbor = int(neighbor)
+                            if (
+                                not np.isfinite(local_distances[neighbor])
+                                or local_distances[neighbor] > float(radius) + tolerance
+                                or hidden[neighbor]
+                            ):
+                                near_external_front[face] = True
+                                break
+                    band_allowed &= ~near_external_front
+                    band_allowed[target_band_faces] = True
+                    seed_mask = np.zeros(count, dtype=bool)
+                    seed_mask[np.unique(np.r_[add_faces, target_band_faces])] = True
+                    band_seen = np.zeros(count, dtype=bool)
+                    band_components = []
+                    for seed in np.flatnonzero(seed_mask & band_allowed):
+                        seed = int(seed)
+                        if band_seen[seed]:
+                            continue
+                        band_seen[seed] = True
+                        pending = [seed]
+                        component_faces = []
+                        while pending:
+                            face = int(pending.pop())
+                            component_faces.append(face)
+                            for neighbor in neighbors[int(offsets[face]) : int(offsets[face + 1])]:
+                                neighbor = int(neighbor)
+                                if (
+                                    band_allowed[neighbor]
+                                    and not band_seen[neighbor]
+                                ):
+                                    band_seen[neighbor] = True
+                                    pending.append(neighbor)
+                        if component_faces:
+                            band_components.append(np.asarray(sorted(component_faces), dtype=np.int32))
+                    metrics["shape_refine_gray_corridor_band_components"] += int(len(band_components))
+                    metrics["shape_refine_gray_corridor_band_faces"] += int(
+                        sum(len(component_faces) for component_faces in band_components)
+                    )
+                    target_edges = tuple(
+                        sorted(int(ordered[index]) for index in np.flatnonzero(add_keep))
+                    )
+                    # Validate/score each contiguous component independently.
+                    # A disconnected side branch therefore cannot poison an
+                    # otherwise useful target-chain proposal.
+                    for component_faces in band_components:
+                        if len(component_faces) < 2:
+                            continue
+                        component_mask = np.zeros(count, dtype=bool)
+                        component_mask[component_faces] = True
+                        candidate = local_global_ids[
+                            np.flatnonzero(selected | component_mask)
+                        ].astype(np.int32)
+                        add_proposals.append((candidate, {
+                            "gray_interval_index": int(interval_index),
+                            "gray_target_edges": target_edges,
+                            "gray_supported_edges": target_edges,
+                            "gray_response": float(np.max(close_response)),
+                            "gray_corridor_band_faces": int(len(component_faces)),
+                        }))
+                        metrics["shape_refine_gray_add_edges"] += int(np.count_nonzero(add_keep))
+                        metrics["shape_refine_gray_add_faces"] += int(len(component_faces))
+                        metrics["shape_refine_add_generated_faces"] += int(len(component_faces))
+                        metrics["shape_refine_add_proposal_count"] += 1
+                        target_signature.append(target_edges)
+                        proposal_signatures.append((
+                            "add", int(interval_index), target_edges,
+                        ))
+            if len(trim_rows) >= 2:
+                trim_faces = []
+                seed_value = int(state.get("seed_local", -1))
+                for row in trim_rows:
+                    inside = int(first[row]) if selected[int(first[row])] else int(second[row])
+                    if selected[inside] and legal_face[inside] and not protected[inside] and inside != seed_value:
+                        trim_faces.append(inside)
+                trim_faces = np.unique(np.asarray(trim_faces, dtype=np.int32))
+                if len(trim_faces) >= 2:
+                    candidate_mask = selected.copy()
+                    candidate_mask[trim_faces] = False
+                    candidate = local_global_ids[np.flatnonzero(candidate_mask)].astype(np.int32)
+                    trim_proposals.append((candidate, {
+                        "gray_interval_index": int(interval_index),
+                        "gray_target_edges": tuple(sorted(int(ordered[index]) for index in np.flatnonzero(trim_keep))),
+                        "gray_supported_edges": tuple(sorted(int(ordered[index]) for index in np.flatnonzero(trim_keep))),
+                        "gray_response": float(np.max(open_response)),
+                    }))
+                    metrics["shape_refine_gray_trim_edges"] += int(np.count_nonzero(trim_keep))
+                    metrics["shape_refine_gray_trim_faces"] += int(len(trim_faces))
+                    metrics["shape_refine_trim_generated_faces"] += int(len(trim_faces))
+                    metrics["shape_refine_trim_proposal_count"] += 1
+                    proposal_signatures.append((
+                        "trim", int(interval_index),
+                        tuple(sorted(int(ordered[index]) for index in np.flatnonzero(trim_keep))),
+                    ))
+            add_reasons.append("interval-%d:%s" % (interval_index, "proposal" if add_rows else "no-closing-response"))
+            trim_reasons.append("interval-%d:%s" % (interval_index, "proposal" if trim_rows else "no-opening-response"))
+        metrics["shape_refine_gray_target_chain"] = tuple(target_signature)
+        metrics["shape_refine_gray_proposal_edge_signatures"] = tuple(proposal_signatures)
+        if window_factors:
+            metrics["shape_refine_gray_window_factor_min"] = float(min(window_factors))
+            metrics["shape_refine_gray_window_factor_max"] = float(max(window_factors))
+        if window_distances:
+            metrics["shape_refine_gray_window_distance_min"] = float(min(window_distances))
+            metrics["shape_refine_gray_window_distance_max"] = float(max(window_distances))
+        metrics["shape_refine_add_reason"] = ";".join(add_reasons) if add_reasons else "no-interval"
+        metrics["shape_refine_trim_reason"] = ";".join(trim_reasons) if trim_reasons else "no-interval"
+        metrics["shape_refine_gray_guarded_edges"] = int(np.count_nonzero(~allowed & (edge_indices >= 0)))
+        metrics["shape_refine_gray_rejection_reason"] = "proposal-generated" if (add_proposals or trim_proposals) else "no-clear-response"
+        return tuple(trim_proposals), tuple(add_proposals), metrics
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError, RuntimeError, OverflowError):
+        metrics["shape_refine_gray_rejection_reason"] = "error-fallback"
+        metrics["shape_refine_add_reason"] = "error-fallback"
+        metrics["shape_refine_trim_reason"] = "error-fallback"
+        return empty
+
+
+def _fill_preview_boundary_morphology_proposals(
+    state, geometry, local, distances, analysis_ids, radius,
+    preview_local_ids, protected_geometry_ids=(), usable_shape_rows=None,
+):
+    """Generate independent one-layer Closing/Opening proposals per edge interval.
+
+    The add and trim helpers each receive the same immutable base candidate.
+    An interval is a connected component of physical mesh edges, not a raw
+    graph-face ring.  This keeps the morphology local and lets the caller
+    compare every proposal with the unchanged candidate under one score.
+    """
+    import numpy as np
+
+    # The former binary helper body is retained below only as a compatibility
+    # reference for old diagnostics; all live callers use the grayscale path.
+    return _fill_preview_boundary_grayscale_proposals(
+        state, geometry, local, distances, analysis_ids, radius,
+        preview_local_ids, protected_geometry_ids, usable_shape_rows,
+    )
+
+    original_ids = np.asarray(preview_local_ids, dtype=np.int32).reshape(-1)
+    metrics = {
+        "shape_refine_add_generated_faces": 0,
+        "shape_refine_add_reason": "not-run",
+        "shape_refine_add_eligible_pairs": 0,
+        "shape_refine_add_gap_faces": 0,
+        "shape_refine_add_proposal_count": 0,
+        "shape_refine_trim_generated_faces": 0,
+        "shape_refine_trim_reason": "not-run",
+        "shape_refine_trim_outlier_edges": 0,
+        "shape_refine_trim_gap_faces": 0,
+        "shape_refine_trim_proposal_count": 0,
+        "shape_refine_proposal_validation": (),
+    }
+    empty = ((), (), metrics)
+    try:
+        count = int(local["count"])
+        first = np.asarray(local["first"], dtype=np.int32).reshape(-1)
+        second = np.asarray(local["second"], dtype=np.int32).reshape(-1)
+        edge_indices = np.asarray(
+            local.get("pair_edge_indices", ()), dtype=np.int32
+        ).reshape(-1)
+        pair_v0 = np.asarray(local.get("pair_v0", ()), dtype=np.int32).reshape(-1)
+        pair_v1 = np.asarray(local.get("pair_v1", ()), dtype=np.int32).reshape(-1)
+        local_global_ids = np.asarray(
+            local.get("_global_face_ids", ()), dtype=np.int32
+        ).reshape(-1)
+        analysis_ids = np.asarray(analysis_ids, dtype=np.int32).reshape(-1)
+        distances = np.asarray(distances, dtype=np.float64).reshape(-1)
+        if (
+            count <= 0
+            or len(first) == 0
+            or len(first) != len(second)
+            or len(first) != len(edge_indices)
+            or len(first) != len(pair_v0)
+            or len(first) != len(pair_v1)
+            or len(local_global_ids) != count
+            or len(analysis_ids) != count
+            or np.any(first < 0)
+            or np.any(second < 0)
+            or np.any(first >= count)
+            or np.any(second >= count)
+            or np.any(analysis_ids < 0)
+            or np.any(analysis_ids >= len(distances))
+        ):
+            metrics["shape_refine_add_reason"] = "schema"
+            metrics["shape_refine_trim_reason"] = "schema"
+            return empty
+        usable_shape_rows = np.asarray(
+            usable_shape_rows if usable_shape_rows is not None else (),
+            dtype=bool,
+        ).reshape(-1)
+        if len(usable_shape_rows) != len(first):
+            metrics["shape_refine_add_reason"] = "interval-schema"
+            metrics["shape_refine_trim_reason"] = "interval-schema"
+            return empty
+        endpoint_reason = _fill_preview_boundary_endpoint_schema(
+            state, geometry, local, edge_indices, pair_v0, pair_v1
+        )
+        if endpoint_reason is not None:
+            metrics["shape_refine_add_reason"] = endpoint_reason
+            metrics["shape_refine_trim_reason"] = endpoint_reason
+            return empty
+        selected = np.isin(local_global_ids, original_ids)
+        local_distances = distances[analysis_ids]
+        crossing = selected[first] != selected[second]
+        outside = np.where(selected[first], second, first)
+        shape = _fill_preview_shape_boundary_mask(
+            crossing, local_distances[outside], float(radius), edge_indices
+        )
+        shape_pairs = np.flatnonzero(
+            shape & (edge_indices >= 0) & usable_shape_rows
+        ).astype(np.int32)
+        if len(shape_pairs) < 6:
+            metrics["shape_refine_add_reason"] = "usable-interval-short"
+            metrics["shape_refine_trim_reason"] = "usable-interval-short"
+            return empty
+
+        # Build physical-edge components from the explicit endpoint arrays.
+        # Duplicate edge ids are ambiguous and are never turned into a
+        # morphology proposal.
+        edge_to_pair = {}
+        vertex_to_edges = {}
+        for pair in shape_pairs:
+            edge = int(edge_indices[int(pair)])
+            if edge in edge_to_pair:
+                metrics["shape_refine_add_reason"] = "duplicate-edge"
+                metrics["shape_refine_trim_reason"] = "duplicate-edge"
+                return empty
+            values = (int(pair_v0[int(pair)]), int(pair_v1[int(pair)]))
+            edge_to_pair[edge] = int(pair)
+            for vertex in values:
+                vertex_to_edges.setdefault(vertex, []).append(edge)
+        remaining = set(edge_to_pair)
+        components = []
+        while remaining:
+            start = min(remaining)
+            remaining.remove(start)
+            pending = [start]
+            component = []
+            while pending:
+                edge = pending.pop()
+                component.append(edge)
+                pair = edge_to_pair[edge]
+                for vertex in (int(pair_v0[pair]), int(pair_v1[pair])):
+                    for other in vertex_to_edges.get(vertex, ()):
+                        if other in remaining:
+                            remaining.remove(other)
+                            pending.append(other)
+            components.append(tuple(sorted(component)))
+        metrics["shape_refine_interval_count"] = int(len(components))
+        add_proposals = []
+        trim_proposals = []
+        add_reasons = []
+        trim_reasons = []
+        validation_records = []
+        protected_ids = np.asarray(tuple(protected_geometry_ids), dtype=np.int32)
+        for interval_index, component in enumerate(components):
+            if len(component) < 6:
+                add_reasons.append("interval-%d:short" % interval_index)
+                trim_reasons.append("interval-%d:short" % interval_index)
+                continue
+            allowed = np.zeros(len(first), dtype=bool)
+            component_pairs = [edge_to_pair[edge] for edge in component]
+            allowed[np.asarray(component_pairs, dtype=np.int32)] = True
+            add_ids, add_details = _fill_preview_boundary_one_hop(
+                state, geometry, local, distances, analysis_ids, radius,
+                original_ids, protected_ids, allowed_shape_rows=allowed,
+            )
+            trim_ids, trim_details = _fill_preview_boundary_trim_bulge(
+                state, geometry, local, distances, analysis_ids, radius,
+                original_ids, protected_ids, allowed_shape_rows=allowed,
+            )
+            add_ids = np.unique(np.asarray(add_ids, dtype=np.int32).reshape(-1))
+            trim_ids = np.unique(np.asarray(trim_ids, dtype=np.int32).reshape(-1))
+            add_reasons.append(
+                "interval-%d:%s" % (interval_index, add_details.get("one_hop_reason", "unknown"))
+            )
+            trim_reasons.append(
+                "interval-%d:%s" % (interval_index, trim_details.get("boundary_trim_reason", "unknown"))
+            )
+            metrics["shape_refine_add_eligible_pairs"] += int(
+                add_details.get("one_hop_eligible_pairs", 0)
+            )
+            metrics["shape_refine_add_gap_faces"] += int(
+                add_details.get("one_hop_gap_faces", 0)
+            )
+            metrics["shape_refine_trim_outlier_edges"] += int(
+                trim_details.get("boundary_trim_edges", 0)
+            )
+            if not np.array_equal(add_ids, original_ids):
+                add_proposals.append(
+                    (add_ids, dict(add_details, interval_index=int(interval_index)))
+                )
+                metrics["shape_refine_add_proposal_count"] += 1
+                metrics["shape_refine_add_generated_faces"] += int(
+                    np.count_nonzero(~np.isin(original_ids, add_ids))
+                )
+            if not np.array_equal(trim_ids, original_ids):
+                trim_proposals.append(
+                    (trim_ids, dict(trim_details, interval_index=int(interval_index)))
+                )
+                metrics["shape_refine_trim_proposal_count"] += 1
+                metrics["shape_refine_trim_generated_faces"] += int(
+                    np.count_nonzero(np.isin(original_ids, trim_ids))
+                )
+        metrics["shape_refine_add_reason"] = ";".join(add_reasons) if add_reasons else "no-interval"
+        metrics["shape_refine_trim_reason"] = ";".join(trim_reasons) if trim_reasons else "no-interval"
+        return tuple(trim_proposals), tuple(add_proposals), metrics
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError, RuntimeError, OverflowError):
+        metrics["shape_refine_add_reason"] = "error-fallback"
+        metrics["shape_refine_trim_reason"] = "error-fallback"
+        return empty
+
+
+def _fill_preview_refine_shape_boundary(
+    state,
+    geometry,
+    local,
+    distances,
+    analysis_ids,
+    radius,
+    preview_local_ids,
+    partition=None,
+    full_candidate_ids=None,
+):
+    """Compare bounded add/trim proposals for one orange boundary corridor.
+
+    The face graph resolver deliberately has one polarity: its Closing may
+    add a narrow band, but it never removes from the immutable base.  This
+    post-pass is the small, symmetric correction that was missing for the
+    opposite seed direction.  The bounded bulge-trim and one-hop add helpers
+    only *propose* candidates; this function gives current/add/trim the same
+    boundary score and accepts a proposal only when it is a clear, connected
+    improvement.
+    Distance crossings, hard graph barriers, and all faces outside the
+    one/two-ring corridor are immutable here.
+    """
+    import numpy as np
+
+    metrics = {
+        "shape_refine_attempted": False,
+        "shape_refine_applied": False,
+        "shape_refine_reason": "not-run",
+        "shape_refine_candidates": 0,
+        "shape_refine_proposal": "none",
+        "shape_refine_gray_proposal_edge_signatures": (),
+        "shape_refine_gray_final_edge_signature": (),
+        "shape_refine_gray_adopted_proposal_edge_signature": (),
+        "shape_refine_before_score": 0.0,
+        "shape_refine_after_score": 0.0,
+        "shape_refine_score_margin": 0.0,
+        "shape_refine_added_faces": 0,
+        "shape_refine_removed_faces": 0,
+        "shape_refine_boundary_edges_before": 0,
+        "shape_refine_boundary_edges_after": 0,
+        "shadow_tested_crossings": 0,
+        "shadow_barrier_count": 0,
+        "shadow_gentle_crossings_passed": 0,
+        "shadow_knee_crossings": 0,
+        "shadow_connected_line_count": 0,
+        "shadow_face_set_neutral": True,
+        "shape_refine_signal_edges": 0,
+        "shape_refine_cyan_guard_pairs": 0,
+        "shape_refine_cyan_guard_faces": 0,
+        "shape_refine_usable_pairs": 0,
+        "shape_refine_cyan_skipped_pairs": 0,
+        "shape_refine_interval_count": 0,
+        "shape_refine_gray_interval_count": 0,
+        "shape_refine_gray_usable_edges": 0,
+        "shape_refine_gray_guarded_edges": 0,
+        "shape_refine_gray_signal_median": 0.0,
+        "shape_refine_gray_signal_mad": 0.0,
+        "shape_refine_gray_close_response_max": 0.0,
+        "shape_refine_gray_open_response_max": 0.0,
+        "shape_refine_gray_add_edges": 0,
+        "shape_refine_gray_trim_edges": 0,
+        "shape_refine_gray_add_faces": 0,
+        "shape_refine_gray_trim_faces": 0,
+        "shape_refine_gray_hysteresis_high": 0.0,
+        "shape_refine_gray_hysteresis_low": 0.0,
+        "shape_refine_gray_window_factor_min": 0.0,
+        "shape_refine_gray_window_factor_max": 0.0,
+        "shape_refine_gray_window_distance_min": 0.0,
+        "shape_refine_gray_window_distance_max": 0.0,
+        "shape_refine_gray_target_chain": (),
+        "shape_refine_gray_junction_count": 0,
+        "shape_refine_gray_junction_pairs": 0,
+        "shape_refine_gray_junction_ambiguous": 0,
+        "shape_refine_gray_rejection_reason": "not-run",
+        "shape_refine_gray_context_edge_count": 0,
+        "shape_refine_gray_context_window": 0.0,
+        "shape_refine_gray_context_status": "not-run",
+        "shape_refine_provisional": False,
+        "shape_refine_add_generated_faces": 0,
+        "shape_refine_add_reason": "not-run",
+        "shape_refine_add_eligible_pairs": 0,
+        "shape_refine_add_gap_faces": 0,
+        "shape_refine_add_proposal_count": 0,
+        "shape_refine_trim_generated_faces": 0,
+        "shape_refine_trim_reason": "not-run",
+        "shape_refine_trim_outlier_edges": 0,
+        "shape_refine_trim_gap_faces": 0,
+        "shape_refine_trim_proposal_count": 0,
+        "shape_refine_proposal_validation": (),
+    }
+    original_ids = np.unique(
+        np.asarray(
+            preview_local_ids if full_candidate_ids is None else full_candidate_ids,
+            dtype=np.int32,
+        ).reshape(-1)
+    )
+    try:
+        full_count = int(geometry["count"])
+        full_first = np.asarray(geometry["first"], dtype=np.int32).reshape(-1)
+        full_second = np.asarray(geometry["second"], dtype=np.int32).reshape(-1)
+        full_edge_indices = np.asarray(
+            geometry.get("pair_edge_indices", ()), dtype=np.int32
+        ).reshape(-1)
+        full_offsets = np.asarray(geometry["offsets"], dtype=np.int64).reshape(-1)
+        full_neighbors = np.asarray(geometry["neighbors"], dtype=np.int32).reshape(-1)
+        full_hidden = np.asarray(geometry["hidden"], dtype=bool).reshape(-1)
+        full_edge_counts = np.asarray(
+            geometry.get("face_edge_counts", ()), dtype=np.int32
+        ).reshape(-1)
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+        metrics["shape_refine_reason"] = "schema"
+        return original_ids, metrics
+    try:
+        count = int(local["count"])
+        first = np.asarray(local["first"], dtype=np.int32).reshape(-1)
+        second = np.asarray(local["second"], dtype=np.int32).reshape(-1)
+        edge_indices = np.asarray(
+            local.get("pair_edge_indices", ()), dtype=np.int32
+        ).reshape(-1)
+        local_global_ids = np.asarray(
+            local.get("_global_face_ids", ()), dtype=np.int32
+        ).reshape(-1)
+        analysis_ids = np.asarray(analysis_ids, dtype=np.int32).reshape(-1)
+        distances = np.asarray(distances, dtype=np.float64).reshape(-1)
+        offsets = np.asarray(local["offsets"], dtype=np.int64).reshape(-1)
+        neighbors = np.asarray(local["neighbors"], dtype=np.int32).reshape(-1)
+        if (
+            count <= 0
+            or len(first) == 0
+            or len(first) != len(second)
+            or len(first) != len(edge_indices)
+            or len(local_global_ids) != count
+            or len(analysis_ids) != count
+            or len(offsets) != count + 1
+            or int(offsets[-1]) != len(neighbors)
+            or np.any(first < 0)
+            or np.any(second < 0)
+            or np.any(first >= count)
+            or np.any(second >= count)
+            or np.any(analysis_ids < 0)
+            or np.any(analysis_ids >= len(distances))
+            or full_count <= 0
+            or len(full_first) != len(full_second)
+            or len(full_first) != len(full_edge_indices)
+            or len(full_offsets) != full_count + 1
+            or int(full_offsets[-1]) != len(full_neighbors)
+            or len(full_hidden) != full_count
+            or len(full_edge_counts) != full_count
+            or len(distances) != full_count
+            or np.any(full_first < 0)
+            or np.any(full_second < 0)
+            or np.any(full_first >= full_count)
+            or np.any(full_second >= full_count)
+            or np.any(full_neighbors < 0)
+            or np.any(full_neighbors >= full_count)
+            or np.any(full_offsets[1:] < full_offsets[:-1])
+        ):
+            metrics["shape_refine_reason"] = "schema"
+            return original_ids, metrics
+        if np.any(original_ids < 0) or np.any(original_ids >= full_count):
+            metrics["shape_refine_reason"] = "full-candidate-schema"
+            return original_ids, metrics
+        if np.any(local_global_ids < 0) or np.any(local_global_ids >= full_count):
+            metrics["shape_refine_reason"] = "local-id-schema"
+            return original_ids, metrics
+        if len(np.unique(local_global_ids)) != count:
+            metrics["shape_refine_reason"] = "local-id-schema"
+            return original_ids, metrics
+        full_pair_lookup = {}
+        for full_pair_index, (left, right) in enumerate(zip(full_first, full_second)):
+            key = (
+                min(int(left), int(right)),
+                max(int(left), int(right)),
+                int(full_edge_indices[full_pair_index]),
+            )
+            full_pair_lookup.setdefault(key, []).append(int(full_pair_index))
+        original_full_mask = np.zeros(full_count, dtype=bool)
+        original_full_mask[original_ids] = True
+        seed_full = int(state.get("seed_local", -1))
+        if seed_full < 0 or seed_full >= full_count:
+            metrics["shape_refine_reason"] = "seed-schema"
+            return original_ids, metrics
+        local_distances = distances[analysis_ids]
+        selected = np.isin(local_global_ids, original_ids)
+        local_original_ids = local_global_ids[selected].astype(np.int32, copy=False)
+        crossing = selected[first] != selected[second]
+        outside = np.where(selected[first], second, first)
+        shape = _fill_preview_shape_boundary_mask(
+            crossing,
+            local_distances[outside],
+            float(radius),
+            edge_indices,
+        )
+        shape_pairs = np.flatnonzero(shape & (edge_indices >= 0)).astype(np.int32)
+        metrics["shape_refine_boundary_edges_before"] = int(len(shape_pairs))
+        if len(shape_pairs) < 6 or len(shape_pairs) > _FILL_PREVIEW_BOUNDARY_ROUTE_SHAPE_PAIR_BUDGET:
+            if len(shape_pairs) < 6 and not bool(state.get("strict_mode", False)):
+                # Ordinary E treats a short/under-context boundary as
+                # provisional.  The preview bootstrap may advance a bounded
+                # cyan shell; it must not silently turn uncertainty into a
+                # permanent orange terminal.  Ctrl+E retains the strict,
+                # conservative early return.
+                metrics["shape_refine_provisional"] = True
+                metrics["shape_refine_reason"] = "provisional-short-context"
+            else:
+                metrics["shape_refine_reason"] = "shape-interval-short-or-budget"
+            return original_ids, metrics
+
+        # The correction corridor is the current orange boundary plus at most
+        # two face rings.  The add proposal is a bounded local Closing and the
+        # trim proposal is its bounded complement Opening; neither is a raw
+        # N-ring morphology over the full candidate.  Keeping this compact is
+        # important: a broad opening can otherwise look numerically attractive
+        # on a dense patch.
+        corridor = np.zeros(count, dtype=bool)
+        corridor[np.unique(np.r_[first[shape_pairs], second[shape_pairs]])] = True
+        frontier = corridor.copy()
+        for _ in range(2):
+            grown = frontier.copy()
+            for face in np.flatnonzero(frontier):
+                grown[neighbors[int(offsets[face]) : int(offsets[face + 1])]] = True
+            corridor |= grown
+            frontier = grown
+        distance_boundary = crossing & ~shape
+        # A cyan crossing at one terminal of a long orange interval should
+        # not suppress the whole correction.  Find only shape-pair rows that
+        # actually touch that terminal, protect that row plus one adjacent
+        # shape row, and keep the interior interval in the shared score.
+        # Invalid/non-edge crossings remain a hard comparison gap and retain
+        # the old all-or-nothing behavior.
+        shape_pair_by_face = {}
+        for pair_position, pair in enumerate(shape_pairs):
+            for face in (int(first[pair]), int(second[pair])):
+                shape_pair_by_face.setdefault(face, []).append(int(pair_position))
+
+        def count_shape_intervals(pair_mask):
+            pair_mask = np.asarray(pair_mask, dtype=bool).reshape(-1)
+            remaining = set(
+                int(value)
+                for value in np.flatnonzero(pair_mask[shape_pairs])
+            )
+            interval_count = 0
+            while remaining:
+                interval_count += 1
+                pending = [remaining.pop()]
+                while pending:
+                    pair_position = pending.pop()
+                    pair = int(shape_pairs[pair_position])
+                    for face in (int(first[pair]), int(second[pair])):
+                        for neighbor_position in shape_pair_by_face.get(face, ()):
+                            if neighbor_position in remaining:
+                                remaining.remove(neighbor_position)
+                                pending.append(neighbor_position)
+            return int(interval_count)
+
+        distance_contact_positions = set()
+        valid_distance_rows = distance_boundary & (edge_indices >= 0)
+        for pair in np.flatnonzero(valid_distance_rows):
+            for face in (int(first[pair]), int(second[pair])):
+                distance_contact_positions.update(shape_pair_by_face.get(face, ()))
+        guard_pair_positions = set(distance_contact_positions)
+        if guard_pair_positions:
+            # One pair hop is deliberately the minimum terminal guard.  It
+            # protects two pairs at an ordinary endpoint while avoiding a
+            # broad face-ring exclusion on dense real meshes.
+            adjacent_positions = set()
+            for pair_position in guard_pair_positions:
+                pair = int(shape_pairs[pair_position])
+                pair_faces = (int(first[pair]), int(second[pair]))
+                for face in pair_faces:
+                    adjacent_positions.update(shape_pair_by_face.get(face, ()))
+            guard_pair_positions.update(adjacent_positions)
+            guard_pair_rows = np.zeros(len(first), dtype=bool)
+            guard_pair_rows[shape_pairs[np.asarray(sorted(guard_pair_positions), dtype=np.int32)]] = True
+            guard_faces = np.zeros(count, dtype=bool)
+            guard_pairs_array = shape_pairs[np.asarray(sorted(guard_pair_positions), dtype=np.int32)]
+            guard_faces[first[guard_pairs_array]] = True
+            guard_faces[second[guard_pairs_array]] = True
+            for pair in np.flatnonzero(valid_distance_rows):
+                if guard_pair_rows[pair] or any(
+                    guard_faces[int(face)] for face in (int(first[pair]), int(second[pair]))
+                ):
+                    guard_faces[first[pair]] = True
+                    guard_faces[second[pair]] = True
+            # One graph ring around the terminal faces blocks a proposal from
+            # redrawing a connector immediately next to the protected cyan
+            # endpoint.  The full cyan crossing equality check below remains
+            # authoritative for every geometry-local pair.
+            guard_frontier = guard_faces.copy()
+            guard_ring = guard_faces.copy()
+            for face in np.flatnonzero(guard_frontier):
+                guard_ring[
+                    neighbors[int(offsets[face]) : int(offsets[face + 1])]
+                ] = True
+            guard_faces = guard_ring
+            # The guard face ring is immutable, but its first interior
+            # transition edge is still allowed to become an orange shape
+            # crossing when a proposal starts just beyond the guard.  Freeze
+            # only the contacted cyan rows and the terminal shape rows; a
+            # blanket ``touches guard face`` rule would make every valid
+            # interior add impossible.
+            guard_rows = guard_pair_rows | valid_distance_rows
+            usable_shape_rows = (
+                shape & (edge_indices >= 0) & ~guard_rows
+            )
+            metrics["shape_refine_cyan_guard_pairs"] = int(len(guard_pair_positions))
+            metrics["shape_refine_cyan_guard_faces"] = int(np.count_nonzero(guard_faces))
+            metrics["shape_refine_cyan_skipped_pairs"] = int(
+                np.count_nonzero(shape & ~usable_shape_rows)
+            )
+            metrics["shape_refine_usable_pairs"] = int(np.count_nonzero(usable_shape_rows))
+            # Count contiguous usable runs in the original row adjacency.  A
+            # disconnected interior is scored independently by the common
+            # chain evaluator, but the metric makes endpoint-only skips
+            # visible in the preview diagnostics.
+            usable_positions = np.flatnonzero(usable_shape_rows).astype(np.int32)
+            metrics["shape_refine_interval_count"] = count_shape_intervals(usable_shape_rows)
+            if len(usable_positions) < 6:
+                metrics["shape_refine_reason"] = "distance-boundary-endpoint-only"
+                return original_ids, metrics
+        elif np.any(
+            distance_boundary
+            & (corridor[first] | corridor[second])
+        ):
+            # A nearby cyan/non-edge crossing that is not a terminal contact
+            # cannot be oriented safely relative to this shape interval.
+            metrics["shape_refine_reason"] = "distance-boundary-near-shape"
+            return original_ids, metrics
+        else:
+            guard_faces = np.zeros(count, dtype=bool)
+            guard_rows = np.zeros(len(first), dtype=bool)
+            usable_shape_rows = shape & (edge_indices >= 0)
+            metrics["shape_refine_usable_pairs"] = int(np.count_nonzero(usable_shape_rows))
+            metrics["shape_refine_interval_count"] = count_shape_intervals(usable_shape_rows)
+        protected = np.zeros(count, dtype=bool)
+        if partition is not None:
+            raw_protected = np.asarray(
+                partition.get("protected", ()), dtype=bool
+            ).reshape(-1)
+            if len(raw_protected) == count:
+                protected |= raw_protected
+        protected |= guard_faces
+        protected_full = np.zeros(full_count, dtype=bool)
+        if np.any(protected):
+            protected_full[local_global_ids[protected]] = True
+        protected_ids = local_global_ids[protected]
+        metrics["shape_refine_attempted"] = True
+
+        # Boundary score -------------------------------------------------
+        # The score is shared by all three masks.  It rewards an existing
+        # mesh-edge chain with a normal/crease/valley signal, while charging
+        # chain turning and endpoint gaps.  The absolute threshold below is
+        # intentionally low; the improvement margin and a multi-edge signal
+        # gate reject planes, broad basins, and single-edge bulges.
+        normals = np.asarray(local.get("normals"), dtype=np.float64)
+        if normals.shape != (count, 3):
+            metrics["shape_refine_reason"] = "normal-schema"
+            return original_ids, metrics
+        contrast = np.asarray(
+            local.get("contrast", np.zeros(count)), dtype=np.float64
+        ).reshape(-1)
+        concavity = np.asarray(
+            local.get("concavity", np.zeros(count)), dtype=np.float64
+        ).reshape(-1)
+        directional = np.asarray(
+            local.get("directional_valley", np.zeros(count)), dtype=np.float64
+        ).reshape(-1)
+        crease = np.asarray(
+            local.get("crease", np.zeros(count)), dtype=np.float64
+        ).reshape(-1)
+        if any(len(values) != count for values in (contrast, concavity, directional, crease)):
+            metrics["shape_refine_reason"] = "feature-schema"
+            return original_ids, metrics
+        finite_features = all(
+            np.all(np.isfinite(values))
+            for values in (normals, contrast, concavity, directional, crease)
+        )
+        if not finite_features:
+            metrics["shape_refine_reason"] = "nonfinite-feature"
+            return original_ids, metrics
+
+        # Use the already prepared world endpoints in the explicitly declared
+        # id space.  Compact cursor slices do not consult mesh-global ids;
+        # tests can supply world_vertices without constructing a bpy mesh.
+        mesh = getattr(state.get("obj"), "data", None)
+        matrix = getattr(state.get("obj"), "matrix_world", None)
+        world_vertices = np.asarray(
+            local.get("world_vertices", geometry.get("world_vertices", ())),
+            dtype=np.float64,
+        )
+        pair_v0 = np.asarray(local.get("pair_v0", ()), dtype=np.int32).reshape(-1)
+        pair_v1 = np.asarray(local.get("pair_v1", ()), dtype=np.int32).reshape(-1)
+        endpoint_reason = _fill_preview_boundary_endpoint_schema(
+            state, geometry, local, edge_indices, pair_v0, pair_v1
+        )
+        if endpoint_reason is not None:
+            metrics["shape_refine_reason"] = endpoint_reason
+            return original_ids, metrics
+        vertex_id_space = str(local.get("vertex_id_space"))
+        point_cache = {}
+
+        def point(vertex):
+            vertex = int(vertex)
+            cached = point_cache.get(vertex)
+            if cached is not None:
+                return cached
+            if vertex_id_space == "mesh-global" and mesh is not None and matrix is not None:
+                value = np.asarray(matrix @ mesh.vertices[vertex].co, dtype=np.float64)
+            elif vertex_id_space == "compact" and (
+                world_vertices.ndim == 2
+                and world_vertices.shape[1] == 3
+                and 0 <= vertex < len(world_vertices)
+            ):
+                value = np.asarray(world_vertices[vertex], dtype=np.float64)
+            else:
+                raise ValueError("edge endpoint data unavailable")
+            if value.shape != (3,) or not np.all(np.isfinite(value)):
+                raise ValueError("edge endpoint data unavailable")
+            point_cache[vertex] = value
+            return value
+
+        def edge_vertices(pair):
+            edge = int(edge_indices[int(pair)])
+            if (
+                0 <= int(pair) < len(pair_v0)
+                and len(pair_v0) == len(edge_indices)
+                and len(pair_v1) == len(edge_indices)
+                and int(pair_v0[int(pair)]) >= 0
+                and int(pair_v1[int(pair)]) >= 0
+            ):
+                return int(pair_v0[int(pair)]), int(pair_v1[int(pair)])
+            return None
+
+        def candidate_score(candidate_ids):
+            candidate_ids = np.asarray(candidate_ids, dtype=np.int32).reshape(-1)
+            mask = np.isin(local_global_ids, candidate_ids)
+            candidate_crossing = mask[first] != mask[second]
+            candidate_outside = np.where(mask[first], second, first)
+            candidate_shape = _fill_preview_shape_boundary_mask(
+                candidate_crossing,
+                local_distances[candidate_outside],
+                float(radius),
+                edge_indices,
+            ) & (edge_indices >= 0)
+            candidate_shape &= corridor[first] | corridor[second]
+            candidate_shape &= ~guard_rows
+            pairs = np.flatnonzero(candidate_shape).astype(np.int32)
+            if len(pairs) == 0:
+                return -float("inf"), 0, 0, False
+            edge_to_pairs = {}
+            for pair in pairs:
+                edge_to_pairs.setdefault(int(edge_indices[pair]), []).append(int(pair))
+            # Multiple graph rows for one mesh edge are malformed; score the
+            # physical edge once and refuse its ambiguous duplicate.
+            if any(len(values) != 1 for values in edge_to_pairs.values()):
+                return -float("inf"), len(pairs), 0, False
+            edge_ids = sorted(edge_to_pairs)
+            edge_points = {}
+            edge_signal = {}
+            edge_face_normals = {}
+            for edge in edge_ids:
+                pair = edge_to_pairs[edge][0]
+                values = edge_vertices(pair)
+                if values is None:
+                    return -float("inf"), len(pairs), 0, False
+                a, b = values
+                pa, pb = point(a), point(b)
+                length = float(np.linalg.norm(pb - pa))
+                if not np.isfinite(length) or length <= 1.0e-12:
+                    return -float("inf"), len(pairs), 0, False
+                edge_points[edge] = (a, b, pa, pb, length)
+                left, right = int(first[pair]), int(second[pair])
+                edge_face_normals[edge] = (normals[left], normals[right])
+                dot = float(np.clip(np.dot(normals[left], normals[right]), -1.0, 1.0))
+                normal_signal = math.acos(dot) / math.pi
+                crease_signal = float(np.clip(max(crease[left], crease[right]) / math.pi, 0.0, 1.0))
+                scalar_signal = max(
+                    float(contrast[left]), float(contrast[right]),
+                    float(concavity[left]), float(concavity[right]),
+                    float(directional[left]), float(directional[right]),
+                )
+                scalar_signal = float(np.clip(scalar_signal / 0.10, 0.0, 1.0))
+                if bool(state.get("strict_mode", False)):
+                    edge_value = (
+                        0.55 * normal_signal
+                        + 0.20 * crease_signal
+                        + 0.25 * scalar_signal
+                    )
+                else:
+                    edge_value, tested = _fill_preview_shadow_pair_signal(
+                        state, local, pair
+                    )
+                    metrics["shadow_tested_crossings"] += int(tested > 0)
+                    if tested and edge_value >= 1.0:
+                        metrics["shadow_barrier_count"] += 1
+                        metrics["shadow_knee_crossings"] += 1
+                    elif tested:
+                        metrics["shadow_gentle_crossings_passed"] += 1
+                    metrics["shadow_face_set_neutral"] = True
+                edge_signal[edge] = float(np.clip(edge_value, 0.0, 1.0))
+            chains, _, _, _ = _fill_preview_gray_partition_intervals(
+                edge_ids,
+                {edge: edge_points[edge][:2] for edge in edge_ids},
+                edge_signal,
+                edge_face_normals,
+                point,
+            )
+            if not chains:
+                return -float("inf"), len(pairs), 0, False
+            spacing = float(np.median([item[4] for item in edge_points.values()]))
+            best_score = -float("inf")
+            best_signal_edges = 0
+            best_count = 0
+            for chain in chains:
+                if len(chain) < 6:
+                    continue
+                total_length = sum(edge_points[edge][4] for edge in chain)
+                weighted_signal = sum(edge_signal[edge] * edge_points[edge][4] for edge in chain)
+                mean_signal = weighted_signal / max(total_length, 1.0e-20)
+                if bool(state.get("strict_mode", False)):
+                    strong_edges = sum(edge_signal[edge] >= 0.08 for edge in chain)
+                else:
+                    chain_signal_values = np.asarray(
+                        [edge_signal[edge] for edge in chain], dtype=np.float64
+                    )
+                    chain_median = float(np.median(chain_signal_values))
+                    chain_mad = float(
+                        1.4826
+                        * np.median(np.abs(chain_signal_values - chain_median))
+                    )
+                    strong_threshold = max(chain_median + chain_mad, 0.08)
+                    strong_edges = sum(
+                        edge_signal[edge] >= strong_threshold for edge in chain
+                    )
+                # Order a simple chain by walking from its endpoint.  A cycle
+                # is intentionally not a correction candidate.
+                incident = {}
+                for edge in chain:
+                    a, b = edge_points[edge][:2]
+                    incident.setdefault(a, []).append(edge)
+                    incident.setdefault(b, []).append(edge)
+                endpoints = [vertex for vertex, values in incident.items() if len(values) == 1]
+                if len(endpoints) != 2:
+                    continue
+                ordered = []
+                used = set()
+                vertex = endpoints[0]
+                while True:
+                    next_edges = [edge for edge in incident.get(vertex, ()) if edge not in used]
+                    if not next_edges:
+                        break
+                    edge = min(next_edges)
+                    used.add(edge)
+                    ordered.append(edge)
+                    a, b = edge_points[edge][:2]
+                    vertex = b if vertex == a else a
+                if len(ordered) != len(chain):
+                    continue
+                turns = 0.0
+                for left_edge, right_edge in zip(ordered, ordered[1:]):
+                    left_a, left_b = edge_points[left_edge][:2]
+                    right_a, right_b = edge_points[right_edge][:2]
+                    shared = left_a if left_a in (right_a, right_b) else left_b
+                    left_other = left_b if shared == left_a else left_a
+                    right_other = right_b if shared == right_a else right_a
+                    va = point(left_other) - point(shared)
+                    vb = point(right_other) - point(shared)
+                    denominator = max(float(np.linalg.norm(va) * np.linalg.norm(vb)), 1.0e-20)
+                    # The vectors point from the shared vertex to each edge's
+                    # outer endpoint.  A straight chain therefore has an
+                    # angle of pi, while a fold-back has zero; use the
+                    # supplementary angle as the actual turn so continuity
+                    # scores straight=1 and fold-back=0.
+                    angle = math.acos(
+                        float(np.clip(np.dot(va, vb) / denominator, -1.0, 1.0))
+                    )
+                    turns += math.pi - angle
+                # Smooth long curves are valid: turn is normalized by the
+                # number of intervals and only gently reduces the score.
+                mean_turn = turns / max(len(chain) - 1, 1)
+                continuity = float(np.clip(1.0 - mean_turn / math.pi, 0.0, 1.0))
+                if bool(state.get("strict_mode", False)):
+                    score = math.log1p(total_length / max(spacing, 1.0e-20)) * (
+                        0.08 + mean_signal
+                    ) * (0.55 + 0.45 * continuity)
+                else:
+                    # A fixed local metric window caps the length
+                    # contribution; enlarging the candidate/radius cannot
+                    # make a remote chain look like a stronger improvement.
+                    score_window = max(4.0 * spacing, spacing, 1.0e-20)
+                    score = math.log1p(
+                        min(total_length, score_window) / max(spacing, 1.0e-20)
+                    ) * (0.08 + mean_signal) * (0.55 + 0.45 * continuity)
+                if score > best_score:
+                    best_score = score
+                    best_signal_edges = strong_edges
+                    best_count = len(chain)
+            signal_ok = best_signal_edges >= 4 and best_count >= 6 and best_score > -float("inf")
+            return float(best_score), len(pairs), int(best_signal_edges), signal_ok
+
+        before_score, before_edges, before_signal_edges, before_signal_ok = candidate_score(original_ids)
+        metrics["shape_refine_before_score"] = float(before_score if np.isfinite(before_score) else 0.0)
+        metrics["shape_refine_signal_edges"] = int(before_signal_edges)
+        # A weak current boundary is not itself a reason to stop.  In the
+        # add-only polarity the missing band is precisely what can carry the
+        # stronger physical-edge signal.  Candidate scoring below still
+        # requires a multi-edge signal and a clear margin, so a plane or a
+        # broad basin remains unchanged; this gate only lets a strong add or
+        # trim proposal be compared with that weak baseline.
+        if not before_signal_ok and not np.isfinite(before_score):
+            metrics["shape_refine_reason"] = "weak-shape-signal"
+            return original_ids, metrics
+
+        # Proposals are intentionally generated independently from the same
+        # immutable current mask.  The live path is the grayscale physical
+        # edge morphology helper; it does not seed a second pass from an add.
+        trim_proposals, add_proposals, morphology_metrics = _fill_preview_boundary_morphology_proposals(
+            state, geometry, local, distances, analysis_ids, radius,
+            local_original_ids, protected_ids, usable_shape_rows,
+        )
+        metrics.update(morphology_metrics)
+        proposals = []
+        for ids, details in trim_proposals:
+            proposals.append(("trim", np.asarray(ids, dtype=np.int32).reshape(-1), details))
+        for ids, details in add_proposals:
+            proposals.append(("add", np.asarray(ids, dtype=np.int32).reshape(-1), details))
+        metrics["shape_refine_candidates"] = int(1 + len(proposals))
+
+        def validate(candidate_ids):
+            candidate_ids = np.unique(
+                np.asarray(candidate_ids, dtype=np.int32).reshape(-1)
+            )
+            if len(candidate_ids) == 0:
+                return False, "empty", None
+            if np.any(~np.isin(candidate_ids, local_global_ids)):
+                return False, "outside-local", None
+            # Proposals are analysis-local, but the candidate state is a
+            # complete geometry-local mask.  Only analysis faces may change;
+            # analysis-outside Closing/valley faces are copied verbatim.
+            candidate = np.isin(local_global_ids, candidate_ids)
+            candidate_full = original_full_mask.copy()
+            candidate_full[local_global_ids] = candidate
+            seed_matches = np.flatnonzero(
+                local_global_ids == int(state.get("seed_local", -1))
+            )
+            if len(seed_matches) == 0 or not candidate[int(seed_matches[0])]:
+                return False, "seed", None
+            if not candidate_full[seed_full]:
+                return False, "seed", None
+            tolerance = max(float(radius) * 1.0e-8, 1.0e-9)
+            local_domain = np.isfinite(local_distances) & (
+                local_distances <= float(radius) + tolerance
+            )
+            if np.any(candidate & ~local_domain):
+                return False, "radius-outside", None
+            full_domain = np.isfinite(distances) & (
+                distances <= float(radius) + tolerance
+            ) & ~full_hidden
+            if np.any(candidate_full & ~full_domain):
+                return False, "radius-outside", None
+            changed = candidate != selected
+            changed_full = candidate_full != original_full_mask
+            if not np.any(changed_full):
+                return False, "unchanged", None
+            # The hard-face mask is geometry-local and shares the same
+            # source of truth as Closing: hidden/non-finite faces and every
+            # degree-deficit face are immutable.  A trim may preserve every
+            # hard-edge crossing and still delete a hard face itself, so
+            # reject that proposal before the crossing XOR check.
+            full_degree = np.diff(full_offsets)
+            hard_full = (
+                full_hidden
+                | ~np.isfinite(distances)
+                | (full_degree < full_edge_counts)
+            )
+            if np.any(changed_full & hard_full):
+                return False, "changed-hard-face", None
+            if np.any(changed & protected) or np.any(changed_full & protected_full):
+                return False, "protected", None
+            if np.any(changed & ~corridor):
+                return False, "corridor", None
+            analysis_mask = np.zeros(full_count, dtype=bool)
+            analysis_mask[local_global_ids] = True
+            if np.any(candidate_full[~analysis_mask] != original_full_mask[~analysis_mask]):
+                return False, "outside-analysis", None
+
+            # Compare the complete geometry-local cyan crossing set, not just
+            # the compact analysis slice.
+            full_crossing = original_full_mask[full_first] != original_full_mask[full_second]
+            full_outside = np.where(original_full_mask[full_first], full_second, full_first)
+            full_shape = _fill_preview_shape_boundary_mask(
+                full_crossing,
+                distances[full_outside],
+                float(radius),
+                full_edge_indices,
+            )
+            distance_pairs = full_crossing & ~full_shape
+            candidate_crossing = candidate_full[full_first] != candidate_full[full_second]
+            candidate_outside = np.where(candidate_full[full_first], full_second, full_first)
+            candidate_shape = _fill_preview_shape_boundary_mask(
+                candidate_crossing,
+                distances[candidate_outside],
+                float(radius),
+                full_edge_indices,
+            )
+            candidate_distance_pairs = candidate_crossing & ~candidate_shape
+            if np.any(candidate_distance_pairs != distance_pairs):
+                return False, "distance-boundary", None
+            guard_full_rows = np.zeros(len(full_first), dtype=bool)
+            for local_pair_index in np.flatnonzero(guard_rows):
+                left = int(local_global_ids[int(first[local_pair_index])])
+                right = int(local_global_ids[int(second[local_pair_index])])
+                key = (
+                    min(left, right), max(left, right),
+                    int(edge_indices[int(local_pair_index)]),
+                )
+                full_matches = full_pair_lookup.get(key)
+                if not full_matches:
+                    return False, "cyan-guard-schema", None
+                guard_full_rows[np.asarray(full_matches, dtype=np.int32)] = True
+            if np.any(candidate_crossing[guard_full_rows] != full_crossing[guard_full_rows]):
+                return False, "cyan-guard", None
+
+            # Hard barriers are geometry-local.  Do not look up a local id in
+            # geometry["face_ids"]: that array is the canonical mesh-face map,
+            # not a geometry-local index map.
+            hard_pairs = hard_full[full_first] | hard_full[full_second]
+            if np.any(candidate_crossing[hard_pairs] != full_crossing[hard_pairs]):
+                return False, "hard-barrier", None
+
+            # Seed connectivity and changed-interval checks use the complete
+            # geometry graph so a preserved analysis-outside component cannot
+            # be accidentally discarded or disconnected.
+            connected = np.zeros(full_count, dtype=bool)
+            connected[seed_full] = True
+            pending = [seed_full]
+            while pending:
+                face = pending.pop()
+                for neighbor in full_neighbors[int(full_offsets[face]) : int(full_offsets[face + 1])]:
+                    neighbor = int(neighbor)
+                    if candidate_full[neighbor] and not connected[neighbor]:
+                        connected[neighbor] = True
+                        pending.append(neighbor)
+            if not np.all(connected[candidate_full]):
+                return False, "disconnected", None
+            changed_seen = np.zeros(full_count, dtype=bool)
+            changed_components = 0
+            for start_face in np.flatnonzero(changed_full):
+                start_face = int(start_face)
+                if changed_seen[start_face]:
+                    continue
+                changed_components += 1
+                changed_seen[start_face] = True
+                pending = [start_face]
+                while pending:
+                    face = pending.pop()
+                    for neighbor in full_neighbors[int(full_offsets[face]) : int(full_offsets[face + 1])]:
+                        neighbor = int(neighbor)
+                        if changed_full[neighbor] and not changed_seen[neighbor]:
+                            changed_seen[neighbor] = True
+                            pending.append(neighbor)
+            if changed_components != 1:
+                return False, "non-contiguous", None
+            try:
+                gap_ids, _gap_metrics = _fill_preview_enclosed_gap_faces(
+                    geometry, distances, float(radius),
+                    np.flatnonzero(candidate_full).astype(np.int32),
+                )
+                if len(gap_ids):
+                    return False, "gap", None
+            except (AttributeError, IndexError, KeyError, TypeError, ValueError, RuntimeError):
+                return False, "gap-check", None
+            return True, "ok", (candidate, candidate_full)
+
+        best = None
+        rejected = []
+        for name, candidate_ids, details in proposals:
+            valid, reason, candidate_masks = validate(candidate_ids)
+            if not valid:
+                rejected.append(f"{name}:{reason}")
+                continue
+            score, edge_count, signal_edges, signal_ok = candidate_score(candidate_ids)
+            if not signal_ok or not np.isfinite(score):
+                rejected.append(f"{name}:weak-score")
+                continue
+            if best is None or score > best[0]:
+                best = (float(score), name, candidate_ids, candidate_masks, int(edge_count))
+        margin = max(abs(float(before_score)), 0.05) * 0.08
+        if best is None or best[0] <= float(before_score) + margin:
+            metrics["shape_refine_reason"] = (
+                "changed-hard-face"
+                if any(
+                    str(reason).endswith(":changed-hard-face")
+                    for reason in rejected
+                )
+                else "no-clear-improvement"
+            )
+            if rejected:
+                metrics["shape_refine_rejections"] = tuple(rejected)
+                metrics["shape_refine_proposal_validation"] = tuple(rejected)
+            return original_ids, metrics
+        _score, name, candidate_ids, candidate_masks, after_edges = best
+        _candidate_mask, candidate_full = candidate_masks
+        changed = candidate_full != original_full_mask
+        # Adoption evidence is extracted from the validated complete mask,
+        # never copied from a rejected or pre-add proposal.  Sorting the
+        # physical edge ids makes this signature direction-independent and
+        # preserves the complete chain (a single common edge is insufficient).
+        final_crossing = candidate_full[full_first] != candidate_full[full_second]
+        final_outside = np.where(candidate_full[full_first], full_second, full_first)
+        final_shape = _fill_preview_shape_boundary_mask(
+            final_crossing,
+            distances[final_outside],
+            float(radius),
+            full_edge_indices,
+        ) & (full_edge_indices >= 0)
+        final_signature = tuple(sorted(
+            set(int(edge) for edge in full_edge_indices[final_shape])
+        ))
+        adopted_signature = tuple()
+        for proposal_name, proposal_ids, proposal_details in proposals:
+            if proposal_name == name and np.array_equal(
+                np.unique(np.asarray(proposal_ids, dtype=np.int32)),
+                np.unique(np.asarray(candidate_ids, dtype=np.int32)),
+            ):
+                adopted_signature = tuple(sorted(
+                    int(edge)
+                    for edge in proposal_details.get("gray_supported_edges", ())
+                ))
+                break
+        metrics.update(
+            {
+                "shape_refine_applied": True,
+                "shape_refine_reason": "applied",
+                "shape_refine_proposal": str(name),
+                "shape_refine_after_score": float(_score),
+                "shape_refine_score_margin": float(_score - before_score),
+                "shape_refine_added_faces": int(np.count_nonzero(changed & candidate_full)),
+                "shape_refine_removed_faces": int(np.count_nonzero(changed & original_full_mask)),
+                "shape_refine_boundary_edges_after": int(after_edges),
+                "shape_refine_gray_final_edge_signature": final_signature,
+                "shape_refine_gray_adopted_proposal_edge_signature": adopted_signature,
+            }
+        )
+        return np.flatnonzero(candidate_full).astype(np.int32), metrics
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError, RuntimeError, OverflowError):
+        metrics["shape_refine_reason"] = "error-fallback"
+        return original_ids, metrics
+
+
+def _fill_preview_revalidate_valley_components(
+    geometry, distances, radius, analysis_ids, fine_selected_ids, records
+):
+    """Revalidate and return complete valley components for the fine pass.
+
+    Records use mesh polygon ids.  The current geometry is mapped through its
+    own ``face_ids`` once, then all component faces are checked together; the
+    valley faces do not have to be present in the precise partition that
+    supplied the shore faces.
+    """
+    import numpy as np
+
+    if not records:
+        return np.empty(0, dtype=np.int32), "none"
+    try:
+        count = int(geometry["count"])
+        canonical = np.asarray(geometry["face_ids"], dtype=np.int64).reshape(-1)
+        distances = np.asarray(distances, dtype=np.float64).reshape(-1)
+        hidden = np.asarray(geometry["hidden"], dtype=bool).reshape(-1)
+        offsets = np.asarray(geometry["offsets"], dtype=np.int64).reshape(-1)
+        neighbors = np.asarray(geometry["neighbors"], dtype=np.int32).reshape(-1)
+        edge_counts = np.asarray(geometry["face_edge_counts"], dtype=np.int32).reshape(-1)
+        first = np.asarray(geometry["first"], dtype=np.int32).reshape(-1)
+        second = np.asarray(geometry["second"], dtype=np.int32).reshape(-1)
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+        return np.empty(0, dtype=np.int32), "schema"
+    if (
+        len(canonical) != count
+        or len(distances) < count
+        or len(hidden) != count
+        or len(offsets) != count + 1
+        or int(offsets[-1]) != len(neighbors)
+        or len(edge_counts) != count
+        or len(first) != len(second)
+        or len(set(int(value) for value in canonical)) != count
+    ):
+        return np.empty(0, dtype=np.int32), "schema"
+    if np.any(neighbors < 0) or np.any(neighbors >= count):
+        return np.empty(0, dtype=np.int32), "graph"
+    degree = np.diff(offsets).astype(np.int64, copy=False)
+    local_by_mesh = {int(mesh_id): index for index, mesh_id in enumerate(canonical)}
+    analysis_ids = np.asarray(analysis_ids, dtype=np.int32).reshape(-1)
+    fine_selected_ids = np.asarray(fine_selected_ids, dtype=np.int32).reshape(-1)
+    analysis_set = set(int(value) for value in analysis_ids)
+    selected_set = set(int(value) for value in fine_selected_ids)
+    pair_set = {
+        (int(left), int(right))
+        for left, right in zip(first, second)
+    }
+    pair_set |= {(right, left) for left, right in tuple(pair_set)}
+    tolerance = max(float(radius) * 1.0e-8, 1.0e-9)
+    fills = []
+    for record in records:
+        try:
+            valley_ids = tuple(int(value) for value in record["valley_face_ids"])
+            shore_ids = tuple(int(value) for value in record["shore_face_ids"])
+            interface_edges = tuple(record["interface_edges"])
+            scale = float(record.get("scale", 1.0))
+        except (AttributeError, KeyError, TypeError, ValueError):
+            continue
+        if not valley_ids or len(set(valley_ids)) != len(valley_ids):
+            continue
+        if any(value not in local_by_mesh for value in valley_ids + shore_ids):
+            continue
+        valley_local = tuple(local_by_mesh[value] for value in valley_ids)
+        shore_local = tuple(local_by_mesh[value] for value in shore_ids)
+        surviving_shore_ids = tuple(
+            shore_id
+            for shore_id, shore_index in zip(shore_ids, shore_local)
+            if shore_index in selected_set
+        )
+        if len(surviving_shore_ids) < 2:
+            continue
+        if any(value not in analysis_set for value in valley_local):
+            continue
+        if any(
+            not np.isfinite(distances[value])
+            or distances[value] > float(radius) + tolerance
+            or bool(hidden[value])
+            or int(degree[value]) < int(edge_counts[value])
+            for value in valley_local
+        ):
+            continue
+        # Component continuity and interface protection are checked against
+        # the current full graph, not against proxy patch-local ids.
+        component_set = set(valley_local)
+        seen = {valley_local[0]}
+        pending = [valley_local[0]]
+        protected = False
+        while pending:
+            face = pending.pop()
+            for neighbor in neighbors[int(offsets[face]) : int(offsets[face + 1])]:
+                neighbor = int(neighbor)
+                if neighbor in component_set and neighbor not in seen:
+                    seen.add(neighbor)
+                    pending.append(neighbor)
+                # Distance clipping is handled by the component-face checks
+                # above; a neighbor outside the requested radius alone is
+                # not a protected boundary.  Hidden neighbors remain hard
+                # stops during fine revalidation.
+                elif neighbor not in component_set and bool(hidden[neighbor]):
+                    protected = True
+        if protected or len(seen) != len(component_set):
+            continue
+        valid_edges = []
+        for edge in interface_edges:
+            try:
+                valley_id, shore_id, point_a, point_b = edge
+                valley_id = int(valley_id)
+                shore_id = int(shore_id)
+                valley_local_id = local_by_mesh[valley_id]
+                shore_local_id = local_by_mesh[shore_id]
+                if (
+                    shore_id not in surviving_shore_ids
+                    or (valley_local_id, shore_local_id) not in pair_set
+                ):
+                    continue
+                valid_edges.append((valley_id, shore_id, point_a, point_b))
+            except (KeyError, TypeError, ValueError):
+                continue
+        if not valid_edges:
+            continue
+        if not _fill_preview_valley_component_is_crossing(
+            geometry,
+            valley_ids,
+            surviving_shore_ids,
+            valid_edges,
+            scale=scale,
+        ):
+            continue
+        fills.extend(valley_local)
+    return np.unique(np.asarray(fills, dtype=np.int32)), "ok"
+
+
 def _fill_preview_make_result(state, radius):
     """Compute one immutable candidate result for the current wheel distance."""
     import numpy as np
 
+    # The active normal-E implementation is deliberately the fast,
+    # incremental geometry-range resolver.  The former screen-space
+    # morphology implementation remains in this module as dormant diagnostic
+    # code, but neither normal E nor Ctrl+E enters it.
+    shadow_mode = False
+    shadow_capture = None
+    screen_mode = False
     geometry = state["adjacency"]
-    if state.get("cursor_local"):
-        _fill_preview_cursor_expand(state, radius)
-        geometry = state["adjacency"]
-    seed_face = int(state.get("seed_local", state["seed_face"]))
+    seed_value = state.get("seed_local")
+    if seed_value is None:
+        seed_value = state["seed_face"]
+    seed_face = int(state["seed_face"]) if screen_mode else int(seed_value)
     if seed_face < 0 or seed_face >= len(geometry["hidden"]):
         raise RuntimeError("preview seed is outside the prepared mesh")
     if bool(geometry["hidden"][seed_face]):
         raise RuntimeError("preview seed is hidden")
-    halo = max(float(radius) * 0.5, float(state["initial_radius"]) * 0.5)
-    patch_radius = float(radius) + halo
     started = time.perf_counter()
-    distances, patch_ids, popped, distance_state = _fill_preview_dijkstra_incremental(
-        geometry, seed_face, patch_radius, state.get("distance_state")
-    )
-    state["distance_state"] = distance_state
-    if len(patch_ids) == 0 or not np.isfinite(distances[seed_face]):
-        raise RuntimeError("preview seed is outside the prepared patch")
+    progressive_step = None
     proxy_metrics = {}
-    analysis_ids = patch_ids
-    if geometry.get("shading_approx"):
-        analysis_ids, proxy_metrics = _fill_preview_shading_proxy(
-            geometry,
-            patch_ids,
-            distances,
-            radius,
-            int(np.flatnonzero(patch_ids == seed_face)[0]),
+    if screen_mode:
+        # The image classifier owns ordinary E end-to-end.  The full graph is
+        # retained only for hidden/non-manifold safety and exact interfaces;
+        # there is no Dijkstra/radius/proxy gate in this branch.
+        count = int(geometry.get("count", 0))
+        analysis_ids = np.arange(count, dtype=np.int32)
+        patch_ids = analysis_ids
+        distances = np.zeros(count, dtype=np.float64)
+        popped = 0
+        state["distance_state"] = None
+        local = geometry
+        seed_local = seed_face
+    else:
+        progressive_step = _fill_preview_progressive_range_step(state, radius)
+        geometry = progressive_step["geometry"]
+        seed_face = int(progressive_step["seed_face"])
+        distances = progressive_step["distances"]
+        patch_ids = progressive_step["patch_ids"]
+        popped = int(progressive_step["popped"])
+        patch_radius = float(progressive_step["patch_radius"])
+        if len(patch_ids) == 0 or not np.isfinite(distances[seed_face]):
+            raise RuntimeError("preview seed is outside the prepared patch")
+        analysis_ids = patch_ids
+        if geometry.get("shading_approx") and bool(state.get("strict_mode", False)):
+            analysis_ids, proxy_metrics = _fill_preview_shading_proxy(
+                geometry,
+                patch_ids,
+                distances,
+                radius,
+                int(np.flatnonzero(patch_ids == seed_face)[0]),
+            )
+        local = _fill_preview_local_geometry(
+            geometry, analysis_ids, bool(state.get("strict_mode", False))
         )
-    local = _fill_preview_local_geometry(geometry, analysis_ids)
-    seed_local = int(np.flatnonzero(analysis_ids == seed_face)[0])
-    local_region, partition = _fill_preview_region(
-        local, seed_local, bool(state["strict_mode"])
+        seed_local = int(np.flatnonzero(analysis_ids == seed_face)[0])
+    visible_profile = state.get("visible_analysis_profile") if not bool(
+        state.get("strict_mode", False)
+    ) else None
+    shadow_metrics = {
+        "shadow_capture_ok": bool(
+            isinstance(shadow_capture, dict) and shadow_capture.get("ok")
+        ),
+        "shadow_capture_reason": (
+            shadow_capture.get("reason", "not-captured")
+            if isinstance(shadow_capture, dict)
+            else (
+                "progressive-range-no-capture"
+                if not bool(state.get("strict_mode", False))
+                else "strict-mode"
+            )
+        ),
+        "shadow_capture_generation": int(state.get("shadow_capture_generation", 0)),
+        "shadow_capture_fresh": bool(shadow_mode and shadow_capture is not None),
+        "shadow_capture_size": tuple(
+            shadow_capture.get("capture_size", (0, 0))
+            if isinstance(shadow_capture, dict) else (0, 0)
+        ),
+        "shadow_luminance_min": float(
+            shadow_capture.get("luminance_min", 0.0)
+            if isinstance(shadow_capture, dict) else 0.0
+        ),
+        "shadow_luminance_max": float(
+            shadow_capture.get("luminance_max", 0.0)
+            if isinstance(shadow_capture, dict) else 0.0
+        ),
+        "shadow_seed_luminance": float(
+            shadow_capture.get("luminance_seed", 0.0)
+            if isinstance(shadow_capture, dict) else 0.0
+        ),
+        "shadow_noise_scale": float(
+            shadow_capture.get("noise_scale", 0.0)
+            if isinstance(shadow_capture, dict) else 0.0
+        ),
+        "shadow_line_pixel_count": int(
+            shadow_capture.get("line_pixel_count", 0)
+            if isinstance(shadow_capture, dict) else 0
+        ),
+        "shadow_face_set_neutral": True,
+        "shadow_analysis_shader_name": str(
+            shadow_capture.get("analysis_shader_name", "")
+            if isinstance(shadow_capture, dict) else ""
+        ),
+        "shadow_analysis_shader_profile_registered": bool(
+            shadow_capture.get("analysis_shader_profile_registered", False)
+            if isinstance(shadow_capture, dict) else False
+        ),
+        "shadow_analysis_shader_matcap": str(
+            shadow_capture.get("analysis_shader_matcap", "")
+            if isinstance(shadow_capture, dict) else ""
+        ),
+        "shadow_faceset_suppressed": bool(
+            shadow_capture.get("faceset_suppressed", False)
+            if isinstance(shadow_capture, dict) else False
+        ),
+        "shadow_mask_suppressed": bool(
+            shadow_capture.get("mask_suppressed", False)
+            if isinstance(shadow_capture, dict) else False
+        ),
+        "shadow_shading_restore_verified": bool(
+            shadow_capture.get("shading_restore_verified", False)
+            if isinstance(shadow_capture, dict) else False
+        ),
+        "shadow_overlay_restore_verified": bool(
+            shadow_capture.get("overlay_restore_verified", False)
+            if isinstance(shadow_capture, dict) else False
+        ),
+        "visible_analysis_profile_active": bool(
+            isinstance(visible_profile, dict) and visible_profile.get("active", False)
+        ),
+        "visible_analysis_profile_applied": bool(
+            isinstance(visible_profile, dict) and visible_profile.get("applied", False)
+        ),
+        "visible_analysis_profile_restore_verified": bool(
+            isinstance(visible_profile, dict) and visible_profile.get("restore_verified", False)
+        ),
+        "visible_analysis_profile_reason": str(
+            visible_profile.get("reason", "not-attempted")
+            if isinstance(visible_profile, dict) else "strict-mode"
+        ),
+        "visible_analysis_profile_manual_owner": bool(
+            (not bool(state.get("strict_mode", False)))
+            and state.get("visible_analysis_profile_manual", False)
+        ),
+        "analysis_profile_restored_before_ready": bool(
+            shadow_mode and state.get("analysis_profile_restored_before_ready", False)
+        ),
+        "analysis_profile_capture_applied": bool(
+            shadow_mode and isinstance(visible_profile, dict)
+            and visible_profile.get("applied", False)
+        ),
+        "shadow_screen_sharpened_overlay_active": False,
+        "shadow_screen_sharpened_overlay_mode": "hidden-after-capture",
+        "shadow_screen_sharpened_overlay_restored": bool(shadow_mode),
+        "progressive_range_mode": not bool(state.get("strict_mode", False)),
+        "progressive_range_active_path": (
+            "progressive-range"
+            if not bool(state.get("strict_mode", False))
+            else "geometry-strict"
+        ),
+        "progressive_range_initial_radius": float(
+            state.get("initial_radius") or 0.0
+        ),
+        "progressive_range_current_radius": float(radius),
+        "progressive_range_newly_processed_faces": 0,
+        "progressive_range_reused_faces": 0,
+        "progressive_range_cache_hit": bool(
+            state.get("active_result_cache_hit", False)
+        ),
+        "progressive_range_wheel_compute_seconds": 0.0,
+        "progressive_range_full_capture_called": False,
+        "progressive_range_screen_morph_called": False,
+    }
+    if shadow_mode:
+        # Keep the existing graph/partition machinery, but remove every
+        # geometry signal from ordinary E.  The grayscale boundary pass below
+        # receives only the fresh screen-space shadow signal; a failed capture
+        # therefore remains distance-only rather than silently reverting to
+        # normal/crease/valley barriers.
+        local = dict(local)
+        hard_faces = np.asarray(
+            local.get("source_hard", np.zeros(int(local["count"]), dtype=bool)),
+            dtype=bool,
+        ).reshape(-1)
+        if len(hard_faces) != int(local["count"]):
+            hard_faces = np.zeros(int(local["count"]), dtype=bool)
+        hidden_faces = np.asarray(
+            local.get("hidden", np.zeros(int(local["count"]), dtype=bool)),
+            dtype=bool,
+        ).reshape(-1)
+        if len(hidden_faces) != int(local["count"]):
+            hidden_faces = np.zeros(int(local["count"]), dtype=bool)
+        if len(hard_faces) == int(local["count"]):
+            hard_faces |= hidden_faces
+        else:
+            hard_faces = np.zeros(int(local["count"]), dtype=bool)
+        for key in ("contrast", "concavity", "directional_valley", "crease"):
+            local[key] = np.zeros(int(local["count"]), dtype=np.float64)
+        # Physical hard/open/non-manifold faces remain safety barriers even
+        # though ordinary E does not use geometry as a shape signal.
+        local["contrast"][hard_faces] = 1.0
+        local["concavity"][hard_faces] = 1.0
+        local["directional_valley"][hard_faces] = 1.0
+        local["crease"][hard_faces] = 2.0
+        local["contour_cost"] = np.asarray(
+            local.get("neighbor_lengths", np.ones(len(local.get("neighbors", ())))),
+            dtype=np.float64,
+        ).copy()
+        # The normal path classifies all source physical edges in the
+        # seed-relative luminance cache inside ``_fill_preview_shadow_region``.
+        # No screen-overlap edge map is built here; that older map could lose
+        # edges outside the current radius and let a later wheel stage differ.
+        local["partitions"] = {}
+    # Face Set assistance belongs to the geometry strict initial phase only;
+    # ordinary E is entirely shadow/graph based and never reads the ID layer.
+    face_set_initial_phase = (
+        state.get("processed_radius") is None and not shadow_mode
     )
+    face_set_metrics = {
+        "face_set_prior_phase": "initial" if face_set_initial_phase else "disabled-after-initial",
+        "face_set_enabled": False,
+        "face_set_seed_face_set_id": -1,
+        "face_set_trusted_enabled": False,
+        "face_set_seed_id": -1,
+        "face_set_relaxed_pair_count": 0,
+        "face_set_reached_same_set_faces": 0,
+        "face_set_full_component_faces": 0,
+        "face_set_expanded_analysis_faces": 0,
+        "face_set_different_id_neutral_crossing_count": 0,
+        "face_set_compact_cut_relaxed_faces": 0,
+        "face_set_source_hard_faces": 0,
+        "face_set_prior_safety_reason": "disabled-after-initial" if not face_set_initial_phase else "attribute-missing",
+        "face_set_prior_applied_reason": "disabled-after-initial" if not face_set_initial_phase else "attribute-missing",
+        "face_set_reason": "disabled-after-initial" if not face_set_initial_phase else "attribute-missing",
+        "face_set_geometry_baseline_count": 0,
+        "face_set_same_id_bonus_count": 0,
+        "face_set_different_id_baseline_preserved_count": 0,
+        "geometry_baseline_count": 0,
+        "same_id_bonus_count": 0,
+        "different_id_baseline_preserved_count": 0,
+    }
+    face_set_expanded_analysis_ids = np.empty(0, dtype=np.int32)
+    # Face Set values are a read-only prior for preview traversal.  The
+    # compact cursor graph indexes geometry faces, while ``face_ids`` maps
+    # those entries back to mesh polygon ids.
+    try:
+        if not face_set_initial_phase:
+            raise RuntimeError("face-set-prior-disabled")
+        mesh = state["obj"].data
+        face_set_attribute = mesh.attributes.get(".sculpt_face_set")
+        mesh_face_ids = np.asarray(
+            geometry.get("face_ids", np.arange(int(geometry["count"]), dtype=np.int32)),
+            dtype=np.int32,
+        ).reshape(-1)
+        if (
+            face_set_attribute is None
+            or getattr(face_set_attribute, "domain", None) != "FACE"
+            or len(face_set_attribute.data) != len(mesh.polygons)
+            or len(mesh_face_ids) != int(geometry["count"])
+            or np.any(mesh_face_ids < 0)
+            or np.any(mesh_face_ids >= len(mesh.polygons))
+        ):
+            face_set_metrics["face_set_reason"] = "attribute-invalid"
+        else:
+            all_face_sets = np.empty(len(mesh.polygons), dtype=np.int32)
+            face_set_attribute.data.foreach_get("value", all_face_sets)
+            seed_mesh_face = int(state.get("seed_face", -1))
+            if seed_mesh_face < 0 or seed_mesh_face >= len(all_face_sets):
+                raise ValueError("seed-face-schema")
+            seed_face_set_id = int(all_face_sets[seed_mesh_face])
+            face_set_metrics["face_set_seed_face_set_id"] = seed_face_set_id
+            face_set_metrics["face_set_seed_id"] = seed_face_set_id
+            if seed_face_set_id < 0:
+                face_set_metrics["face_set_reason"] = "seed-id-invalid"
+            else:
+                trusted_geometry_ids, source_hard, prior_safety_reason = (
+                    _fill_preview_face_set_initial_component(
+                        geometry,
+                        distances,
+                        radius,
+                        int(state.get("seed_face", seed_face)),
+                        all_face_sets,
+                    )
+                )
+                if len(trusted_geometry_ids):
+                    face_set_expanded_analysis_ids = trusted_geometry_ids[
+                        ~np.isin(trusted_geometry_ids, analysis_ids)
+                    ]
+                    face_set_metrics["face_set_full_component_faces"] = int(
+                        len(trusted_geometry_ids)
+                    )
+                    face_set_metrics["face_set_expanded_analysis_faces"] = int(
+                        len(face_set_expanded_analysis_ids)
+                    )
+                    if len(face_set_expanded_analysis_ids):
+                        analysis_ids = np.unique(
+                            np.r_[analysis_ids, face_set_expanded_analysis_ids]
+                        ).astype(np.int32, copy=False)
+                        local = _fill_preview_local_geometry(
+                            geometry,
+                            analysis_ids,
+                            bool(state.get("strict_mode", False)),
+                        )
+                        seed_local = int(
+                            np.flatnonzero(analysis_ids == seed_face)[0]
+                        )
+                # ``local`` carries the full-graph source safety projection;
+                # compact degree is never used as a physical barrier.
+                local_face_sets = all_face_sets[mesh_face_ids[analysis_ids]]
+                local["face_set_values"] = local_face_sets.astype(np.int32, copy=False)
+                local["face_set_seed_id"] = seed_face_set_id
+                local["face_set_prior_enabled"] = True
+                face_set_metrics["face_set_enabled"] = True
+                face_set_metrics["face_set_trusted_enabled"] = True
+                face_set_metrics["face_set_reason"] = "same-id-geodesic-bonus"
+                face_set_metrics["face_set_prior_applied_reason"] = "same-id-geodesic-bonus"
+                face_set_metrics["face_set_prior_safety_reason"] = prior_safety_reason
+    except (AttributeError, IndexError, KeyError, ReferenceError, RuntimeError, TypeError, ValueError):
+        if face_set_initial_phase:
+            face_set_metrics["face_set_reason"] = "attribute-invalid"
+            face_set_metrics["face_set_prior_applied_reason"] = "attribute-invalid"
+    # Compute the geometry-only candidate first.  Face Set prior is an
+    # additive initial hint, never a reason to remove a face or bend the
+    # baseline boundary toward a different-ID outline.  Keep the assisted
+    # partition separate so all later scoring/refinement sees geometry costs.
+    geometry_local = dict(local)
+    for _key in (
+        "face_set_values",
+        "face_set_seed_id",
+        "face_set_prior_enabled",
+    ):
+        geometry_local.pop(_key, None)
+    geometry_local["partitions"] = {}
+    if shadow_mode:
+        # Ordinary E bypasses the legacy geometry/Face Set partition entirely.
+        # With a valid fresh analysis capture, face luminance is the primary
+        # classifier: connected bright/dark membership is decided before any
+        # secondary edge Closing.  If capture is unavailable, retain the
+        # explicit distance-only provisional safety path.
+        if screen_mode:
+            local_region, shadow_region_metrics = _fill_preview_shadow_screen_region(
+                state, geometry, seed_local, int(state.get("luminance_step", 0))
+            )
+        elif shadow_metrics.get("shadow_capture_ok"):
+            local_region, shadow_region_metrics = _fill_preview_shadow_luminance_region(
+                state, local, distances[analysis_ids], radius, seed_local,
+                geometry, distances,
+            )
+        else:
+            local_region, shadow_region_metrics = _fill_preview_shadow_region(
+                state,
+                local,
+                distances[analysis_ids],
+                radius,
+                seed_local,
+                geometry,
+                distances,
+            )
+        local_region = np.unique(
+            np.asarray(local_region, dtype=np.int32).reshape(-1)
+        )
+        geometry_region = local_region.copy()
+        assisted_region = np.empty(0, dtype=np.int32)
+        geometry_partition = {
+            "protected": np.zeros(int(local["count"]), dtype=bool),
+        }
+        assisted_partition = {}
+    else:
+        geometry_region, geometry_partition = _fill_preview_region(
+            geometry_local, seed_local, bool(state["strict_mode"])
+        )
+        assisted_region, assisted_partition = _fill_preview_region(
+            local, seed_local, bool(state["strict_mode"])
+        )
+        local_region = np.unique(
+            np.r_[geometry_region, assisted_region]
+        ).astype(np.int32, copy=False)
+        shadow_region_metrics = {}
+    # Do not let the Face Set-adjusted graph leak into the boundary resolver.
+    local = geometry_local
+    partition = geometry_partition
+    if isinstance(assisted_partition, dict):
+        face_set_metrics["face_set_relaxed_pair_count"] = int(
+            assisted_partition.get("face_set_relaxed_pair_count", 0)
+        )
+        face_set_metrics["face_set_reached_same_set_faces"] = int(
+            assisted_partition.get("face_set_reached_same_set_faces", 0)
+        )
+        face_set_metrics["face_set_different_id_neutral_crossing_count"] = int(
+            assisted_partition.get("face_set_different_id_neutral_crossing_count", 0)
+        )
+        face_set_metrics["face_set_compact_cut_relaxed_faces"] = int(
+            assisted_partition.get("face_set_compact_cut_relaxed_faces", 0)
+        )
+        face_set_metrics["face_set_source_hard_faces"] = int(
+            assisted_partition.get("face_set_source_hard_faces", 0)
+        )
+        face_set_metrics["face_set_prior_safety_reason"] = str(
+            assisted_partition.get("face_set_prior_safety_reason", "unknown")
+        )
+        if (
+            face_set_initial_phase
+            and face_set_metrics["face_set_enabled"]
+            and not face_set_metrics["face_set_relaxed_pair_count"]
+        ):
+            face_set_metrics["face_set_prior_applied_reason"] = "same-id-component-no-shared-pair"
+        face_set_metrics["face_set_geometry_baseline_count"] = int(
+            len(geometry_region)
+        )
+        face_set_metrics["face_set_same_id_bonus_count"] = int(
+            len(np.setdiff1d(assisted_region, geometry_region, assume_unique=False))
+        )
+        face_set_metrics["face_set_different_id_baseline_preserved_count"] = int(
+            len(geometry_region)
+        )
+        face_set_metrics["geometry_baseline_count"] = int(len(geometry_region))
+        face_set_metrics["same_id_bonus_count"] = int(
+            len(np.setdiff1d(assisted_region, geometry_region, assume_unique=False))
+        )
+        face_set_metrics["different_id_baseline_preserved_count"] = int(
+            len(geometry_region)
+        )
     # Let the exact local partition inspect the original boundary band while
     # retaining only the current distance-first seed component.  The component
     # is recomputed for every radius, so finite valleys can reconnect at their
@@ -10761,48 +21267,458 @@ def _fill_preview_make_result(state, radius):
         # the newly acquired distance range, so a finite valley can reconnect
         # naturally without a persistent blacklist.
         allowed_local = np.isin(analysis_ids, coarse_candidate_ids)
+        if len(face_set_expanded_analysis_ids):
+            allowed_local |= np.isin(analysis_ids, face_set_expanded_analysis_ids)
         local_region = local_region[allowed_local[local_region]]
         local_region = np.unique(local_region).astype(np.int32)
-    valley_merge_evidence = proxy_metrics.get("proxy_valley_merge_evidence", ())
-    if valley_merge_evidence:
-        # A coarse valley proof is accepted only when the fine partition kept
-        # the same valley face and both opposing contact faces.  This prevents
-        # a fine/strict decision that rejects one shore from being overridden.
-        fine_global_ids = analysis_ids[local_region]
-        accepted_valley_faces = []
-        for valley_id, first_contact_id, second_contact_id in valley_merge_evidence:
-            if np.all(
-                np.isin(
-                    np.asarray(
-                        (valley_id, first_contact_id, second_contact_id),
-                        dtype=np.int32,
-                    ),
-                    fine_global_ids,
-                )
+    valley_components = proxy_metrics.get("proxy_valley_components", ())
+    if valley_components:
+        # Revalidate one component record at a time.  The exact partition may
+        # exclude every valley face while retaining both shores; that is not a
+        # circular prerequisite for the component rescue.
+        # ``local_region`` is analysis-local, while the revalidator returns
+        # geometry-local ids.  Convert through an explicit geometry-local
+        # union before mapping accepted ids back to analysis-local indices.
+        fine_geometry_ids = analysis_ids[local_region]
+        accepted_valley_geometry_ids, valley_fine_reason = _fill_preview_revalidate_valley_components(
+            geometry,
+            distances,
+            radius,
+            analysis_ids,
+            fine_geometry_ids,
+            valley_components,
+        )
+        if len(accepted_valley_geometry_ids):
+            accepted_valley_geometry_ids = np.asarray(
+                accepted_valley_geometry_ids, dtype=np.int32
+            ).reshape(-1)
+            analysis_inverse = {
+                int(geometry_id): analysis_index
+                for analysis_index, geometry_id in enumerate(analysis_ids)
+            }
+            accepted_analysis_local = [
+                analysis_inverse.get(int(geometry_id), -1)
+                for geometry_id in accepted_valley_geometry_ids
+            ]
+            if (
+                any(index < 0 for index in accepted_analysis_local)
+                or len(set(accepted_analysis_local)) != len(accepted_analysis_local)
             ):
-                valley_matches = np.flatnonzero(analysis_ids == int(valley_id))
-                if len(valley_matches):
-                    accepted_valley_faces.append(int(valley_matches[0]))
-        if accepted_valley_faces:
-            local_region = np.unique(
-                np.r_[local_region, np.asarray(accepted_valley_faces, dtype=np.int32)]
-            ).astype(np.int32)
-    local_global = analysis_ids[local_region]
-    candidate_mask = (
-        (distances[local_global] <= float(radius) + max(radius * 1.e-8, 1.e-9))
-        & ~geometry["hidden"][local_global]
+                # A revalidator result outside the current analysis partition
+                # is a schema failure, never an invitation to add another
+                # geometry face to the candidate.
+                valley_fine_reason = "analysis-id-schema"
+            else:
+                fine_geometry_ids = np.unique(
+                    np.r_[fine_geometry_ids, accepted_valley_geometry_ids]
+                ).astype(np.int32)
+                local_region = np.unique(
+                    np.r_[
+                        local_region,
+                        np.asarray(accepted_analysis_local, dtype=np.int32),
+                    ]
+                ).astype(np.int32)
+    else:
+        valley_fine_reason = "none"
+    # Use the geometry-local union directly for the final distance/hidden
+    # mask.  This keeps the accepted valley component in the same ID space
+    # that the revalidator returned; analysis-local indices are only used for
+    # partition bookkeeping above.
+    local_global = (
+        fine_geometry_ids
+        if valley_components
+        else analysis_ids[local_region]
     )
+    if screen_mode:
+        # Screen classification already owns extent.  The full graph is
+        # deliberately not clipped by the legacy radius candidate mask.
+        candidate_mask = ~geometry["hidden"][local_global]
+    else:
+        candidate_mask = (
+            (distances[local_global] <= float(radius) + max(radius * 1.e-8, 1.e-9))
+            & ~geometry["hidden"][local_global]
+        )
     preview_local_ids = local_global[candidate_mask].astype(np.int32, copy=False)
-    # A single compact-domain external label removes inner loops (including a
-    # closed pocket) before extracting the outer boundary.  This replaces the
-    # old global gapfill, route, and one-hop re-search passes for prediction.
-    enclosed_gap_ids, compact_external_metrics = _fill_preview_compact_external_faces(
-        geometry, distances, radius, preview_local_ids
+    # The enclosed and sandwiched-band resolvers both inspect this same base
+    # candidate.  They are intentionally independent: band evidence must not
+    # turn a large open component into a compact hole, and the 100/101 rule is
+    # never rerun after band faces have been added.
+    base_preview_local_ids = np.unique(preview_local_ids).astype(
+        np.int32, copy=False
     )
-    if len(enclosed_gap_ids):
-        preview_local_ids = np.unique(
-            np.r_[preview_local_ids, enclosed_gap_ids]
-        ).astype(np.int32, copy=False)
+    if screen_mode:
+        enclosed_component_ids = np.empty(0, dtype=np.int32)
+        sandwiched_band_ids = np.empty(0, dtype=np.int32)
+        enclosed_component_metrics = {"screen_classifier_skipped": True}
+        sandwiched_band_metrics = {"screen_classifier_skipped": True}
+    else:
+        enclosed_component_ids, enclosed_component_metrics = _fill_preview_resolve_enclosed_components(
+            geometry, distances, radius, base_preview_local_ids,
+        )
+        sandwiched_band_ids, sandwiched_band_metrics = _fill_preview_resolve_sandwiched_bands(
+            geometry, distances, radius, base_preview_local_ids,
+        )
+    preview_parts = [base_preview_local_ids]
+    if len(enclosed_component_ids):
+        preview_parts.append(enclosed_component_ids)
+    if len(sandwiched_band_ids):
+        preview_parts.append(sandwiched_band_ids)
+    preview_local_ids = np.unique(np.concatenate(preview_parts)).astype(
+        np.int32, copy=False
+    )
+    # An edge-adjacent seed can initially occupy the whole visible component:
+    # every crossing is orange, while the first cyan/distance front is still
+    # one safe geodesic step away.  Bootstrap only this provisional case;
+    # candidate face count is deliberately not used as a density heuristic.
+    # The added faces are selected from the already prepared local patch, so
+    # no hidden/non-manifold/protected face or unrelated sheet can be crossed.
+    bootstrap_metrics = {
+        "shape_refine_bootstrap_attempted": False,
+        "shape_refine_bootstrap_applied": False,
+        "shape_refine_bootstrap_reason": "not-triggered",
+        "shape_refine_bootstrap_faces": 0,
+        "shape_refine_bootstrap_selected_faces": int(len(preview_local_ids)),
+        "shape_refine_bootstrap_orange_pairs": 0,
+        "shape_refine_bootstrap_low_signal_threshold": 0.0,
+        "shape_refine_bootstrap_eligible_pairs": 0,
+        "shape_refine_bootstrap_run_count": 0,
+        "shape_refine_bootstrap_front_faces": 0,
+        "shape_refine_bootstrap_multi_front_source_count": 0,
+        "shape_refine_bootstrap_shells_advanced": 0,
+        "shape_refine_bootstrap_cyan_front_created": False,
+        "shape_refine_bootstrap_target_line_reached": False,
+        "shape_refine_bootstrap_target_line_strength": 0.0,
+    }
+    try:
+        local_global_ids = np.asarray(
+            local.get("_global_face_ids", ()), dtype=np.int32
+        ).reshape(-1)
+        local_first = np.asarray(local.get("first", ()), dtype=np.int32).reshape(-1)
+        local_second = np.asarray(local.get("second", ()), dtype=np.int32).reshape(-1)
+        local_edges = np.asarray(
+            local.get("pair_edge_indices", ()), dtype=np.int32
+        ).reshape(-1)
+        if bool(state.get("strict_mode", False)) and (
+            len(local_global_ids) == int(local.get("count", 0))
+            and len(local_first) == len(local_second) == len(local_edges)
+            and len(local_global_ids) > 0
+        ):
+            local_distances = distances[analysis_ids]
+            # A later radius may shrink the geometry resolver's raw region,
+            # but the accepted initial cache remains part of the provisional
+            # source range for bootstrap.  The cache is stable mesh-id space;
+            # project it through the current geometry face-id map here.
+            geometry_face_ids = np.asarray(
+                geometry.get("face_ids", np.arange(int(geometry["count"]), dtype=np.int32)),
+                dtype=np.int32,
+            ).reshape(-1)
+            cached_mesh_ids = np.asarray(
+                state.get("initial_accepted_ids", ()), dtype=np.int32
+            ).reshape(-1)
+            cached_geometry_ids = np.flatnonzero(
+                np.isin(geometry_face_ids, np.unique(cached_mesh_ids))
+            ).astype(np.int32)
+            bootstrap_source_ids = np.unique(
+                np.r_[preview_local_ids, cached_geometry_ids]
+            ).astype(np.int32, copy=False)
+            local_selected = np.isin(local_global_ids, bootstrap_source_ids)
+            local_crossing = local_selected[local_first] != local_selected[local_second]
+            local_outside = np.where(local_selected[local_first], local_second, local_first)
+            local_shape = _fill_preview_shape_boundary_mask(
+                local_crossing,
+                local_distances[local_outside],
+                float(radius),
+                local_edges,
+            )
+            orange_pairs = local_crossing & (local_edges >= 0)
+            bootstrap_metrics["shape_refine_bootstrap_orange_pairs"] = int(
+                np.count_nonzero(orange_pairs)
+            )
+            orange_minimum = 4 if bool(state.get("strict_mode", False)) else 1
+            all_orange = bool(
+                np.count_nonzero(orange_pairs) >= orange_minimum
+                and not np.any(local_crossing & ~local_shape)
+            )
+            if all_orange:
+                bootstrap_metrics["shape_refine_bootstrap_attempted"] = True
+                bootstrap_metrics["shape_refine_bootstrap_reason"] = "all-orange-edge-adjacent"
+                offsets = np.asarray(local.get("offsets", ()), dtype=np.int64).reshape(-1)
+                neighbors = np.asarray(local.get("neighbors", ()), dtype=np.int32).reshape(-1)
+                hidden_local = np.asarray(
+                    local.get("hidden", np.zeros(len(local_global_ids), dtype=bool)),
+                    dtype=bool,
+                ).reshape(-1)
+                source_hard_local = np.asarray(
+                    local.get("source_hard", np.zeros(len(local_global_ids), dtype=bool)),
+                    dtype=bool,
+                ).reshape(-1)
+                if len(source_hard_local) != len(local_global_ids):
+                    source_hard_local = np.zeros(len(local_global_ids), dtype=bool)
+                protected_local = np.zeros(len(local_global_ids), dtype=bool)
+                if isinstance(partition, dict):
+                    raw_protected = np.asarray(partition.get("protected", ()), dtype=bool).reshape(-1)
+                    if len(raw_protected) == len(protected_local):
+                        protected_local |= raw_protected
+                # Compact analysis degree is allowed to be deficient at a
+                # crop edge.  Only full-geometry source_hard is physical
+                # non-manifold/open evidence; never reintroduce the old
+                # compact-degree hard stop here.
+                hard_local = hidden_local | ~np.isfinite(local_distances) | source_hard_local
+                normals_local = np.asarray(local.get("normals", ()), dtype=np.float64)
+                contrast_local = np.asarray(
+                    local.get("contrast", np.zeros(len(local_global_ids))),
+                    dtype=np.float64,
+                ).reshape(-1)
+                concavity_local = np.asarray(
+                    local.get("concavity", np.zeros(len(local_global_ids))),
+                    dtype=np.float64,
+                ).reshape(-1)
+                directional_local = np.asarray(
+                    local.get("directional_valley", np.zeros(len(local_global_ids))),
+                    dtype=np.float64,
+                ).reshape(-1)
+                crease_local = np.asarray(
+                    local.get("crease", np.zeros(len(local_global_ids))),
+                    dtype=np.float64,
+                ).reshape(-1)
+                orange_rows = np.flatnonzero(orange_pairs).astype(np.int32)
+                orange_signal = {}
+                if (
+                    normals_local.shape == (len(local_global_ids), 3)
+                    and all(
+                        len(values) == len(local_global_ids)
+                        for values in (
+                            contrast_local,
+                            concavity_local,
+                            directional_local,
+                            crease_local,
+                        )
+                    )
+                ):
+                    for pair in orange_rows:
+                        pair = int(pair)
+                        left, right = int(local_first[pair]), int(local_second[pair])
+                        dot = float(np.clip(np.dot(normals_local[left], normals_local[right]), -1.0, 1.0))
+                        normal_signal = math.acos(dot) / math.pi
+                        crease_signal = float(
+                            np.clip(max(crease_local[left], crease_local[right]) / math.pi, 0.0, 1.0)
+                        )
+                        scalar_signal = float(
+                            np.clip(
+                                max(
+                                    abs(float(contrast_local[left])),
+                                    abs(float(contrast_local[right])),
+                                    abs(float(concavity_local[left])),
+                                    abs(float(concavity_local[right])),
+                                    abs(float(directional_local[left])),
+                                    abs(float(directional_local[right])),
+                                ) / 0.10,
+                                0.0,
+                                1.0,
+                            )
+                        )
+                        geodesic_signal = float(
+                            np.clip(
+                                1.0
+                                - abs(float(local_distances[left]) - float(local_distances[right]))
+                                / max(float(radius), 1.0e-20),
+                                0.0,
+                                1.0,
+                            )
+                        )
+                        orange_signal[pair] = float(
+                            np.clip(
+                                0.55 * normal_signal
+                                + 0.20 * crease_signal
+                                + 0.20 * scalar_signal
+                                + 0.05 * geodesic_signal,
+                                0.0,
+                                1.0,
+                            )
+                        )
+                signal_values = np.asarray(tuple(orange_signal.values()), dtype=np.float64)
+                if len(signal_values):
+                    signal_median = float(np.median(signal_values))
+                    signal_mad = float(1.4826 * np.median(np.abs(signal_values - signal_median)))
+                    low_signal_threshold = signal_median - max(0.5 * signal_mad, 0.03)
+                else:
+                    low_signal_threshold = -float("inf")
+                bootstrap_metrics["shape_refine_bootstrap_low_signal_threshold"] = float(
+                    low_signal_threshold if np.isfinite(low_signal_threshold) else 0.0
+                )
+                eligible_rows = {
+                    pair
+                    for pair, signal in orange_signal.items()
+                    if signal <= low_signal_threshold
+                }
+                bootstrap_metrics["shape_refine_bootstrap_eligible_pairs"] = int(len(eligible_rows))
+                # Connected runs are formed from the same face incidence as
+                # the boundary graph.  A distant low-signal edge cannot be
+                # used as an unrelated bootstrap exit.
+                face_to_orange_rows = {}
+                for pair in eligible_rows:
+                    for face in (int(local_first[pair]), int(local_second[pair])):
+                        face_to_orange_rows.setdefault(face, []).append(pair)
+                remaining_rows = set(eligible_rows)
+                eligible_runs = []
+                while remaining_rows:
+                    start = min(remaining_rows)
+                    remaining_rows.remove(start)
+                    pending = [start]
+                    run = []
+                    while pending:
+                        pair = int(pending.pop())
+                        run.append(pair)
+                        for face in (int(local_first[pair]), int(local_second[pair])):
+                            for other in face_to_orange_rows.get(face, ()):
+                                if other in remaining_rows:
+                                    remaining_rows.remove(other)
+                                    pending.append(other)
+                    eligible_runs.append(tuple(sorted(run)))
+                bootstrap_metrics["shape_refine_bootstrap_run_count"] = int(len(eligible_runs))
+                # Use every safe orange boundary face as a multi-source wave,
+                # rather than selecting one low-signal run.  This keeps the
+                # bootstrap geometry-only and lets a 2-D front branch around
+                # a ridge before reconnecting.  Face Set values are not read
+                # here: only the cached initial source range above matters.
+                safe_sources = set()
+                if (
+                    len(offsets) == len(local_global_ids) + 1
+                    and int(offsets[-1]) == len(neighbors)
+                ):
+                    for pair in orange_rows:
+                        outside = int(local_outside[int(pair)])
+                        if (
+                            0 <= outside < len(local_global_ids)
+                            and not local_selected[outside]
+                            and not hard_local[outside]
+                            and not protected_local[outside]
+                            and np.isfinite(local_distances[outside])
+                        ):
+                            safe_sources.add(outside)
+                bootstrap_metrics["shape_refine_bootstrap_multi_front_source_count"] = int(
+                    len(safe_sources)
+                )
+                front, bootstrap_seed_faces, shells_advanced, shell_reason = (
+                    _fill_preview_multi_source_metric_shell(
+                        safe_sources,
+                        local_selected,
+                        offsets,
+                        neighbors,
+                        local_distances,
+                        radius,
+                        hard_local,
+                        protected_local,
+                        max_shells=6,
+                    )
+                )
+                bootstrap_metrics["shape_refine_bootstrap_shells_advanced"] = int(
+                    shells_advanced
+                )
+                bootstrap_metrics["shape_refine_bootstrap_cyan_front_created"] = bool(
+                    front
+                )
+                target_line_strength = float(
+                    max(orange_signal.values()) if orange_signal else 0.0
+                )
+                bootstrap_metrics["shape_refine_bootstrap_target_line_strength"] = (
+                    target_line_strength
+                )
+                bootstrap_metrics["shape_refine_bootstrap_target_line_reached"] = bool(
+                    front and target_line_strength >= 0.08
+                )
+                bootstrap_metrics["shape_refine_bootstrap_front_faces"] = int(len(front))
+                if front:
+                    front_values = np.asarray(
+                        sorted(front), dtype=np.int32
+                    )
+                    minimum_distance = float(np.min(local_distances[front_values]))
+                    front_values = front_values[
+                        local_distances[front_values]
+                        <= minimum_distance + max(minimum_distance * 1.e-3, 1.e-8)
+                    ]
+                    if len(front_values) > 64:
+                        front_values = front_values[:64]
+                    if len(front_values):
+                        bootstrap_radius = max(
+                            float(radius),
+                            float(np.max(local_distances[front_values]))
+                            + max(float(radius) * 1.e-8, 1.e-9),
+                        )
+                        bootstrap_ids = local_global_ids[
+                            np.unique(
+                                np.r_[
+                                    front_values,
+                                    np.asarray(sorted(bootstrap_seed_faces), dtype=np.int32),
+                                ]
+                            )
+                        ]
+                        preview_local_ids = np.unique(
+                            np.r_[preview_local_ids, bootstrap_ids]
+                        ).astype(np.int32, copy=False)
+                        radius = bootstrap_radius
+                        bootstrap_metrics.update(
+                            {
+                                "shape_refine_bootstrap_applied": True,
+                                "shape_refine_bootstrap_reason": "multi-source-metric-shell",
+                                "shape_refine_bootstrap_faces": int(len(front_values)),
+                            }
+                        )
+                    else:
+                        bootstrap_metrics["shape_refine_bootstrap_reason"] = "front-distance-schema"
+                elif not safe_sources:
+                    bootstrap_metrics["shape_refine_bootstrap_reason"] = "no-safe-boundary-source"
+                else:
+                    bootstrap_metrics["shape_refine_bootstrap_reason"] = shell_reason
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError, RuntimeError, OverflowError):
+        bootstrap_metrics["shape_refine_bootstrap_reason"] = "bootstrap-schema"
+    # Closing is intentionally preserved as the immutable-base resolver.  A
+    # separate bounded post-pass compares its add proposal with the existing
+    # candidate and the complementary trim proposal, using one local shape
+    # score for all three.  This is what makes the same physical boundary
+    # independent of whether the cursor reached it from above or below.
+    if shadow_mode:
+        # Shadow-only E has already resolved the candidate through the
+        # dedicated graph walk. Do not let legacy geometry refinement or its
+        # bootstrap overwrite that result.
+        shape_refined_ids = preview_local_ids
+        shape_refine_metrics = {
+            "shape_refine_attempted": False,
+            "shape_refine_applied": False,
+            "shape_refine_reason": "shadow-only",
+            "shape_refine_candidates": 1,
+            "shape_refine_proposal": "none",
+            "shape_refine_added_faces": 0,
+            "shape_refine_removed_faces": 0,
+            "shape_refine_provisional": not bool(
+                shadow_metrics.get("shadow_capture_ok")
+            ),
+            **shadow_region_metrics,
+        }
+    else:
+        shape_refined_ids, shape_refine_metrics = _fill_preview_refine_shape_boundary(
+            state,
+            geometry,
+            local,
+            distances,
+            analysis_ids,
+            radius,
+            preview_local_ids,
+            partition,
+            full_candidate_ids=preview_local_ids,
+        )
+    preview_local_ids = np.unique(shape_refined_ids).astype(
+        np.int32, copy=False
+    )
+    preview_local_ids, monotonic_metrics, cached_local_ids = (
+        _fill_preview_preserve_initial_ids(
+            state,
+            geometry,
+            preview_local_ids,
+            face_set_initial_phase,
+            bool(face_set_metrics.get("face_set_enabled", False)),
+        )
+    )
     preview_faces = preview_local_ids
     face_ids = geometry.get("face_ids")
     if face_ids is not None:
@@ -10814,8 +21730,16 @@ def _fill_preview_make_result(state, radius):
     boundary_records = []
     mesh = state["obj"].data
     draw_full_geometry = bool(
-        geometry.get("shading_approx")
-        and len(geometry.get("first", ())) == len(geometry.get("second", ()))
+        (
+            not bool(state.get("strict_mode", False))
+            and not screen_mode
+        )
+        or (
+            geometry.get("shading_approx")
+            and bool(state.get("strict_mode", False))
+        )
+    ) and bool(
+        len(geometry.get("first", ())) == len(geometry.get("second", ()))
         and len(geometry.get("first", ())) == len(geometry.get("pair_edge_indices", ()))
         and len(distances) >= int(geometry.get("count", 0))
     )
@@ -10823,6 +21747,11 @@ def _fill_preview_make_result(state, radius):
         draw_first = np.asarray(geometry["first"], dtype=np.int32)
         draw_second = np.asarray(geometry["second"], dtype=np.int32)
         pair_edge_indices = np.asarray(geometry["pair_edge_indices"], dtype=np.int32)
+        draw_pair_v0 = np.asarray(geometry.get("pair_v0", ()), dtype=np.int32).reshape(-1)
+        draw_pair_v1 = np.asarray(geometry.get("pair_v1", ()), dtype=np.int32).reshape(-1)
+        draw_world_vertices = np.asarray(
+            geometry.get("world_vertices", ()), dtype=np.float64
+        ).reshape((-1, 3))
         draw_ids = np.arange(int(geometry["count"]), dtype=np.int32)
         draw_selected = np.isin(draw_ids, preview_local_ids)
         draw_outside = np.where(
@@ -10832,6 +21761,11 @@ def _fill_preview_make_result(state, radius):
     else:
         draw_first = np.asarray(local["first"], dtype=np.int32)
         draw_second = np.asarray(local["second"], dtype=np.int32)
+        draw_pair_v0 = np.asarray(local.get("pair_v0", ()), dtype=np.int32).reshape(-1)
+        draw_pair_v1 = np.asarray(local.get("pair_v1", ()), dtype=np.int32).reshape(-1)
+        draw_world_vertices = np.asarray(
+            geometry.get("world_vertices", ()), dtype=np.float64
+        ).reshape((-1, 3))
         draw_selected = np.isin(analysis_ids, preview_local_ids)
         pair_edge_indices = local.get("pair_edge_indices")
         draw_outside = np.where(
@@ -10845,28 +21779,56 @@ def _fill_preview_make_result(state, radius):
         if len(pair_edge_indices) != len(draw_first):
             pair_edge_indices = np.full(len(draw_first), -1, dtype=np.int32)
     boundary = draw_selected[draw_first] != draw_selected[draw_second]
-    shape_boundary_mask = _fill_preview_shape_boundary_mask(
-        boundary, draw_outside_distances, radius, pair_edge_indices
+    boundary_topology_metrics = _fill_preview_boundary_topology_metrics(
+        mesh, pair_edge_indices, boundary, draw_pair_v0, draw_pair_v1
     )
+    if shadow_mode:
+        # In ordinary E, orange is exclusively a sampled shadow crossing;
+        # every other radius crossing remains cyan/distance-only.
+        shape_boundary_mask = np.zeros(len(boundary), dtype=bool)
+        if shadow_metrics.get("shadow_capture_ok"):
+            luminance_region_edges = state.get(
+                "shadow_luminance_region_edges", set()
+            )
+            luminance_edge_cache = state.get("shadow_luminance_edge_cache")
+            for edge in np.flatnonzero(boundary):
+                key = _fill_preview_shadow_edge_key(local, int(edge))
+                entry = (
+                    luminance_edge_cache.get("edges", {}).get(key, {})
+                    if isinstance(luminance_edge_cache, dict)
+                    else {}
+                )
+                if key in luminance_region_edges or (
+                    int(entry.get("tested", 0))
+                    and bool(entry.get("barrier", False))
+                ):
+                    shape_boundary_mask[int(edge)] = True
+    else:
+        shape_boundary_mask = _fill_preview_shape_boundary_mask(
+            boundary, draw_outside_distances, radius, pair_edge_indices
+        )
     for edge in np.flatnonzero(boundary):
         edge_index = -1
-        if int(pair_edge_indices[edge]) >= 0:
-            edge_index = int(pair_edge_indices[edge])
-            edge_vertices = tuple(int(value) for value in mesh.edges[edge_index].vertices)
-            matrix = state["obj"].matrix_world
-            segment = tuple(
-                tuple(float(value) for value in (matrix @ mesh.vertices[vertex].co))
-                for vertex in edge_vertices
-            )
-        else:
-            if draw_full_geometry:
-                continue
-            v0 = int(local["pair_v0"][edge])
-            v1 = int(local["pair_v1"][edge])
-            segment = (
-                tuple(float(value) for value in geometry["world_vertices"][v0]),
-                tuple(float(value) for value in geometry["world_vertices"][v1]),
-            )
+        # pair_v0/pair_v1 are generated together with the face pair and
+        # world_vertices.  They remain valid when cursor expansion replaces
+        # the compact graph, while pair_edge_indices can refer to an older
+        # mesh-edge ordering.  Use the physical endpoint arrays for every
+        # preview segment; never draw from an unvalidated mesh edge hint.
+        if (
+            edge >= len(draw_pair_v0)
+            or edge >= len(draw_pair_v1)
+            or int(draw_pair_v0[edge]) < 0
+            or int(draw_pair_v1[edge]) < 0
+            or int(draw_pair_v0[edge]) >= len(draw_world_vertices)
+            or int(draw_pair_v1[edge]) >= len(draw_world_vertices)
+        ):
+            continue
+        v0 = int(draw_pair_v0[edge])
+        v1 = int(draw_pair_v1[edge])
+        segment = (
+            tuple(float(value) for value in draw_world_vertices[v0]),
+            tuple(float(value) for value in draw_world_vertices[v1]),
+        )
         shape_boundary = bool(shape_boundary_mask[edge])
         geometry_face_a = int(
             draw_first[edge]
@@ -10893,20 +21855,37 @@ def _fill_preview_make_result(state, radius):
             }
         )
         (shape_segments if shape_boundary else distance_segments).append(segment)
-    patch_edge_reached = bool(
+    patch_edge_reached = False if screen_mode else bool(
         len(patch_ids)
         and np.any(distances[patch_ids] >= patch_radius - max(patch_radius * 0.01, 1.e-8))
     )
     confirm_snapshot, confirm_domain_ids = _fill_preview_confirm_graph_snapshot(
         geometry, distances, radius
     )
+    if len(cached_local_ids):
+        # Confirmation must retain the same stable cache floor as drawing;
+        # the current radius domain alone is allowed to be smaller.
+        confirm_domain_ids = np.unique(
+            np.r_[confirm_domain_ids, cached_local_ids]
+        ).astype(np.int32, copy=False)
     if confirm_snapshot is None or len(confirm_domain_ids) == 0:
         raise RuntimeError("preview confirmation graph is unavailable")
     elapsed = time.perf_counter() - started
+    if isinstance(progressive_step, dict):
+        newly_processed = int(progressive_step.get("newly_processed_faces", 0))
+        reused_faces = int(progressive_step.get("reused_faces", 0))
+    else:
+        newly_processed = 0
+        reused_faces = int(len(patch_ids))
+    shadow_metrics["progressive_range_newly_processed_faces"] = int(
+        newly_processed
+    )
+    shadow_metrics["progressive_range_reused_faces"] = int(reused_faces)
+    shadow_metrics["progressive_range_wheel_compute_seconds"] = float(elapsed)
     proxy_metrics_for_result = dict(proxy_metrics)
     proxy_metrics_for_result.pop("proxy_candidate_ids", None)
     proxy_metrics_for_result.pop("proxy_valley_merge_ids", None)
-    proxy_metrics_for_result.pop("proxy_valley_merge_evidence", None)
+    proxy_metrics_for_result.pop("proxy_valley_components", None)
     return {
         "radius": float(radius),
         "faces": preview_faces,
@@ -10926,7 +21905,15 @@ def _fill_preview_make_result(state, radius):
         "geometry": local,
         "partition": partition,
         "created_generation": int(state["generation"]),
-        **compact_external_metrics,
+        "valley_fine_reason": valley_fine_reason,
+        **enclosed_component_metrics,
+        **sandwiched_band_metrics,
+        **shadow_metrics,
+        **shape_refine_metrics,
+        **bootstrap_metrics,
+        **monotonic_metrics,
+        **face_set_metrics,
+        **boundary_topology_metrics,
         **proxy_metrics_for_result,
     }
 
@@ -10965,44 +21952,75 @@ def _fill_preview_build_draw_batches(state, result):
         result["gpu_batches"] = batches
 
 
+def _fill_preview_record_confirm_metrics(result, metrics):
+    """Persist confirmation diagnostics after modal state is cleared."""
+    global _fill_preview_last_confirm_metrics
+    payload = dict(metrics)
+    _fill_preview_last_confirm_metrics = payload
+    if isinstance(result, dict):
+        result["confirm_metrics"] = dict(payload)
+        result["confirm_reason"] = str(payload.get("reason", "unknown"))
+    return payload
+
+
 def _fill_preview_confirm_flood(state, result):
     """Resolve one generation's boundary snapshot into mesh-global faces.
 
     Confirmation uses the compact graph captured by the ready result, never
-    the provisional ``result['faces']`` array.  The current mesh visibility is
-    checked against the same generation before the flood; any mismatch aborts
-    without a partial attribute write.
+    the provisional ``result['faces']`` array.  Hidden faces are hard barriers
+    in the recorded domain.  Visibility changes outside that domain do not
+    invalidate an otherwise visible seed component.
     """
     import numpy as np
 
+    metrics = {
+        "reason": "started",
+        "visible_domain_count": 0,
+        "hidden_excluded_count": 0,
+        "outside_domain_visibility_change_ignored": 0,
+        "reached_visible_count": 0,
+    }
+
+    def fail(reason, **updates):
+        metrics["reason"] = str(reason)
+        metrics.update(updates)
+        _fill_preview_record_confirm_metrics(result, metrics)
+        return None
+
     geometry = result.get("confirm_geometry")
-    if geometry is None or result.get("confirm_signature") != state.get("signature"):
-        return None
-    count = int(geometry.get("count", 0))
+    if geometry is None:
+        return fail("missing-confirm-geometry")
+    if result.get("confirm_signature") != state.get("signature"):
+        return fail("confirm-signature-mismatch")
+    try:
+        count = int(geometry.get("count", 0))
+    except (AttributeError, TypeError, ValueError):
+        return fail("schema-count")
     if count <= 0:
-        return None
+        return fail("domain-empty")
     face_ids = geometry.get("face_ids")
     if face_ids is None:
         face_ids = np.arange(count, dtype=np.int32)
     else:
-        face_ids = np.asarray(face_ids, dtype=np.int32).reshape(-1)
+        try:
+            face_ids = np.asarray(face_ids, dtype=np.int32).reshape(-1)
+        except (TypeError, ValueError):
+            return fail("schema-face-ids")
     if len(face_ids) != count:
-        return None
+        return fail("schema-face-ids")
     try:
         mesh = state["obj"].data
         current_hidden = np.empty(len(mesh.polygons), dtype=bool)
         mesh.polygons.foreach_get("hide", current_hidden)
     except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
-        return None
+        return fail("visibility-read-error")
     snapshot_hidden = np.asarray(
         geometry.get("hidden", np.zeros(count, dtype=bool)), dtype=bool
     ).reshape(-1)
     if len(snapshot_hidden) != count:
-        return None
+        return fail("schema-hidden")
     if np.any(face_ids < 0) or np.any(face_ids >= len(current_hidden)):
-        return None
-    if not np.array_equal(current_hidden[face_ids], snapshot_hidden):
-        return None
+        return fail("schema-face-id-range")
 
     domain_ids = np.asarray(
         result.get("confirm_domain_ids", ()), dtype=np.int32
@@ -11010,16 +22028,46 @@ def _fill_preview_confirm_flood(state, result):
     domain = np.zeros(count, dtype=bool)
     domain_ids = domain_ids[(domain_ids >= 0) & (domain_ids < count)]
     domain[domain_ids] = True
+    current_hidden_local = current_hidden[face_ids]
+    changed_hidden = current_hidden_local != snapshot_hidden
+    metrics["outside_domain_visibility_change_ignored"] = int(
+        np.count_nonzero(changed_hidden & ~domain)
+    )
+    hidden_in_domain = domain & (snapshot_hidden | current_hidden_local)
+    visible_domain = domain & ~snapshot_hidden & ~current_hidden_local
+    metrics["hidden_excluded_count"] = int(np.count_nonzero(hidden_in_domain))
+    metrics["visible_domain_count"] = int(np.count_nonzero(visible_domain))
     seed = int(result.get("confirm_seed_local", -1))
-    if seed < 0 or seed >= count or not domain[seed] or snapshot_hidden[seed]:
-        return None
+    if seed < 0 or seed >= count:
+        return fail("seed-invalid")
+    if snapshot_hidden[seed] or current_hidden_local[seed]:
+        return fail("seed-hidden")
+    if not domain[seed] or not visible_domain[seed]:
+        return fail("seed-outside-visible-domain")
+    # A face that was part of the confirmation domain but became hidden is a
+    # stale generation, not a reason to traverse through the hidden face.
+    # Abort before any write; hidden changes outside this local domain remain
+    # irrelevant to the candidate.
+    if np.any(domain & snapshot_hidden):
+        return fail(
+            "domain-snapshot-hidden",
+            domain_hidden_count=int(np.count_nonzero(domain & snapshot_hidden)),
+        )
+    if np.any(domain & current_hidden_local):
+        return fail(
+            "domain-hidden-changed",
+            domain_hidden_count=int(np.count_nonzero(domain & current_hidden_local)),
+        )
+    if not np.any(visible_domain):
+        return fail("domain-empty")
+
     boundary_pairs = set()
     for record in result.get("boundary_records", ()):
         try:
             first = int(record["geometry_face_a"])
             second = int(record["geometry_face_b"])
         except (KeyError, TypeError, ValueError):
-            return None
+            return fail("boundary-schema")
         if (
             first < 0
             or second < 0
@@ -11027,13 +22075,13 @@ def _fill_preview_confirm_flood(state, result):
             or second >= count
             or first == second
         ):
-            return None
+            return fail("boundary-face-range")
         boundary_pairs.add((min(first, second), max(first, second)))
 
     offsets = np.asarray(geometry.get("offsets"), dtype=np.int64)
     neighbors = np.asarray(geometry.get("neighbors"), dtype=np.int32)
     if len(offsets) != count + 1 or len(neighbors) != int(offsets[-1]):
-        return None
+        return fail("confirm-graph-schema")
     reached = np.zeros(count, dtype=bool)
     reached[seed] = True
     pending = [seed]
@@ -11042,14 +22090,17 @@ def _fill_preview_confirm_flood(state, result):
         start, end = int(offsets[face]), int(offsets[face + 1])
         for neighbor in neighbors[start:end]:
             neighbor = int(neighbor)
-            if neighbor < 0 or neighbor >= count or not domain[neighbor]:
+            if neighbor < 0 or neighbor >= count or not visible_domain[neighbor]:
                 continue
             if (min(face, neighbor), max(face, neighbor)) in boundary_pairs:
                 continue
             if not reached[neighbor]:
                 reached[neighbor] = True
                 pending.append(neighbor)
-    return face_ids[np.flatnonzero(reached)].astype(np.int32, copy=False)
+    reached_ids = face_ids[np.flatnonzero(reached)].astype(np.int32, copy=False)
+    metrics.update({"reason": "ok", "reached_visible_count": int(len(reached_ids))})
+    _fill_preview_record_confirm_metrics(result, metrics)
+    return reached_ids
 
 
 def _fill_preview_confirm_graph_snapshot(geometry, distances, radius):
@@ -11119,21 +22170,175 @@ def _fill_preview_draw_text(state, result):
                 "E again/Enter apply when ready; Esc cancel",
             ]
         else:
-            edge = "shape boundary" if result.get("shape_segments") else "distance boundary"
+            screen_roi = bool(result.get("shadow_screen_classifier_mode"))
+            edge = (
+                "screen luminance boundary"
+                if screen_roi
+                else ("shape boundary" if result.get("shape_segments") else "distance boundary")
+            )
             if result.get("patch_edge_reached"):
                 edge += " / analysis limit"
-            lines = [
-                "Smart Fill Preview",
-                f"Distance {float(result['radius']):.4g} m  Boundary edges {int(result.get('boundary_edge_count', 0))}",
-                f"Ready - {edge}  Prep {float(state.get('prepare_seconds', 0.0)):.2f}s",
-                "E again: apply   Enter: apply   Esc: cancel",
-            ]
+            if screen_roi:
+                roi_radius = int(result.get("shadow_screen_roi_radius", state.get("shadow_screen_roi_radius", 320)))
+                roi_bounds = result.get("shadow_screen_roi_bounds", (0, 0, 0, 0))
+                try:
+                    roi_w = max(0, int(roi_bounds[2]) - int(roi_bounds[0]))
+                    roi_h = max(0, int(roi_bounds[3]) - int(roi_bounds[1]))
+                except (TypeError, ValueError, IndexError):
+                    roi_w = int(result.get("shadow_screen_width", 0))
+                    roi_h = int(result.get("shadow_screen_height", 0))
+                lines = [
+                    "Smart Fill Preview - screen morphology",
+                    f"ROI r{roi_radius}px ({roi_w}x{roi_h})  Boundary edges {int(result.get('boundary_edge_count', 0))}",
+                    f"Field {'sharpened' if result.get('shadow_screen_sharpened_field_used') else 'raw'}  Analysis restored {'yes' if result.get('analysis_profile_restored_before_ready') else 'manual/unknown'}",
+                    f"Ready - {edge}  Prep {float(state.get('prepare_seconds', 0.0)):.2f}s",
+                    "E again: apply   Enter: apply   Esc: cancel",
+                ]
+            else:
+                lines = [
+                    (
+                        "Smart Fill Preview - progressive range"
+                        if result.get("progressive_range_mode")
+                        else "Smart Fill Preview"
+                    ),
+                    f"Distance {float(result['radius']):.4g} m  Boundary edges {int(result.get('boundary_edge_count', 0))}",
+                    (
+                        f"New {int(result.get('progressive_range_newly_processed_faces', 0))} "
+                        f"/ reused {int(result.get('progressive_range_reused_faces', 0))} "
+                        f"({'cache' if result.get('progressive_range_cache_hit') else 'frontier'})"
+                        if result.get("progressive_range_mode")
+                        else ""
+                    ),
+                    f"Ready - {edge}  Prep {float(state.get('prepare_seconds', 0.0)):.2f}s",
+                    "E again: apply   Enter: apply   Esc: cancel",
+                ]
         for index, line in enumerate(lines):
             blf.position(font_id, x, y - index * 18, 0)
             blf.color(font_id, 0.92, 0.96, 1.0, 1.0)
             blf.draw(font_id, line)
     except (AttributeError, RuntimeError, TypeError, ValueError):
         pass
+
+
+def _fill_preview_build_shadow_field_overlay(state, result):
+    """Build a bounded face-tone view of the sharpened ROI field.
+
+    A native 2D image shader would require version-specific texture upload
+    state.  The experimental overlay therefore uses one center point per
+    reduced ROI cell, colored from the exact sharpened luminance buffer that
+    drives the classifier.  It is an explicitly center-sample view, not a
+    polygon-coverage claim, and is rebuilt only when the immutable capture
+    generation/buffer changes.
+    """
+    import numpy as np
+
+    if bool(state.get("strict_mode", False)):
+        return False
+    buffers = state.get("shadow_screen_buffers")
+    geometry = result.get("geometry") if isinstance(result, dict) else None
+    if not isinstance(buffers, dict) or not isinstance(geometry, dict):
+        return False
+    cache_key = (state.get("shadow_capture_generation"), buffers.get("key"))
+    if (
+        state.get("shadow_screen_overlay_batches") is not None
+        and state.get("shadow_screen_overlay_cache_key") == cache_key
+    ):
+        if isinstance(result, dict):
+            result["shadow_screen_sharpened_overlay_active"] = True
+            result["shadow_screen_sharpened_overlay_alpha"] = float(
+                state.get("shadow_screen_overlay_alpha", 0.30)
+            )
+            result["shadow_screen_sharpened_overlay_mode"] = "center-sample-face-tone"
+        return True
+    shader = _fill_preview_shader_get()
+    if shader is None:
+        return False
+    try:
+        center_inside = np.asarray(buffers.get("center_inside"), dtype=bool).reshape(-1)
+        center_x = np.asarray(buffers.get("center_x"), dtype=np.int64).reshape(-1)
+        center_y = np.asarray(buffers.get("center_y"), dtype=np.int64).reshape(-1)
+        field = np.asarray(buffers.get("denoised"), dtype=np.float32)
+        centers = np.asarray(geometry.get("centers"), dtype=np.float64)
+        if (
+            field.ndim != 2
+            or centers.ndim != 2
+            or centers.shape[1] != 3
+            or len(center_inside) != len(centers)
+            or len(center_x) != len(centers)
+            or len(center_y) != len(centers)
+        ):
+            return False
+        height, width = field.shape
+        valid = center_inside.copy()
+        valid &= center_x >= 0
+        valid &= center_x < width
+        valid &= center_y >= 0
+        valid &= center_y < height
+        ids = np.flatnonzero(valid)
+        if not len(ids):
+            return False
+        # One deterministic center per reduced cell keeps the overlay bounded
+        # on dense meshes while the classifier still evaluates every center.
+        flat = center_y[ids] * width + center_x[ids]
+        _, first_index = np.unique(flat, return_index=True)
+        ids = ids[np.sort(first_index)]
+        values = field[center_y[ids], center_x[ids]].astype(np.float64, copy=False)
+        finite = np.isfinite(values)
+        ids, values = ids[finite], values[finite]
+        if not len(ids):
+            return False
+        vmin, vmax = float(np.min(values)), float(np.max(values))
+        span = max(vmax - vmin, 1.0e-6)
+        bins = np.clip(((values - vmin) / span * 8.0).astype(np.int32), 0, 7)
+        batches = []
+        for index in range(8):
+            selected = ids[bins == index]
+            if not len(selected):
+                continue
+            batches.append(
+                (
+                    float(vmin + (index + 0.5) * span / 8.0),
+                    batch_for_shader(shader, "POINTS", {"pos": centers[selected].astype(np.float32, copy=False)}),
+                )
+            )
+        if not batches:
+            return False
+        state["shadow_screen_overlay_batches"] = tuple(batches)
+        state["shadow_screen_overlay_cache_key"] = cache_key
+        if isinstance(result, dict):
+            result["shadow_screen_sharpened_overlay_active"] = True
+            result["shadow_screen_sharpened_overlay_alpha"] = float(
+                state.get("shadow_screen_overlay_alpha", 0.30)
+            )
+            result["shadow_screen_sharpened_overlay_mode"] = "center-sample-face-tone"
+        return True
+    except (AttributeError, IndexError, MemoryError, RuntimeError, TypeError, ValueError):
+        state["shadow_screen_overlay_batches"] = None
+        state["shadow_screen_overlay_cache_key"] = None
+        return False
+
+
+def _fill_preview_draw_shadow_field_overlay(state, result, shader):
+    """Draw the sharpened center-sample field beneath orange/cyan lines."""
+    if not isinstance(state, dict) or bool(state.get("strict_mode", False)):
+        return False
+    if not _fill_preview_build_shadow_field_overlay(state, result):
+        return False
+    batches = state.get("shadow_screen_overlay_batches") or ()
+    try:
+        gpu.state.point_size_set(
+            max(2.0, min(9.0, 0.75 * float(
+                (state.get("shadow_screen_buffers") or {}).get("downsample_factor", 2)
+            )))
+        )
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        pass
+    alpha = float(state.get("shadow_screen_overlay_alpha", 0.30))
+    for value, batch in batches:
+        shader.bind()
+        shader.uniform_float("color", (float(value), float(value), float(value), alpha))
+        batch.draw(shader)
+    return True
 
 
 def _fill_preview_draw():
@@ -11177,6 +22382,11 @@ def _fill_preview_draw():
                     depth_mask = True
                 except (AttributeError, RuntimeError, TypeError, ValueError):
                     pass
+                # The processed field is capture-time diagnostic only.  Once
+                # a candidate is ready, restore the user's normal viewport
+                # and draw only the orange/cyan interface; keeping the tone
+                # overlay here would hide the user's Face Set colors and
+                # make the preview differ from the editable scene.
                 if len(result["triangles_np"]):
                     shader.bind()
                     shader.uniform_float("color", (0.16, 0.72, 0.96, 0.20))
@@ -11207,6 +22417,10 @@ def _fill_preview_draw():
                         pass
                 try:
                     gpu.state.line_width_set(1.0)
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    pass
+                try:
+                    gpu.state.point_size_set(1.0)
                 except (AttributeError, RuntimeError, TypeError, ValueError):
                     pass
                 gpu.state.blend_set("NONE")
@@ -11265,6 +22479,35 @@ def _fill_preview_cancel(state=None, reason="cancel"):
         except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
             pass
     current["timer"] = None
+    # The normal-E visible analysis profile is purely transient.  Restore it
+    # before removing draw handlers on every exit path (confirm, Esc, stale,
+    # replacement, load/unregister, and modal exceptions).  The helper is
+    # idempotent so repeated cancellation is safe.
+    visible_profile = current.get("visible_analysis_profile")
+    if visible_profile is not None and not current.get(
+        "visible_analysis_profile_manual", False
+    ):
+        try:
+            _fill_preview_restore_visible_analysis_profile(visible_profile)
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            visible_profile["restore_verified"] = False
+        result = current.get("result")
+        if isinstance(result, dict):
+            result["visible_analysis_profile_active"] = bool(
+                visible_profile.get("active", False)
+            )
+            result["visible_analysis_profile_restore_verified"] = bool(
+                visible_profile.get("restore_verified", False)
+            )
+            result["visible_analysis_profile_reason"] = str(
+                visible_profile.get("reason", "restored")
+            )
+    result = current.get("result")
+    if isinstance(result, dict) and result.get("shadow_screen_classifier_mode"):
+        result["shadow_screen_sharpened_overlay_active"] = False
+        result["shadow_screen_sharpened_overlay_restored"] = True
+    current["shadow_screen_overlay_batches"] = None
+    current["shadow_screen_overlay_cache_key"] = None
     _fill_preview_stop_draw()
     _fill_preview_state = None
     _fill_preview_tag_redraw(current)
@@ -11492,6 +22735,7 @@ def _fill_geometry(obj):
                   centers=centers, normals=normals, scale=scale,
                   neighbors=destinations[order], neighbor_lengths=np.r_[distance, distance][order],
                   contour_cost=np.r_[contour_cost, contour_cost][order],
+                  physical_degree=degree.astype(np.int32, copy=False),
                   hidden=hidden, contrast=contrast, concavity=concavity,
                   crease=crease, directional_valley=directional_valley,
                   count=count, seam_count=seam_count, partitions={})
@@ -11732,6 +22976,7 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
 
     def invoke(self, context, event):
         global _fill_preview_state, _fill_preview_draw_handler, _fill_preview_text_draw_handler
+        import numpy as np
         if not self.poll(context):
             return {"PASS_THROUGH"}
         if _tube_preview_state is not None and _tube_preview_state.get("active"):
@@ -11757,6 +23002,26 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
         if _fill_preview_state is not None:
             _fill_preview_cancel(_fill_preview_state, "replaced")
         obj, seed_face, seed_face_set, _location, _screen = hit
+        try:
+            seed_screen = (float(_screen.x), float(_screen.y))
+        except (AttributeError, TypeError, ValueError):
+            seed_screen = (float(self.mouse_region_x), float(self.mouse_region_y))
+        manual_profile_key = _fill_preview_shadow_view_key(context)
+        manual_profile = (
+            _shadow_analysis_view_tokens.get(manual_profile_key)
+            if manual_profile_key
+            else None
+        )
+        if not isinstance(manual_profile, dict) or not manual_profile.get("active"):
+            manual_profile = None
+        # Ordinary E is intentionally the fast progressive geometry-range
+        # path.  It must not capture the viewport, allocate an ROI, or invoke
+        # the screen morphology/sharpening helpers.  A manually-owned
+        # Shift+Alt+E view is independent and is left untouched throughout
+        # the modal session.  Ctrl+E keeps the same geometry path with its
+        # strict boundary policy.
+        temporary_profile = None
+        shadow_capture = None
         signature = _fill_preview_signature(obj)
         if signature is None:
             return {"CANCELLED"}
@@ -11777,9 +23042,22 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
             "mode": str(context.mode),
             "seed_face": int(seed_face),
             "seed_face_set": int(seed_face_set),
+            "seed_screen": seed_screen,
+            # Screen ROI/capture is dormant on the active progressive path.
+            "shadow_screen_roi_radius": 0,
             "strict_mode": bool(self.strict_mode),
-            "cursor_prepare": True,
-            "cursor_local": True,
+            "shadow_capture": shadow_capture,
+            "shadow_capture_generation": int(time.time_ns()),
+            "visible_analysis_profile": None,
+            "visible_analysis_profile_manual": bool(
+                manual_profile is not None and not bool(self.strict_mode)
+            ),
+            # Strict mode keeps the compact cursor preparation used by the
+            # established path.  Normal E prepares the reusable full graph
+            # once, then limits actual work to its small Dijkstra range; this
+            # keeps the edge index stable so expansions remain incremental.
+            "cursor_prepare": bool(self.strict_mode),
+            "cursor_local": bool(self.strict_mode),
             "seed_local": None,
             "start_key": str(getattr(event, "type", "E") or "E"),
             "start_key_released": False,
@@ -11792,6 +23070,22 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
             "distance_state": None,
             "initial_radius": None,
             "desired_radius": None,
+            # Kept for compatibility with older in-memory sessions.  Normal
+            # E no longer uses screen/luminance stages; wheel state is the
+            # physical progressive range below.
+            "luminance_step": 0,
+            "shadow_luminance_initial_ids": np.empty(0, dtype=np.int32),
+            "shadow_luminance_previous_ids": np.empty(0, dtype=np.int32),
+            "shadow_luminance_previous_step": 0,
+            "shadow_screen_initial_ids": np.empty(0, dtype=np.int32),
+            "shadow_screen_previous_ids": np.empty(0, dtype=np.int32),
+            "shadow_screen_previous_step": 0,
+            "shadow_screen_classifier_cache": None,
+            "shadow_screen_buffers": None,
+            "shadow_screen_overlay_batches": None,
+            "shadow_screen_overlay_cache_key": None,
+            "shadow_screen_overlay_alpha": 0.30,
+            "cancel_requested": False,
             "processed_radius": None,
             "pending": True,
             "wheel_armed": False,
@@ -11801,6 +23095,11 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
             "wheel_drain_until": 0.0,
             "result": None,
             "results": {},
+            # Stable mesh polygon ids accepted by the initial Face Set prior;
+            # subsequent wheel stages project this cache into their current
+            # cursor-local geometry and union it as an immutable floor.
+            "initial_accepted_ids": np.empty(0, dtype=np.int32),
+            "initial_base_count": 0,
             "generation": 0,
             "prepare_seconds": 0.0,
             "last_tick_seconds": 0.0,
@@ -11808,6 +23107,12 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
             "timer": None,
             "last_timer_dispatch": 0.0,
         }
+        if not bool(self.strict_mode):
+            # A manual analysis-view owner remains visible by design.  There
+            # is no automatic profile in progressive-range mode, so a normal
+            # viewport is already restored before the preview becomes ready.
+            state["visible_analysis_profile"] = manual_profile
+            state["analysis_profile_restored_before_ready"] = False
         _fill_preview_state = state
         shader = _fill_preview_shader_get()
         if shader is None:
@@ -11937,8 +23242,16 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
                 radius = float(state["desired_radius"])
                 state["result"] = None
                 state["generation"] += 1
-                key = round(radius, 10)
+                # Both normal E and Ctrl+E use the incremental physical-range
+                # cache.  Re-visiting a smaller radius is a pure cache lookup;
+                # growing the range extends the retained Dijkstra frontier.
+                key = (
+                    "progressive-range"
+                    if not bool(state.get("strict_mode", False))
+                    else "geometry-strict"
+                ), round(radius, 10)
                 cached = state["results"].get(key)
+                state["active_result_cache_hit"] = cached is not None
                 if cached is None:
                     cached = _fill_preview_make_result(state, radius)
                     state["results"][key] = cached
@@ -11949,8 +23262,15 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
                     # preserves the current radius and its two predecessors.
                     state["results"].pop(key, None)
                     state["results"][key] = cached
+                # Cache bookkeeping is per dispatch, not part of the
+                # immutable geometry result.  Publish a shallow copy so the
+                # diagnostics can distinguish a reused wheel stage without
+                # changing the cached candidate itself.
+                cached = dict(cached)
+                cached["progressive_range_cache_hit"] = bool(
+                    state.get("active_result_cache_hit", False)
+                )
                 if int(cached.get("created_generation", -1)) != int(state["generation"]):
-                    cached = dict(cached)
                     cached["created_generation"] = int(state["generation"])
                 state["last_tick_seconds"] = float(cached.get("compute_seconds", 0.0))
                 state["max_tick_seconds"] = max(
@@ -12043,6 +23363,7 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
         event_type = getattr(event, "type", "")
         event_value = getattr(event, "value", None)
         if event_type == "ESC" and event_value in {None, "PRESS"}:
+            state["cancel_requested"] = True
             _fill_preview_cancel(state, "escape")
             return {"CANCELLED"}
         if event_type == state.get("start_key", "E"):
@@ -12082,6 +23403,9 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
                     )
                 return {"RUNNING_MODAL"}
             factor = 1.25 if event.type == "WHEELUPMOUSE" else 1.0 / 1.25
+            # Normal E expands and shrinks the same physical range as strict
+            # mode.  The geometry resolver itself remains less strict for the
+            # normal path; no luminance threshold or screen cache is involved.
             base = float(state["desired_radius"] or state["initial_radius"])
             state["desired_radius"] = max(
                 float(state["initial_radius"]) * 0.125,
@@ -12270,6 +23594,36 @@ class VIEW3D_PT_mesh_focus_topology_colors(bpy.types.Panel):
         clear_operator.color_index = 0
 
 
+class VIEW3D_PT_mesh_focus_local_feature_brush(bpy.types.Panel):
+    """Sculpt N-panel entry and compact controls for Local Feature Brush."""
+
+    bl_idname = "VIEW3D_PT_mesh_focus_local_feature_brush"
+    bl_label = "Local Feature Brush"
+    bl_category = TOPOLOGY_COLOR_PANEL_CATEGORY
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+
+    @classmethod
+    def poll(cls, context):
+        obj = getattr(context, "active_object", None)
+        return (
+            getattr(context, "mode", None) == "SCULPT"
+            and obj is not None
+            and obj.type == "MESH"
+        )
+
+    def draw(self, context):
+        layout = self.layout
+        prefs = _addon_preferences()
+        if prefs is not None:
+            layout.prop(prefs, "local_feature_strength")
+            layout.prop(prefs, "local_feature_scale")
+            layout.prop(prefs, "local_feature_radius")
+        layout.separator()
+        layout.label(text="Select the MFO brush from the Sculpt Asset Shelf")
+        layout.label(text="LMB applies; Shift+LMB is native Smooth")
+
+
 def _remove_keymaps():
     for keymap, keymap_item in _addon_keymaps:
         try:
@@ -12290,7 +23644,9 @@ def _remove_keymaps():
             FACE_SET_ACTIVATION_OPERATOR_ID,
             LOCAL_FACE_SET_GROW_OPERATOR_ID,
             TUBE_SHAPE_OPERATOR_ID,
+            LOCAL_FEATURE_BRUSH_OPERATOR_ID,
             TOPOLOGY_COLOR_ASSIGN_OPERATOR_ID,
+            "view3d.mesh_focus_shadow_analysis_toggle",
         }
         for keymap in keyconfig.keymaps:
             for keymap_item in list(keymap.keymap_items):
@@ -12360,6 +23716,17 @@ def _rebuild_keymaps():
         strict_grow_item.properties.strict_mode = True
         _addon_keymaps.append((keymap, strict_grow_item))
 
+        shadow_analysis_item = keymap.keymap_items.new(
+            "view3d.mesh_focus_shadow_analysis_toggle",
+            "E",
+            "PRESS",
+            any=False,
+            alt=True,
+            ctrl=False,
+            shift=True,
+        )
+        _addon_keymaps.append((keymap, shadow_analysis_item))
+
         tube_shape_item = keymap.keymap_items.new(
             TUBE_SHAPE_OPERATOR_ID,
             TUBE_SHAPE_KEY,
@@ -12369,6 +23736,28 @@ def _rebuild_keymaps():
             alt=True,
         )
         _addon_keymaps.append((keymap, tube_shape_item))
+
+        # The local feature brush is a normal Brush Asset selection.  Its
+        # dispatcher lives in the Sculpt keymap and is poll-gated by the
+        # stable asset marker, so ordinary assets and Shift Smooth fall back
+        # to Blender's native items without a resident modal selector.
+        sculpt_keymap = keyconfig.keymaps.new(
+            name="Sculpt",
+            space_type="EMPTY",
+            region_type="WINDOW",
+        )
+        local_feature_item = sculpt_keymap.keymap_items.new(
+            LOCAL_FEATURE_BRUSH_OPERATOR_ID,
+            "LEFTMOUSE",
+            "PRESS",
+            any=False,
+            shift=False,
+            ctrl=False,
+            alt=False,
+            head=True,
+        )
+        local_feature_item.active = True
+        _addon_keymaps.append((sculpt_keymap, local_feature_item))
 
         for color_index, key in enumerate(
             ("ONE", "TWO", "THREE", "FOUR", "FIVE", "SIX", "ZERO"),
@@ -12458,6 +23847,32 @@ class MESH_FOCUS_ORBIT_AddonPreferences(bpy.types.AddonPreferences):
         subtype="FACTOR",
         update=_preferences_changed,
     )
+    local_feature_strength: FloatProperty(
+        name="Local Feature Strength",
+        description="Maximum strength of the existing ridge/valley enhancement dab",
+        default=0.35,
+        min=0.0,
+        max=1.0,
+        precision=3,
+        subtype="FACTOR",
+    )
+    local_feature_scale: FloatProperty(
+        name="Target Feature Scale",
+        description="Low-pass scale for broad hair-bundle features",
+        default=0.35,
+        min=0.10,
+        max=1.0,
+        precision=2,
+        subtype="FACTOR",
+    )
+    local_feature_radius: FloatProperty(
+        name="Local Feature Radius",
+        description="Radius multiplier relative to the selected Sculpt brush",
+        default=1.0,
+        min=0.10,
+        max=4.0,
+        precision=2,
+    )
 
     def draw(self, context):
         layout = self.layout
@@ -12470,6 +23885,11 @@ class MESH_FOCUS_ORBIT_AddonPreferences(bpy.types.AddonPreferences):
         layout.prop(self, "retopoflow_target_island_filter")
         layout.prop(self, "topology_colors_enabled")
         layout.prop(self, "topology_color_opacity")
+        layout.separator()
+        layout.label(text="Local Feature Brush (Sculpt only)")
+        layout.prop(self, "local_feature_strength")
+        layout.prop(self, "local_feature_scale")
+        layout.prop(self, "local_feature_radius")
         layout.prop(self, "double_tap_window")
         layout.separator()
         layout.label(text="Double-tap the activation key in a 3D Viewport.")
@@ -12483,9 +23903,13 @@ CLASSES = (
     VIEW3D_OT_mesh_focus_orbit_watcher,
     VIEW3D_OT_mesh_focus_face_set_activate,
     VIEW3D_OT_mesh_focus_orbit,
+    VIEW3D_OT_mesh_focus_shadow_analysis_toggle,
     VIEW3D_OT_mesh_focus_local_face_set_grow,
     VIEW3D_OT_mesh_focus_tube_shape,
+    VIEW3D_OT_mesh_focus_local_feature_brush,
+    VIEW3D_OT_mesh_focus_local_feature_brush_stroke,
     VIEW3D_OT_mesh_focus_topology_color_assign,
+    VIEW3D_PT_mesh_focus_local_feature_brush,
     VIEW3D_PT_mesh_focus_topology_colors,
     MESH_FOCUS_ORBIT_AddonPreferences,
 )
@@ -12534,14 +23958,26 @@ def register():
         bpy.app.handlers.depsgraph_update_post.append(_on_fill_preview_depsgraph_update)
     if _on_tube_preview_depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(_on_tube_preview_depsgraph_update)
+    if _on_local_feature_brush_depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(_on_local_feature_brush_depsgraph_update)
+    if _on_local_feature_brush_undo_post not in bpy.app.handlers.undo_post:
+        bpy.app.handlers.undo_post.append(_on_local_feature_brush_undo_post)
+    if _on_local_feature_brush_redo_post not in bpy.app.handlers.redo_post:
+        bpy.app.handlers.redo_post.append(_on_local_feature_brush_redo_post)
+    if _on_local_feature_brush_load_pre not in bpy.app.handlers.load_pre:
+        bpy.app.handlers.load_pre.append(_on_local_feature_brush_load_pre)
+    if _on_local_feature_brush_load_post not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_on_local_feature_brush_load_post)
     _rebuild_keymaps()
 
 
 def unregister():
     global _is_registered
+    _fill_preview_restore_manual_analysis_profiles()
     if not _is_registered:
         _fill_preview_cancel(reason="unregister")
         _tube_preview_cancel(reason="unregister")
+        _local_feature_cancel_all("unregister", restore=True)
         _cancel_undo_orphan_cleanup()
         _retopo_undo_tombstones.clear()
         _retopo_debug_sessions.clear()
@@ -12562,12 +23998,23 @@ def unregister():
             bpy.app.handlers.depsgraph_update_post.remove(_on_fill_preview_depsgraph_update)
         if _on_tube_preview_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
             bpy.app.handlers.depsgraph_update_post.remove(_on_tube_preview_depsgraph_update)
+        for _handler_list_name, _handler in (
+            ("depsgraph_update_post", _on_local_feature_brush_depsgraph_update),
+            ("undo_post", _on_local_feature_brush_undo_post),
+            ("redo_post", _on_local_feature_brush_redo_post),
+            ("load_pre", _on_local_feature_brush_load_pre),
+            ("load_post", _on_local_feature_brush_load_post),
+        ):
+            _handler_list = getattr(bpy.app.handlers, _handler_list_name)
+            if _handler in _handler_list:
+                _handler_list.remove(_handler)
         _restore_retopoflow_hooks()
         _stop_topology_color_draw()
         return
     _finish_all_states()
     _fill_preview_cancel(reason="unregister")
     _tube_preview_cancel(reason="unregister")
+    _local_feature_cancel_all("unregister", restore=True)
     _cancel_undo_orphan_cleanup()
     _cleanup_orphan_face_set_proxies()
     _retopo_undo_tombstones.clear()
@@ -12594,11 +24041,23 @@ def unregister():
         bpy.app.handlers.depsgraph_update_post.remove(_on_fill_preview_depsgraph_update)
     if _on_tube_preview_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(_on_tube_preview_depsgraph_update)
+    for _handler_list_name, _handler in (
+        ("depsgraph_update_post", _on_local_feature_brush_depsgraph_update),
+        ("undo_post", _on_local_feature_brush_undo_post),
+        ("redo_post", _on_local_feature_brush_redo_post),
+        ("load_pre", _on_local_feature_brush_load_pre),
+        ("load_post", _on_local_feature_brush_load_post),
+    ):
+        _handler_list = getattr(bpy.app.handlers, _handler_list_name)
+        if _handler in _handler_list:
+            _handler_list.remove(_handler)
     _stop_topology_color_draw()
     _remove_keymaps()
     _local_face_set_adjacency_cache.clear()
     _fill_preview_adjacency_cache.clear()
     _fill_preview_cursor_cache.clear()
+    _local_feature_brush_cache.clear()
+    _local_feature_brush_states.clear()
     _is_registered = False
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)
@@ -12730,14 +24189,29 @@ def _fill_preview_build_adjacency_cooperative(obj, prepared=None):
     source_edges = np.r_[np.arange(len(first)), np.arange(len(first))]
     edge_v0_directed = np.r_[edge_v0, edge_v0]
     edge_v1_directed = np.r_[edge_v1, edge_v1]
+    face_vertex_ids = tuple(
+        tuple(
+            int(value)
+            for value in loop_vertices[
+                int(face_starts[face]):int(face_starts[face]) + int(totals[face])
+            ]
+        )
+        for face in range(face_count)
+    )
     order = np.argsort(sources, kind="stable")
     yield "csr-before"
     degree = np.bincount(sources, minlength=face_count)
     offsets = np.r_[0, np.cumsum(degree)].astype(np.int64)
+    pair_edge_points = (
+        np.stack((world_vertices[edge_v0], world_vertices[edge_v1]), axis=1)
+        if len(edge_v0)
+        else np.empty((0, 2, 3), dtype=np.float64)
+    )
     yield "csr-after"
     cached = {
         "signature": signature,
         "count": int(face_count),
+        "face_edge_counts": totals.astype(np.int32, copy=False),
         "centers": centers,
         "normals": normals,
         "hidden": hidden,
@@ -12745,6 +24219,9 @@ def _fill_preview_build_adjacency_cooperative(obj, prepared=None):
         "offsets": offsets,
         "neighbors": destinations[order].astype(np.int32, copy=False),
         "neighbor_lengths": np.r_[distance, distance][order],
+        # Keep the directed-to-physical mapping so screen-boundary refinement
+        # can remain bounded even when the source mesh is very large.
+        "edge_indices": source_edges[order].astype(np.int32, copy=False),
         "edge_v0": edge_v0_directed[order].astype(np.int32, copy=False),
         "edge_v1": edge_v1_directed[order].astype(np.int32, copy=False),
         "first": first,
@@ -12752,7 +24229,11 @@ def _fill_preview_build_adjacency_cooperative(obj, prepared=None):
         "pair_lengths": distance,
         "pair_v0": edge_v0,
         "pair_v1": edge_v1,
+        "pair_edge_points": pair_edge_points,
+        "face_vertex_ids": face_vertex_ids,
+        "face_ids": np.arange(face_count, dtype=np.int32),
         "seam_count": seam_count,
+        "vertex_id_space": "mesh-global",
     }
     # Drop obsolete revisions for this mesh while retaining unrelated meshes.
     mesh_pointer = signature[1]

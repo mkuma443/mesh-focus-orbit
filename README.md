@@ -2,7 +2,7 @@
 
 Blender 5.2 用のリトポロジー支援アドオンです。
 
-現在のアドオンバージョン: **3.2.28**
+現在のアドオンバージョン: **3.3.0**
 
 主な機能:
 
@@ -10,6 +10,17 @@ Blender 5.2 用のリトポロジー支援アドオンです。
 - **Face Set MFO (FSMFO)**: 設定した Reference Object の対象 Face Set と、対応する Retopo island だけを一時表示する
 - **Smart Face Set Fill**: Sculpt Mode でカーソル直下の外周境界だけをプレビューし、E再押下またはEnterで外周内のseed接続面を Face Set 化する
 - Smart Face Set Fill の予測は境界 edge の線だけを描画する。確定時に世代固定したcompact graphの外周境界を越えず、seed接続面を一括で復元して書き込む
+- Smart Face Set Fill は、オレンジ形状境界の1〜2面リングだけで実エッジの追加/除去候補を同一スコア比較し、方向に依存せず明確な連続改善だけを採用する（シアン距離境界と保護境界は固定）
+- 境界補正の追加側は局所bounded Closing、除去側は補集合の局所bounded Openingとして扱い、シアン接触端の最小guardを除いた内部orange区間だけを評価する（全候補へのN-ring形態処理はしない）
+- `Ctrl + E` のgeometry-strict境界補正は物理edgeごとのnormal/crease/contrast/valley/radius信号を実距離近傍でgrayscale max/min filterし、局所median+MADのhysteresisで連続chainだけをproposal化する。分岐では接平面上の明確な直進ペアだけを接続し、曖昧な枝は区間分割する。シアン・hard・radius外では伝播せず、上下のseed方向に依存しない
+- 初期にcyanがなくorangeだけの候補は、geometry-onlyの初期baselineを壊さず、全ての安全なorange境界面をmulti-sourceとして通常geometry距離の1〜数metric shellだけlookaheadする。cyan前線が生じる場合だけ暫定bootstrapし、全高signal、hard/hidden/non-manifold/protected/別sheet、frontなしは変更しない
+- 初期範囲の決定時だけseedと同じFace Set IDの連結面内をgeodesic bonusで優先する。異なるIDは中立で、非連結同IDへのテレポートや初期範囲確定後のFace Set参照は行わない。初期geometry baselineを先に保持し、same-IDの追加分だけをunionする
+- 通常の `E` は画面キャプチャやROI・ピクセルモーフォロジーを行わず、seed周辺の小さな物理距離範囲をprogressive-rangeとして段階的に探索する。既存のface graph/Dijkstra frontierを初回だけ準備し、wheel拡張では新たに露出した外周だけを処理、縮小・再訪では既存距離と候補を再利用する。normal Eはgeometry boundaryを穏やかに扱い、`Ctrl + E` はgeometry-strictを維持する
+- 通常Eのwheelは物理半径を単調に増減する。各stageは`progressive-range`のradiusをキーにcacheされ、`newly_processed_faces`、`reused_faces`、cache hit、wheel計算時間をmetricsへ残す。全画面capture・screen morphology・Face Set色は通常Eの候補判定に使わない。描画境界はcompact sliceではなく準備済みfull physical graphとのaccepted/rejected interfaceから復元し、完全なorange/cyan boundaryを保持する
+- 初期範囲の決定時だけseedと同じFace Set IDの連結面内をgeodesic bonusで優先する。異なるIDは中立で、後段のwheel・境界補正ではFace Set IDを参照しない。normal Eは同じgeometry baselineを保ち、`Ctrl + E` のstrict判定を変更しない
+- `Shift + Alt + E` はSculpt Modeの現在View3Dだけで独立した専用analysis shader表示をON/OFFする。ON時はtoon_dark MATCAP、Face Setカラー（opacity 0.45）、mesh wire overlayを表示し、shading/overlayを完全snapshotする。OFF、load、unregisterで型互換プロパティを冪等復元する。通常Eは表示を変更せず、旧Alt+Eのkeymapは登録しない。`Ctrl + E` は表示を変更しない
+- 初期priorの安全判定はcompact analysis sliceの欠落隣接をphysical hardと誤認せず、full geometry由来のphysical degree/hidden/non-manifold metadataを用いる
+- 旧screen-space shadow/morphology実装は診断用コードとして残るが、3.3.0の通常E本番経路からは呼び出さない。これによりwheel応答では画面全体のcapture・pixel flood・shader切替を発生させない
 - **Topology Colors**: 編集中の選択面へ6色の半透明ガイドを割り当てる
 - **Curved Face Set Tube Shape**: Sculpt Mode で seed Face Set の edge-connected tube を自動判別し、曲がった中心線を保ったまま均一化または先細り補正する
 
@@ -34,6 +45,7 @@ Reference Object は、Face Set MFO が使うリトポロジー対象のハイ�
 | Smart Face Set Fill 厳格プレビュー | Sculpt Mode で `Ctrl + E`、開始Eのrelease後に `E` を再押下（または `Enter`）で確定、ホイールで距離変更、`Esc` で取消 |
 | Topology Colors | 編集モードで `Ctrl + Alt + 1..6`（`0`で解除） |
 | Curved Face Set Tube Shape | Sculpt Mode で `Ctrl + Alt + T`、ホイールで半径/先細り、`Shift + ホイール`で補正強度、`T`/左クリック/Enterで確定、`Esc`で取消 |
+| Local Feature Brush | Sculpt Mode の Asset Shelf から `MFO Local Feature Brush` を選択し、左ドラッグで既存の髪束スケールの山/谷だけを強調、ストローク中のホイールで半径、`Shift + ホイール`で強さ、`Esc`でストローク取消 |
 
 通常 MFO と FSMFO は別の KeyMap Item から直接起動します。FSMFO は外側の非 Undo Trigger を経由せず、Undo 対象の Activation Operator が直接起動し、その中から非 Undo Watcher を開始します。
 
@@ -113,7 +125,7 @@ Sculpt Mode でカーソルを Face Set 上へ置き、`E` を押すと局所プ
 - 固定した複数方向の Lambert 照度近似を使い、まず指定距離の局所 patch を取得してから谷の符号付き変化を検出する。実影や AO、画面の照明は使わず、谷barrierでseed側の元face成分を選び、その周囲を元の面で補正する。半径変更ごとに現在patchから再判定するため、有限長の谷端での正当な再加入を妨げない
 - 指定距離内の可視面graphで候補に囲まれた未選択成分だけを補完する。距離境界、欠落edge（crop/メッシュ境界、非多様体、hidden、未接続seam）へつながる成分や別sheetは補完しない
 - 現在半径の候補距離内にある有効な共有辺crossingはshape/領域境界（orange）として扱い、fine partition barrierの有無で距離境界（cyan）へ戻さない。距離外または未探索のcrossingは距離境界のままにする
-- 外周境界は現在のcompact radius domainから作り、内部閉ループを外部到達ラベルで除外する。外へ開く細い溝、crop/mesh境界、非多様体edge、hidden隣接、未接続seam、別sheetは外周側として保持する
+- 外周境界は現在のcompact radius domainから作り、内部閉ループを外部到達ラベルで除外する。外へ開く細い溝、crop/mesh境界、非多様体edge、hidden隣接、未接続seam、別sheetは外周側として保持する。ただし通常は停止境界となる谷でも、現在のブラシ範囲内に対岸が入り連続谷成分が両岸に挟まれる場合は、radius外へ進まず範囲内区間だけを候補へ統合する。この谷救済は全体UV展開ではなく、base候補から同じface graph上で小さいN（最大8）のdilation→erosion Closingを行い、元base境界の離れた2区間以上へ接する新規帯だけを最小Nで統合する。candidateが内包する未選択連結成分は、選択領域との共有境界頂点を除いた外側固有頂点数が100以下の場合だけ全体を統合し、101以上、保護境界、距離外は採用しない
 - 境界分類では選択側ではなく隣接する非選択側の距離を使い、seed floodと最終描画のoutside面を一致させる
 - 予測は外周境界線だけを表示し、面のtriangulationや面GPU batchを作らない。E再押下またはEnterで世代固定snapshotをseedからfloodし、その面集合を一度だけFace Setへ書き込む。履歴は現在と直前2段階を保持する
 - 同期計算中と最新結果の実描画前後に届いたwheel入力は捨て、最新結果の描画後に短い排出区間を経た次のwheelだけを1段階として受け付ける。Escとready済み結果のE/Enter確定は維持する
@@ -129,6 +141,16 @@ Blender同梱のNumPyを使用します。大規模メッシュでは初回の�
 この機能は Sculpt Mode 専用です。`bpy.ops.sculpt.expand()`、Sculpt Mask、画面の深度や表裏で候補を決める処理、Face Set の新規 ID 生成は使用しません。準備中の処理は内部timerで区切られ、ready前のE再押下やEnterは確定しません。
 
 ショートカットは Blender の `Preferences > Keymap` で `Mesh Focus: Local Face Set Grow` を検索して変更できます。
+
+## Local Feature Brush
+
+Sculpt Mode の Asset Shelf で専用の `MFO Local Feature Brush` asset を選択します。選択は通常のBlender Brush選択として保持され、左ボタンを押した時だけstroke用operatorが開始されます。Asset Shelf、Nパネル、別editor、MMB視点操作はstroke外で通常どおり操作できます。左ボタンを離すと一strokeを一つのUndoステップとして確定し、stroke中の `Esc` はそのstrokeだけを元の座標へ戻します。
+
+専用marker付きのSculptブラシassetをEssentialsから独立した `assets/mfo_local_feature_brush.blend` として配布します。Blender Preferences > File Paths > Asset Libraries でこの `assets` ディレクトリを登録し、Asset Shelfの `MFO Local Feature Brush` を選択してください。Essentialsのassetや標準ブラシは変更しません。径（Blender 5.2の`Brush.size`は直径）と筆圧を読み取ります。N パネルの強さ・対象起伏スケール・半径は各stroke開始時に再読込され、選択中の表示値が次のstrokeへ反映されます。native prep中だけbrush型をDrawへ一時変更し、関連設定はfinallyで復元します。ストローク中だけホイールでこのブラシの半径、`Shift + ホイール`で強さを調整し、待機中のホイールは通常のBlender入力として扱います。専用marker以外ではdispatcherのpollがfalseになり、通常ブラシのLMBとShift Smoothへ介入しません。UI/Asset Shelf領域のクリックと修飾キーは消費せず、Local Feature Brush自身のstroke中はShift入力を変形へ使用せず通過させます。
+
+各dabは画面のray hit周辺だけをBVHから取得し、そのcandidate+haloを圧縮して低域化します。低域化後の符号付き曲率残差へgate、falloff、clampを適用するため、既存の広いridgeは上げ、valleyは深くします。平面・傾斜面・fine-onlyの細波、mask頂点、hidden頂点、半径外は変更しません。全meshのBVH/triangle配列は最初のstrokeだけ段階的に準備し、準備中のrelease/Escで中止できます。途中dabでもMesh.updateとredrawを通知し、同期中の自己更新だけcacheを保持して後続外部更新は破棄します。7.6M頂点での実時間は未検証です。
+
+shared mesh、shape key、Multires、Dyntopo、非一様scale、linked meshは変形前に拒否します。最初のnonzero dabで座標setterの直前に一度だけ、公開RNA schemaを検証した `bpy.ops.sculpt.brush_stroke("EXEC_DEFAULT")` を strength 0 のDrawとして実行し、native Sculpt Undo stepを準備します。外側のstroke operatorは `REGISTER,UNDO` でLMB releaseまでnative pending stepを保持し、selector自体は `UNDO` を持ちません。現在の標準ブラシ型は一時的にDrawへ切り替え、`size`、`use_locked_size`、`unprojected_size`、unified設定、automasking、front-faceなどをsnapshotしてfinallyで復元します。Brush.size hard limitを満たさず、world-space object bounds 8 cornerから作る有限bounding sphereを設定できない場合は変形前に中止します。Undo/Redo、ファイルロード、外部mesh更新ではruntime cacheを破棄し、native履歴後に古い座標snapshotを書き戻しません。Blender 5.2.1の隔離GUIで実本体のAsset Shelf選択・custom stroke・marker選択を維持した実SmoothによるShift交互操作・Undo/Redo・Esc・保護領域・設定復元を検証済みです（attempt034、viewport OpenGL画像）。preview埋め込み後のattempt035では非黒の`production_panel_before.png`にmarker名と色付きpreviewを確認しましたが、後続startup全画面captureには黒画像もあり、継続的な全画面UI合格とは扱いません。実髪、tablet pressure、7.6M頂点性能、全深度surface coverageは未検証で、診断で確認された「Undo後の新strokeをEscすると以前のRedo枝を保持できない」制約は残ります。
 
 ## Topology Colors
 
@@ -157,6 +179,9 @@ Sculpt Mode で Smart Face Set Fill で塗ったチューブへカーソルを�
 - `Debug Display`: Orbit 中心のデバッグポイント表示
 - `RetopoFlow Focus-Island Snap/Weld Filter`: FSMFO 中の RetopoFlow Snap/Weld 制限。既定 OFF
 - `Topology Colors`: 6色オーバーレイの表示と透明度
+- `Local Feature Strength`: 既存の山/谷を強調する強さ
+- `Target Feature Scale`: 低域化する髪束スケール
+- `Local Feature Radius`: 現在のSculptブラシ径に対する半径倍率
 
 ## 制限と復旧
 
@@ -173,7 +198,7 @@ Sculpt Mode で Smart Face Set Fill で塗ったチューブへカーソルを�
 
 A Blender 5.2 add-on for manual retopology workflows.
 
-Current add-on version: **3.2.28**
+Current add-on version: **3.3.0**
 
 Main features:
 
@@ -181,8 +206,23 @@ Main features:
 - **Face Set MFO (FSMFO)**: temporarily shows one Face Set from the configured Reference Object and its matching Retopo island
 - **Smart Face Set Fill**: previews only the outer boundary under the cursor and applies the seed-connected faces inside it after a second E press or Enter
 - Smart Face Set Fill draws boundary lines during prediction and resolves the generation snapshot into one seed flood at confirmation, preserving distance, hidden, crop, and mesh-domain limits
+- Smart Face Set Fill compares add and trim proposals in the one/two-face orange-boundary corridor with one shape score, accepting only a clear continuous real-edge improvement independent of seed direction; cyan distance and protected boundaries remain fixed
+- Ordinary E traces maximal physical edge sequences before grayscale Closing. Junctions use the most straight deterministic continuation and split ambiguous pairs; each sequence receives a cumulative physical-distance max-then-min Closing so short gaps in one shadow chain are recovered without joining unrelated branches. The immutable capture-generation barrier map is reused at every radius stage and reports sequence, window, junction, gap, endpoint, and domain metrics
+- The former normal-E screen capture/morphology pipeline is retained only as dormant diagnostic code; the active 3.3.0 normal-E path performs no capture or automatic shader switch. Boundary lines come from the full prepared physical graph so compact-slice perimeter edges are not lost
+- Ordinary `E` uses the fast progressive-range geometry path. It starts from a small seed-local physical range, prepares the reusable face graph once, processes only the newly exposed outer band on wheel expansion, and reuses cached distances/candidates on shrink or revisit. No viewport capture, ROI pixel flood, screen morphology, or full-mesh projection is performed by the active normal-E path
+- Normal-E wheel stages are keyed by physical radius and remain incremental: `progressive-range` metrics report initial/current radius, newly processed faces, reused faces, cache hit, and per-stage compute time. Normal E uses the existing permissive geometry boundary resolver; `Ctrl + E` retains the strict resolver unchanged
+- Initial Face Set assistance is limited to the seed-range prior: same-ID faces may receive a geodesic bonus, while different IDs remain neutral. After the initial range is fixed, wheel expansion and boundary refinement do not inspect Face Set IDs or display colors
+- `Shift + Alt + E` toggles the independent analysis view for the current Sculpt View3D without starting a fill. It shows the toon_dark MATCAP together with semi-transparent Face Set colors (opacity 0.45) and mesh wire overlay. It snapshots and exactly restores shading/overlay state on toggle-off, load, unregister, or modal error; normal E never changes this manual ownership and Ctrl+E leaves the visible view untouched
+- Boundary correction treats add as a bounded local Closing and trim as its bounded complement Opening; only the internal orange interval beyond a minimal cyan-contact guard is evaluated, never a full-candidate N-ring morphology
+- `Ctrl + E` geometry-strict boundary correction builds a per-physical-edge normal/crease/contrast/valley/radius signal, applies metric-bounded grayscale max/min filters, and uses median+MAD hysteresis to propose only continuous chains; junctions connect only an unambiguous straight pair in the local tangent plane and split ambiguous arms, while cyan, hard barriers, and the radius boundary stop propagation, independent of seed direction
+- Initial Face Set assistance is an additive geometry-only prior: the baseline candidate is computed without Face Set costs, same-ID bonus faces may only be unioned, and the accepted initial mesh-face ids are retained as a monotonic floor for later wheel stages.  An all-orange provisional boundary uses all safe sources for a bounded multi-source metric shell; later refinement and shell propagation do not inspect Face Set ids.
+- Shadow luminance/morphology metrics remain available for offline diagnostics only. The active normal-E result reports `progressive-range` path metrics instead; hard, hidden, non-manifold, protected, and separate-sheet safety checks remain active in both modes.
+- An initial all-orange candidate with no cyan front preserves a geometry-only baseline, then uses every safe orange boundary face as a multi-source ordinary-geometry metric shell; it bootstraps only when a bounded shell creates a cyan front, leaving all-high-signal, hard/hidden/non-manifold/protected, separate-sheet, and frontless cases unchanged
+- During initial range determination only, connected faces sharing the seed Face Set ID receive a geodesic bonus; different IDs remain neutral, no teleport to disconnected components is allowed, and Face Set IDs are not consulted after the initial range is fixed
+- Initial-prior safety uses full-geometry physical degree/hidden/non-manifold metadata, never a missing-neighbor count from the compact analysis slice
 - **Topology Colors**: assigns six translucent topology guide colors to selected Edit Mesh faces
 - **Curved Face Set Tube Shape**: classifies one connected Sculpt Face Set tube and previews curved uniform or tapered shaping
+- **Local Feature Brush**: selects a marked Sculpt Brush Asset whose LMB dispatcher amplifies existing broad ridges and valleys locally without creating a new stroke crease
 
 ## Installation
 
@@ -205,6 +245,7 @@ The default Activation Key is `Right Shift`.
 | Strict Smart Face Set Fill preview | `Ctrl + E` in Sculpt Mode; release and press `E` again (or press `Enter`) to apply, wheel changes distance, `Esc` cancels |
 | Topology Colors | `Ctrl + Alt + 1..6` in Edit Mode (`0` clears) |
 | Curved Face Set Tube Shape | `Ctrl + Alt + T` in Sculpt Mode; wheel changes radius/taper, `Shift + wheel` changes strength, `T`/left click/Enter applies, `Esc` cancels |
+| Local Feature Brush | Select `MFO Local Feature Brush` from the Sculpt Asset Shelf; LMB drag applies one stroke, release commits, `Esc` cancels the current stroke; during that stroke only, wheel changes radius and `Shift + wheel` changes strength |
 
 Normal MFO and FSMFO use separate KeyMap Items. FSMFO is started directly by its Undo-enabled Activation Operator; it does not pass through an outer non-Undo trigger. The Activation Operator starts the non-Undo Watcher and then finishes.
 
@@ -282,7 +323,7 @@ The algorithm:
 - Skips hidden faces and non-manifold boundaries; a ray that first reaches a hidden face continues to the first visible face. There is no fixed 100,000-face cutoff; wheel-adjusted search distance is capped at 16 times the initial radius
 - Writes the existing seed Face Set ID directly to the accepted faces
 - Uses fixed view-independent multi-direction Lambert illumination as an approximation, not real shadows or ambient occlusion. It acquires the requested local distance patch first, detects signed valley changes there, keeps the seed-side original-face component across valley barriers, and corrects its surrounding band against original faces. Each radius is reevaluated from the current patch so a finite valley may reconnect naturally at its end.
-- Labels one compact radius domain from its outside openings to remove inner boundary loops. Open U grooves, crop or mesh boundaries, non-manifold edges, hidden neighbors, unmatched seams, and separate sheets remain outside; a closed pocket connected to the candidate is included.
+- Labels one compact radius domain from its outside openings to remove inner boundary loops. Open U grooves, crop or mesh boundaries, non-manifold edges, hidden neighbors, unmatched seams, and separate sheets remain outside; a valley normally remains a stopping boundary, but a continuous valley component is included only for the in-range interval whose two shores are inside the current brush range, without traversing beyond the radius. This rescue does not use a full UV unwrap: it applies a small, base-seeded face-graph Closing (dilation followed by erosion, at most eight steps) and merges only new components touching two or more separated arcs of the original candidate boundary. An unselected connected component enclosed by the candidate is merged as a whole only when its unique outer vertices, excluding vertices shared with the selected interface, number at most 100; 101 or more, protected boundaries, and faces outside the distance domain are not adopted.
 - Treats a valid shared-edge crossing whose outside face is within the current candidate distance as a shape/region boundary (orange); the fine partition barrier does not demote it to the distance boundary (cyan). Crossings outside the distance or beyond the explored patch remain distance boundaries.
 - Uses the non-selected adjacent face for boundary distance and draws only copied boundary lines. No prediction triangulation or face GPU batch is created; confirmation floods the generation-fixed compact graph without crossing its stored outer boundary. History keeps the current and two previous stages.
 - Wheel input received during synchronous computation and around the first draw of the latest result is discarded. After the draw callback and a short drain interval, the next wheel is accepted as one stage; Esc and E/Enter confirmation of a ready result remain available.
@@ -296,6 +337,16 @@ Uses Blender's bundled NumPy. Initial local preparation of large meshes can take
 This feature is Sculpt Mode only. It does not use `bpy.ops.sculpt.expand()`, Sculpt Mask, screen depth/backface state to choose candidates, or newly generated Face Set IDs. Preparation is divided across internal timer ticks; E/Enter before Ready cannot apply a partial result.
 
 The shortcut can be changed in Blender's `Preferences > Keymap` by searching for `Mesh Focus: Local Face Set Grow`.
+
+## Local Feature Brush
+
+In Sculpt Mode, add the repository's `assets` directory as a Blender Asset Library and select the dedicated `MFO Local Feature Brush` asset from the Asset Shelf. Essentials and built-in brushes are not modified. The marked asset remains selected across strokes as a normal Blender Brush selection; the per-stroke operator starts only on LMB press. The Asset Shelf, N-panel, other editors, and MMB view navigation remain available outside a stroke. Releasing LMB commits one stroke as one Undo step. Pressing `Esc` during a stroke restores that stroke's saved coordinates.
+
+The dedicated marked Sculpt Brush asset is never replaced. Its diameter (`Brush.size` is a diameter in Blender 5.2) and tablet pressure are read for the local dab. N-panel strength, target-feature scale, and radius are re-read at each stroke start, so edits made while the asset remains selected affect the next stroke. During the one-time native prep, only the brush type is temporarily changed to Draw and all related settings are restored in `finally`. While a custom stroke is active, wheel adjusts this brush radius and `Shift + wheel` adjusts strength; while idle, wheel remains ordinary Blender input. The dispatcher is poll-gated by the stable asset marker; standard brush LMB and native Shift Smooth remain outside this explicitly selected tool. UI/Asset Shelf clicks and modifier events are not consumed by the dispatcher. During the custom stroke, Shift is passed through without changing the custom geometry.
+
+Each dab queries only a ray-hit neighborhood from a reusable BVH, then compresses the candidate+halo before low-pass and curvature calculations. A post-low-pass signed-curvature gate, radial falloff, and displacement clamp raise existing broad ridges and deepen valleys while leaving flat/slope/fine-only regions, masked/hidden vertices, and vertices outside the radius unchanged. The initial whole-mesh BVH/triangle read is staged and cancellable; update/redraw is published after changed dabs with a synchronous ownership boundary for cache invalidation. 7.6M-vertex interactive timing is unverified.
+
+Shared mesh data, shape keys, Multires, Dyntopo, non-uniform scale, and linked meshes are rejected before any write. On the first non-zero dab, immediately before the first coordinate setter, the add-on validates Blender 5.2's public `OperatorStrokeElement` schema and runs exactly one `bpy.ops.sculpt.brush_stroke("EXEC_DEFAULT")` with a zero-strength temporary Draw configuration. The outer stroke operator uses `REGISTER,UNDO` so the native pending step remains open until LMB release; the selector itself is non-UNDO. It snapshots and restores the active brush's `size`, `use_locked_size`, `unprojected_size`, unified settings, automasking, front-face, and related fields in `finally`; the finite world-space bounds sphere is derived from all eight object-bound corners, and a Brush.size/unprojected-size hard-limit failure cancels before any write. Undo/Redo, file load, and external mesh updates invalidate runtime cache without writing an old coordinate snapshot over native history. Blender 5.2.1 isolated-GUI testing exercised real Asset Shelf selection, custom strokes, native Shift while the marker remained selected, Undo/Redo, Esc, protection regions, and setting restoration (attempt034, viewport OpenGL evidence). A non-black `production_panel_before.png` also showed the embedded marker preview/name in the Asset Shelf (attempt035), but later startup full-screen captures were black and are not a persistent full-screen UI pass. Real hair, tablet pressure, 7.6M-vertex timing, and all-depth surface coverage remain unverified; the diagnostic proof's known limitation remains that after Undo then starting a new custom stroke, Blender's earlier Redo branch may be unavailable.
 
 ## Topology Colors
 
