@@ -2,7 +2,7 @@
 
 Blender 5.2 用のリトポロジー支援アドオンです。
 
-現在のアドオンバージョン: **3.3.0**
+現在のアドオンバージョン: **3.3.1**
 
 主な機能:
 
@@ -20,7 +20,7 @@ Blender 5.2 用のリトポロジー支援アドオンです。
 - 初期範囲の決定時だけseedと同じFace Set IDの連結面内をgeodesic bonusで優先する。異なるIDは中立で、後段のwheel・境界補正ではFace Set IDを参照しない。normal Eは同じgeometry baselineを保ち、`Ctrl + E` のstrict判定を変更しない
 - `Shift + Alt + E` はSculpt Modeの現在View3Dだけで独立した専用analysis shader表示をON/OFFする。ON時はtoon_dark MATCAP、Face Setカラー（opacity 0.45）、mesh wire overlayを表示し、shading/overlayを完全snapshotする。OFF、load、unregisterで型互換プロパティを冪等復元する。通常Eは表示を変更せず、旧Alt+Eのkeymapは登録しない。`Ctrl + E` は表示を変更しない
 - 初期priorの安全判定はcompact analysis sliceの欠落隣接をphysical hardと誤認せず、full geometry由来のphysical degree/hidden/non-manifold metadataを用いる
-- 旧screen-space shadow/morphology実装は診断用コードとして残るが、3.3.0の通常E本番経路からは呼び出さない。これによりwheel応答では画面全体のcapture・pixel flood・shader切替を発生させない
+- 旧screen-space shadow/morphology実装は診断用コードとして残るが、3.3.1の通常E本番経路からは呼び出さない。これによりwheel応答では画面全体のcapture・pixel flood・shader切替を発生させない
 - **Topology Colors**: 編集中の選択面へ6色の半透明ガイドを割り当てる
 - **Curved Face Set Tube Shape**: Sculpt Mode で seed Face Set の edge-connected tube を自動判別し、曲がった中心線を保ったまま均一化または先細り補正する
 
@@ -198,7 +198,7 @@ Sculpt Mode で Smart Face Set Fill で塗ったチューブへカーソルを�
 
 A Blender 5.2 add-on for manual retopology workflows.
 
-Current add-on version: **3.3.0**
+Current add-on version: **3.3.1**
 
 Main features:
 
@@ -208,7 +208,7 @@ Main features:
 - Smart Face Set Fill draws boundary lines during prediction and resolves the generation snapshot into one seed flood at confirmation, preserving distance, hidden, crop, and mesh-domain limits
 - Smart Face Set Fill compares add and trim proposals in the one/two-face orange-boundary corridor with one shape score, accepting only a clear continuous real-edge improvement independent of seed direction; cyan distance and protected boundaries remain fixed
 - Ordinary E traces maximal physical edge sequences before grayscale Closing. Junctions use the most straight deterministic continuation and split ambiguous pairs; each sequence receives a cumulative physical-distance max-then-min Closing so short gaps in one shadow chain are recovered without joining unrelated branches. The immutable capture-generation barrier map is reused at every radius stage and reports sequence, window, junction, gap, endpoint, and domain metrics
-- The former normal-E screen capture/morphology pipeline is retained only as dormant diagnostic code; the active 3.3.0 normal-E path performs no capture or automatic shader switch. Boundary lines come from the full prepared physical graph so compact-slice perimeter edges are not lost
+- The former normal-E screen capture/morphology pipeline is retained only as dormant diagnostic code; the active 3.3.1 normal-E path performs no capture or automatic shader switch. Boundary lines come from the full prepared physical graph so compact-slice perimeter edges are not lost
 - Ordinary `E` uses the fast progressive-range geometry path. It starts from a small seed-local physical range, prepares the reusable face graph once, processes only the newly exposed outer band on wheel expansion, and reuses cached distances/candidates on shrink or revisit. No viewport capture, ROI pixel flood, screen morphology, or full-mesh projection is performed by the active normal-E path
 - Normal-E wheel stages are keyed by physical radius and remain incremental: `progressive-range` metrics report initial/current radius, newly processed faces, reused faces, cache hit, and per-stage compute time. Normal E uses the existing permissive geometry boundary resolver; `Ctrl + E` retains the strict resolver unchanged
 - Initial Face Set assistance is limited to the seed-range prior: same-ID faces may receive a geodesic bonus, while different IDs remain neutral. After the initial range is fixed, wheel expansion and boundary refinement do not inspect Face Set IDs or display colors

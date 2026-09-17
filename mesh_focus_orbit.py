@@ -9,7 +9,7 @@ rotating the view.
 bl_info = {
     "name": "Mesh Focus Orbit",
     "author": "OpenAI",
-    "version": (3, 3, 0),
+    "version": (3, 3, 1),
     "blender": (5, 2, 0),
     "location": "3D View",
     "description": "Temporary mesh-centered orbit and local Smart Face Set Fill preview",
@@ -10155,6 +10155,33 @@ def _fill_preview_signature(obj):
         return None
 
 
+def _fill_preview_cached_visibility_check(obj, cached):
+    """Compare a reusable full graph's hidden mask with the live mesh once.
+
+    The adjacency signature intentionally omits visibility because it is a
+    cheap ownership/topology key.  Visibility is therefore validated at cache
+    handoff; a mismatch invalidates the complete graph so hidden filtering is
+    rebuilt instead of patched in place.
+    """
+    import numpy as np
+
+    try:
+        mesh = obj.data
+        cached_hidden = np.asarray(cached.get("hidden"), dtype=bool).reshape(-1)
+        if len(cached_hidden) != len(mesh.polygons):
+            return {"matches": False, "reason": "hidden-schema", "hidden_count": 0}
+        current_hidden = np.empty(len(mesh.polygons), dtype=bool)
+        mesh.polygons.foreach_get("hide", current_hidden)
+        matches = bool(np.array_equal(current_hidden, cached_hidden))
+        return {
+            "matches": matches,
+            "reason": "match" if matches else "hidden-changed",
+            "hidden_count": int(np.count_nonzero(current_hidden)),
+        }
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return {"matches": False, "reason": "visibility-read-error", "hidden_count": 0}
+
+
 def _fill_preview_adjacency_steps(obj):
     """Yield between large mesh reads used by a modal preview preparation."""
     import numpy as np
@@ -10786,7 +10813,10 @@ def _fill_preview_build_adjacency(obj, prepared=None):
         raise RuntimeError("preview target is unavailable")
     cached = _fill_preview_adjacency_cache.get(signature)
     if cached is not None:
-        return cached
+        visibility = _fill_preview_cached_visibility_check(obj, cached)
+        if visibility.get("matches"):
+            return cached
+        _fill_preview_adjacency_cache.pop(signature, None)
 
     if prepared is None:
         vertex_count = len(mesh.vertices)
@@ -21906,6 +21936,15 @@ def _fill_preview_make_result(state, radius):
         "partition": partition,
         "created_generation": int(state["generation"]),
         "valley_fine_reason": valley_fine_reason,
+        "visibility_cache_checked": bool(
+            state.get("visibility_cache_checked", False)
+        ),
+        "visibility_cache_invalidated": bool(
+            state.get("visibility_cache_invalidated", False)
+        ),
+        "visibility_cache_reason": str(
+            state.get("visibility_cache_reason", "not-checked")
+        ),
         **enclosed_component_metrics,
         **sandwiched_band_metrics,
         **shadow_metrics,
@@ -23095,6 +23134,10 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
             "wheel_drain_until": 0.0,
             "result": None,
             "results": {},
+            "visibility_cache_checked": False,
+            "visibility_cache_invalidated": False,
+            "visibility_cache_hidden_count": 0,
+            "visibility_cache_reason": "not-checked",
             # Stable mesh polygon ids accepted by the initial Face Set prior;
             # subsequent wheel stages project this cache into their current
             # cursor-local geometry and union it as an immutable floor.
@@ -23147,6 +23190,21 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
                 if state["prepare_job"] is None and state["prepare_raw"] is None:
                     signature = state["signature"]
                     cached = None if state.get("cursor_prepare") else _fill_preview_adjacency_cache.get(signature)
+                    if cached is not None:
+                        visibility = _fill_preview_cached_visibility_check(
+                            state["obj"], cached
+                        )
+                        state["visibility_cache_checked"] = True
+                        state["visibility_cache_hidden_count"] = int(
+                            visibility.get("hidden_count", 0)
+                        )
+                        state["visibility_cache_reason"] = str(
+                            visibility.get("reason", "unknown")
+                        )
+                        if not visibility.get("matches"):
+                            _fill_preview_adjacency_cache.pop(signature, None)
+                            state["visibility_cache_invalidated"] = True
+                            cached = None
                     if cached is not None:
                         state["adjacency"] = cached
                         state["initial_radius"] = _fill_preview_initial_radius(
@@ -24082,7 +24140,10 @@ def _fill_preview_build_adjacency_cooperative(obj, prepared=None):
         raise RuntimeError("preview target is unavailable")
     cached = _fill_preview_adjacency_cache.get(signature)
     if cached is not None:
-        return cached
+        visibility = _fill_preview_cached_visibility_check(obj, cached)
+        if visibility.get("matches"):
+            return cached
+        _fill_preview_adjacency_cache.pop(signature, None)
 
     if prepared is None:
         vertex_count = len(mesh.vertices)
