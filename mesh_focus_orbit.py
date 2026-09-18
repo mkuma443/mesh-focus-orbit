@@ -9,7 +9,7 @@ rotating the view.
 bl_info = {
     "name": "Mesh Focus Orbit",
     "author": "OpenAI",
-    "version": (3, 3, 5),
+    "version": (3, 3, 9),
     "blender": (5, 2, 0),
     "location": "3D View",
     "description": "Mesh-centered orbit, Face Set tools, Smart Fill, and Guided Ridge",
@@ -93,7 +93,6 @@ _retopo_undo_tombstones = {}
 _local_face_set_adjacency_cache = {}
 _fill_preview_adjacency_cache = {}
 _fill_preview_cursor_cache = {}
-_fill_preview_self_face_set_update_token = None
 _fill_preview_state = None
 _fill_preview_last_confirm_metrics = {}
 _fill_preview_draw_handler = None
@@ -6520,8 +6519,6 @@ def _on_fill_preview_redo_post(_dummy):
 @persistent
 def _on_load_pre(_dummy):
     """Clear viewport-bound state before Blender replaces the current file."""
-    global _fill_preview_self_face_set_update_token
-    _fill_preview_self_face_set_update_token = None
     _fill_preview_cancel(reason="load")
     _fill_preview_restore_manual_analysis_profiles()
     _tube_preview_cancel(reason="load")
@@ -6536,8 +6533,6 @@ def _on_load_pre(_dummy):
 @persistent
 def _on_load_post(_dummy):
     """Recover remnants loaded from a file saved during Face Set MFO."""
-    global _fill_preview_self_face_set_update_token
-    _fill_preview_self_face_set_update_token = None
     _fill_preview_cancel(reason="load-post")
     _fill_preview_restore_manual_analysis_profiles()
     _tube_preview_cancel(reason="load-post")
@@ -12020,6 +12015,24 @@ def _fill_preview_cached_visibility_check(obj, cached):
         return {"matches": False, "reason": "visibility-read-error", "hidden_count": 0}
 
 
+def _fill_preview_prepare_token(stage, done=None, total=None, stage_index=None, stage_count=None, phase="prepare"):
+    """Describe one bounded preparation slice for the modal progress HUD."""
+    token = {
+        "stage": str(stage),
+        "phase": str(phase),
+        "indeterminate": done is None or total is None or int(total) <= 0,
+    }
+    if done is not None:
+        token["done"] = int(done)
+    if total is not None:
+        token["total"] = int(total)
+    if stage_index is not None:
+        token["stage_index"] = int(stage_index)
+    if stage_count is not None:
+        token["stage_count"] = int(stage_count)
+    return token
+
+
 def _fill_preview_adjacency_steps(obj):
     """Yield between large mesh reads used by a modal preview preparation."""
     import numpy as np
@@ -12035,23 +12048,23 @@ def _fill_preview_adjacency_steps(obj):
     loop_vertices = np.empty(len(mesh.loops), dtype=np.int32)
     totals = np.empty(face_count, dtype=np.int32)
     hidden = np.empty(face_count, dtype=bool)
-    yield "allocate"
+    yield _fill_preview_prepare_token("allocate", 0, 1, 0, 8)
     mesh.vertices.foreach_get("co", coordinates.ravel())
-    yield "vertices"
+    yield _fill_preview_prepare_token("vertices", 1, 1, 1, 8)
     mesh.loops.foreach_get("edge_index", loop_edges)
-    yield "loop_edges"
+    yield _fill_preview_prepare_token("loop_edges", 1, 1, 2, 8)
     mesh.loops.foreach_get("vertex_index", loop_vertices)
-    yield "loop_vertices"
+    yield _fill_preview_prepare_token("loop_vertices", 1, 1, 3, 8)
     mesh.polygons.foreach_get("loop_total", totals)
-    yield "totals"
+    yield _fill_preview_prepare_token("totals", 1, 1, 4, 8)
     mesh.polygons.foreach_get("hide", hidden)
-    yield "hidden"
+    yield _fill_preview_prepare_token("hidden", 1, 1, 5, 8)
     centers = np.empty((face_count, 3), dtype=np.float32)
     normals = np.empty((face_count, 3), dtype=np.float32)
     mesh.polygons.foreach_get("center", centers.ravel())
-    yield "centers"
+    yield _fill_preview_prepare_token("centers", 1, 1, 6, 8)
     mesh.polygons.foreach_get("normal", normals.ravel())
-    yield "normals"
+    yield _fill_preview_prepare_token("normals", 1, 1, 7, 8)
     return {
         "signature": signature,
         "coordinates": coordinates,
@@ -12583,6 +12596,41 @@ def _fill_preview_cursor_prepare_steps(obj, seed_face):
     if signature is None:
         raise RuntimeError("preview target is unavailable")
     cache = _fill_preview_cursor_cache.get(signature)
+    if cache is not None and cache.get("geometry_dirty"):
+        # Cursor preparation has its own small reusable index.  Refresh the
+        # volatile centers/loop metadata in place; Face Set IDs are not part
+        # of this cache and therefore never cause an eviction.
+        face_count = int(len(mesh.polygons))
+        loop_count = int(len(mesh.loops))
+        if (
+            len(np.asarray(cache.get("world_centers", ()))) != face_count
+            or len(np.asarray(cache.get("loop_edges", ()))) != loop_count
+            or len(np.asarray(cache.get("totals", ()))) != face_count
+        ):
+            _fill_preview_cursor_cache.pop(signature, None)
+            cache = None
+        else:
+            centers_local = np.empty((face_count, 3), dtype=np.float32)
+            totals = np.empty(face_count, dtype=np.int32)
+            loop_edges = np.empty(loop_count, dtype=np.int32)
+            mesh.polygons.foreach_get("center", centers_local.ravel())
+            matrix = np.asarray(obj.matrix_world, dtype=np.float64)
+            cache["world_centers"] = (
+                centers_local.astype(np.float64) @ matrix[:3, :3].T
+                + matrix[:3, 3]
+            )
+            mesh.polygons.foreach_get("loop_total", totals)
+            mesh.loops.foreach_get("edge_index", loop_edges)
+            cache["edge_degree"] = np.bincount(
+                loop_edges, minlength=len(mesh.edges)
+            ).astype(np.int32, copy=False)
+            cache["loop_edges"] = loop_edges
+            cache["totals"] = totals
+            cache["geometry_dirty"] = False
+            cache["geometry_refresh_count"] = int(
+                cache.get("geometry_refresh_count", 0)
+            ) + 1
+            cache["geometry_refresh_reason"] = "depsgraph-dirty"
     if cache is None:
         face_count = len(mesh.polygons)
         centers_local = np.empty((face_count, 3), dtype=np.float32)
@@ -12636,6 +12684,272 @@ def _fill_preview_cursor_prepare_steps(obj, seed_face):
     return geometry
 
 
+def _fill_preview_topology_fingerprint(loop_edges, loop_vertices, totals):
+    """Return a compact fingerprint for the connectivity-only cache layer.
+
+    Face Set values are intentionally absent.  The Smart Face Set Fill graph
+    is an expensive connectivity index; a Face Set paint changes only the
+    live classification read by each E invocation and must not evict this
+    index.  The loop arrays are retained only as a compact integrity guard so
+    a same-count rewiring still forces a rebuild.
+    """
+    import numpy as np
+
+    digest = hashlib.blake2b(digest_size=16)
+    for values in (loop_edges, loop_vertices, totals):
+        array = np.ascontiguousarray(values)
+        digest.update(array.tobytes())
+    return (
+        int(len(loop_edges)),
+        int(len(loop_vertices)),
+        int(len(totals)),
+        digest.digest(),
+    )
+
+
+def _fill_preview_array_fingerprint(values):
+    """Hash one numeric array without retaining its contents as cache state."""
+    import numpy as np
+
+    array = np.ascontiguousarray(values)
+    return (tuple(int(value) for value in array.shape), hashlib.blake2b(
+        array.tobytes(), digest_size=16
+    ).digest())
+
+
+def _fill_preview_face_set_fingerprint(obj):
+    """Return a change hint for live Face Set values, never a Face Set cache."""
+    import numpy as np
+
+    try:
+        attribute = obj.data.attributes.get(".sculpt_face_set")
+        if attribute is None or attribute.domain != "FACE":
+            return None
+        values = np.empty(len(attribute.data), dtype=np.int32)
+        attribute.data.foreach_get("value", values)
+        return _fill_preview_array_fingerprint(values)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _fill_preview_refresh_cached_adjacency(obj, cached):
+    """Refresh volatile geometry/visibility in a retained topology graph.
+
+    Depsgraph cannot distinguish a ``.sculpt_face_set`` write from a sculpt
+    coordinate edit: both are commonly reported as ``is_updated_geometry``.
+    Therefore the handler marks the graph dirty instead of deleting it.  On
+    the next E, this function rereads the current coordinates, normals and
+    hidden flags, validates loop topology, and rebuilds only the filtered CSR
+    views and edge weights.  Face Set values are only fingerprinted as a
+    volatile-update hint; the actual values remain live-read by each preview
+    result and are never used to build this graph.
+
+    Returning ``False`` means the topology guard failed (or the entry is an
+    older cache without the split-layer fields); the caller must perform a
+    cold graph build.  A visibility change remains correct because the
+    visible CSR is regenerated from the retained raw pair list.
+    """
+    import numpy as np
+
+    if not isinstance(cached, dict):
+        return False
+    required = (
+        "topology_first",
+        "topology_second",
+        "topology_edge_v0",
+        "topology_edge_v1",
+    )
+    if any(key not in cached for key in required):
+        return False
+    try:
+        cached["visibility_refresh_verified"] = False
+        mesh = obj.data
+        vertex_count = int(len(mesh.vertices))
+        face_count = int(len(mesh.polygons))
+        loop_count = int(len(mesh.loops))
+        if int(cached.get("count", -1)) != face_count:
+            return False
+
+        # Face Set Paint and SFSF confirmation are the common dirty path.  The
+        # graph deliberately excludes Face Set IDs, so identify that path from
+        # the live attribute first and avoid touching the large loop/coordinate
+        # arrays.  Hidden state is still checked because visibility is a hard
+        # traversal boundary.  A simultaneous Face Set+geometry edit is
+        # conservatively handled by the normal geometry path when the Face Set
+        # fingerprint did not change; Blender does not expose a more granular
+        # per-attribute depsgraph revision.
+        face_set_fingerprint = _fill_preview_face_set_fingerprint(obj)
+        if (
+            face_set_fingerprint is not None
+            and cached.get("face_set_fingerprint") is not None
+            and face_set_fingerprint != cached.get("face_set_fingerprint")
+        ):
+            hidden = np.empty(face_count, dtype=bool)
+            mesh.polygons.foreach_get("hide", hidden)
+            hidden_matches = bool(
+                np.array_equal(
+                    hidden,
+                    np.asarray(cached.get("hidden", ()), dtype=bool).reshape(-1),
+                )
+            )
+            if hidden_matches:
+                cached["face_set_fingerprint"] = face_set_fingerprint
+                cached["geometry_dirty"] = False
+                cached["geometry_refresh_count"] = int(
+                    cached.get("geometry_refresh_count", 0)
+                ) + 1
+                cached["geometry_refresh_reason"] = "face-set-only"
+                cached["visibility_refresh_verified"] = True
+                cached["visibility_refresh_hidden_count"] = int(
+                    np.count_nonzero(hidden)
+                )
+                return True
+
+        loop_edges = np.empty(loop_count, dtype=np.int32)
+        loop_vertices = np.empty(loop_count, dtype=np.int32)
+        totals = np.empty(face_count, dtype=np.int32)
+        mesh.loops.foreach_get("edge_index", loop_edges)
+        mesh.loops.foreach_get("vertex_index", loop_vertices)
+        mesh.polygons.foreach_get("loop_total", totals)
+        fingerprint = _fill_preview_topology_fingerprint(
+            loop_edges, loop_vertices, totals
+        )
+        if fingerprint != cached.get("topology_fingerprint"):
+            return False
+
+        coordinates = np.empty((vertex_count, 3), dtype=np.float32)
+        hidden = np.empty(face_count, dtype=bool)
+        mesh.vertices.foreach_get("co", coordinates.ravel())
+        mesh.polygons.foreach_get("hide", hidden)
+        coordinate_fingerprint = _fill_preview_array_fingerprint(coordinates)
+        hidden_matches = bool(
+            np.array_equal(
+                hidden,
+                np.asarray(cached.get("hidden", ()), dtype=bool).reshape(-1),
+            )
+        )
+        if (
+            fingerprint == cached.get("topology_fingerprint")
+            and hidden_matches
+            and coordinate_fingerprint == cached.get("coordinate_fingerprint")
+        ):
+            # This is the common Face Set Paint/SFSF-confirm case.  The
+            # topology graph and its geometry are still valid; only the live
+            # Face Set attribute changed.  Clear the dirty marker without
+            # sorting or rebuilding the CSR graph.
+            cached["face_set_fingerprint"] = face_set_fingerprint
+            cached["coordinate_fingerprint"] = coordinate_fingerprint
+            cached["geometry_dirty"] = False
+            cached["geometry_refresh_count"] = int(
+                cached.get("geometry_refresh_count", 0)
+            ) + 1
+            cached["geometry_refresh_reason"] = "face-set-only"
+            cached["visibility_refresh_verified"] = True
+            cached["visibility_refresh_hidden_count"] = int(
+                np.count_nonzero(hidden)
+            )
+            return True
+        # Unwelded-seam bridges are inferred from world-space coincidence and
+        # normal compatibility, so a deformation can change whether a seam
+        # exists even when the loop topology is unchanged.  Rebuild those
+        # uncommon graphs instead of retaining a stale seam bridge.
+        if int(cached.get("seam_count", 0)):
+            return False
+        centers_local = np.empty((face_count, 3), dtype=np.float32)
+        normals_local = np.empty((face_count, 3), dtype=np.float32)
+        mesh.polygons.foreach_get("center", centers_local.ravel())
+        mesh.polygons.foreach_get("normal", normals_local.ravel())
+
+        world_matrix = np.asarray(obj.matrix_world, dtype=np.float64)
+        transform = world_matrix[:3, :3]
+        translation = world_matrix[:3, 3]
+        world_vertices = coordinates.astype(np.float64) @ transform.T + translation
+        centers = centers_local.astype(np.float64) @ transform.T + translation
+        normals = normals_local.astype(np.float64) @ np.linalg.inv(transform)
+        normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1.0e-20)
+
+        raw_first = np.asarray(cached["topology_first"], dtype=np.int32).reshape(-1)
+        raw_second = np.asarray(cached["topology_second"], dtype=np.int32).reshape(-1)
+        raw_v0 = np.asarray(cached["topology_edge_v0"], dtype=np.int32).reshape(-1)
+        raw_v1 = np.asarray(cached["topology_edge_v1"], dtype=np.int32).reshape(-1)
+        if not (
+            len(raw_first) == len(raw_second)
+            and len(raw_first) == len(raw_v0)
+            and len(raw_first) == len(raw_v1)
+        ):
+            return False
+        if (
+            (len(raw_first) and (
+                int(np.min(raw_first)) < 0
+                or int(np.max(raw_first)) >= face_count
+                or int(np.min(raw_second)) < 0
+                or int(np.max(raw_second)) >= face_count
+            ))
+            or (len(raw_v0) and (
+                int(np.min(raw_v0)) < 0
+                or int(np.max(raw_v0)) >= vertex_count
+                or int(np.min(raw_v1)) < 0
+                or int(np.max(raw_v1)) >= vertex_count
+            ))
+        ):
+            return False
+
+        valid = ~(hidden[raw_first] | hidden[raw_second]) & (
+            raw_first != raw_second
+        )
+        first = raw_first[valid]
+        second = raw_second[valid]
+        edge_v0 = raw_v0[valid]
+        edge_v1 = raw_v1[valid]
+        delta = centers[second] - centers[first]
+        distance = np.maximum(np.linalg.norm(delta, axis=1), 1.0e-20)
+        sources = np.r_[first, second]
+        destinations = np.r_[second, first]
+        source_edges = np.r_[np.arange(len(first)), np.arange(len(first))]
+        directed_v0 = np.r_[edge_v0, edge_v0]
+        directed_v1 = np.r_[edge_v1, edge_v1]
+        order = np.argsort(sources, kind="stable")
+        degree = np.bincount(sources, minlength=face_count)
+        offsets = np.r_[0, np.cumsum(degree)].astype(np.int64)
+        pair_edge_points = (
+            np.stack((world_vertices[edge_v0], world_vertices[edge_v1]), axis=1)
+            if len(edge_v0)
+            else np.empty((0, 2, 3), dtype=np.float64)
+        )
+        cached.update(
+            {
+                "face_edge_counts": totals.astype(np.int32, copy=False),
+                "physical_degree": degree.astype(np.int32, copy=False),
+                "centers": centers,
+                "normals": normals,
+                "hidden": hidden,
+                "world_vertices": world_vertices,
+                "offsets": offsets,
+                "neighbors": destinations[order].astype(np.int32, copy=False),
+                "neighbor_lengths": np.r_[distance, distance][order],
+                "edge_indices": source_edges[order].astype(np.int32, copy=False),
+                "edge_v0": directed_v0[order].astype(np.int32, copy=False),
+                "edge_v1": directed_v1[order].astype(np.int32, copy=False),
+                "first": first,
+                "second": second,
+                "pair_lengths": distance,
+                "pair_v0": edge_v0,
+                "pair_v1": edge_v1,
+                "pair_edge_points": pair_edge_points,
+                "coordinate_fingerprint": coordinate_fingerprint,
+                "face_set_fingerprint": face_set_fingerprint,
+                "geometry_dirty": False,
+                "geometry_refresh_count": int(cached.get("geometry_refresh_count", 0)) + 1,
+                "geometry_refresh_reason": "depsgraph-dirty",
+                "visibility_refresh_verified": True,
+                "visibility_refresh_hidden_count": int(np.count_nonzero(hidden)),
+            }
+        )
+        return True
+    except (AttributeError, IndexError, MemoryError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return False
+
+
 def _fill_preview_build_adjacency(obj, prepared=None):
     """Build only the reusable surface graph needed by preview sessions.
 
@@ -12651,10 +12965,23 @@ def _fill_preview_build_adjacency(obj, prepared=None):
         raise RuntimeError("preview target is unavailable")
     cached = _fill_preview_adjacency_cache.get(signature)
     if cached is not None:
-        visibility = _fill_preview_cached_visibility_check(obj, cached)
-        if visibility.get("matches"):
+        refreshed = False
+        if cached.get("geometry_dirty"):
+            refreshed = _fill_preview_refresh_cached_adjacency(obj, cached)
+            if refreshed:
+                cached.pop("visibility_refresh_verified", None)
+                cached.pop("visibility_refresh_hidden_count", None)
+                return cached
+            _fill_preview_adjacency_cache.pop(signature, None)
+            cached = None
+        if cached is None:
+            visibility = None
+        else:
+            visibility = _fill_preview_cached_visibility_check(obj, cached)
+        if visibility is not None and visibility.get("matches"):
             return cached
-        _fill_preview_adjacency_cache.pop(signature, None)
+        if cached is not None:
+            _fill_preview_adjacency_cache.pop(signature, None)
 
     if prepared is None:
         vertex_count = len(mesh.vertices)
@@ -12691,7 +13018,6 @@ def _fill_preview_build_adjacency(obj, prepared=None):
     centers = centers.astype(np.float64) @ transform.T + translation
     normals = normals.astype(np.float64) @ np.linalg.inv(transform)
     normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1.0e-20)
-
     face_ids = np.repeat(np.arange(face_count, dtype=np.int32), totals)
     order = np.argsort(loop_edges, kind="stable")
     sorted_edges = loop_edges[order]
@@ -12747,7 +13073,23 @@ def _fill_preview_build_adjacency(obj, prepared=None):
         edge_v1 = np.r_[edge_v1, loop_vertices[next_loops[ia[match]]]]
         seam_count = int(np.count_nonzero(match))
 
+    topology_first = np.asarray(first, dtype=np.int32)
+    topology_second = np.asarray(second, dtype=np.int32)
+    topology_edge_v0 = np.asarray(edge_v0, dtype=np.int32)
+    topology_edge_v1 = np.asarray(edge_v1, dtype=np.int32)
+    topology_fingerprint = _fill_preview_topology_fingerprint(
+        loop_edges, loop_vertices, totals
+    )
     valid = ~(hidden[first] | hidden[second]) & (first != second)
+    if not bool(np.all(valid)):
+        # Hidden faces need an immutable raw pair list so visibility changes
+        # can rebuild the filtered CSR without re-sorting every loop.  When
+        # the common all-visible case applies, share the arrays with the
+        # visible graph and avoid four large duplicate allocations.
+        topology_first = topology_first.copy()
+        topology_second = topology_second.copy()
+        topology_edge_v0 = topology_edge_v0.copy()
+        topology_edge_v1 = topology_edge_v1.copy()
     first, second = first[valid], second[valid]
     edge_v0, edge_v1 = edge_v0[valid], edge_v1[valid]
     delta = centers[second] - centers[first]
@@ -12802,6 +13144,15 @@ def _fill_preview_build_adjacency(obj, prepared=None):
         # proxy/fine valley record uses this field instead of patch-local ids.
         "face_ids": np.arange(face_count, dtype=np.int32),
         "seam_count": seam_count,
+        "topology_fingerprint": topology_fingerprint,
+        "topology_first": topology_first,
+        "topology_second": topology_second,
+        "topology_edge_v0": topology_edge_v0,
+        "topology_edge_v1": topology_edge_v1,
+        "coordinate_fingerprint": _fill_preview_array_fingerprint(coordinates),
+        "face_set_fingerprint": _fill_preview_face_set_fingerprint(obj),
+        "geometry_dirty": False,
+        "geometry_refresh_count": 0,
     }
     # Drop obsolete revisions for this mesh while retaining unrelated meshes.
     mesh_pointer = signature[1]
@@ -13037,6 +13388,63 @@ def _fill_preview_valley_contact_pair_is_crossing(
     return bool(alignment >= 0.45)
 
 
+class _FillPreviewFaceVertexSequence:
+    """Tuple-compatible view over the full graph's flat loop schema."""
+
+    __slots__ = ("_flat", "_offsets", "_counts")
+
+    def __init__(self, flat, offsets, counts):
+        self._flat = flat
+        self._offsets = offsets
+        self._counts = counts
+
+    def __len__(self):
+        return len(self._counts)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return tuple(self[position] for position in range(*index.indices(len(self))))
+        index = int(index)
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        start = int(self._offsets[index])
+        end = start + int(self._counts[index])
+        return self._flat[start:end]
+
+    def __iter__(self):
+        for index in range(len(self)):
+            yield self[index]
+
+
+def _fill_preview_face_vertex_sequence(geometry):
+    """Return tuple geometry or a zero-copy flat-array compatibility view."""
+    stored = geometry.get("face_vertex_ids")
+    if stored is not None:
+        return stored
+    try:
+        import numpy as np
+
+        flat = np.asarray(geometry["face_vertex_flat"], dtype=np.int32).reshape(-1)
+        offsets = np.asarray(
+            geometry["face_vertex_offsets"], dtype=np.int64
+        ).reshape(-1)
+        counts = np.asarray(
+            geometry.get("face_vertex_counts", geometry["face_edge_counts"]),
+            dtype=np.int32,
+        ).reshape(-1)
+        if len(offsets) != len(counts) or len(offsets) == 0:
+            return None
+        if int(offsets[0]) != 0 or np.any(offsets[1:] < offsets[:-1]):
+            return None
+        if np.any(counts < 0) or np.any(offsets + counts > len(flat)):
+            return None
+        return _FillPreviewFaceVertexSequence(flat, offsets, counts)
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+        return None
+
+
 def _fill_preview_valley_component_is_crossing(
     geometry, valley_face_ids, shore_face_ids, interface_edges, scale=1.0
 ):
@@ -13055,7 +13463,7 @@ def _fill_preview_valley_component_is_crossing(
         canonical = np.asarray(geometry["face_ids"], dtype=np.int64).reshape(-1)
         centers = np.asarray(geometry["centers"], dtype=np.float64)
         normals = np.asarray(geometry["normals"], dtype=np.float64)
-        face_vertices = geometry.get("face_vertex_ids")
+        face_vertices = _fill_preview_face_vertex_sequence(geometry)
         world_vertices = np.asarray(
             geometry.get("world_vertices"), dtype=np.float64
         )
@@ -18716,7 +19124,7 @@ def _fill_preview_resolve_enclosed_components(
         hidden = np.asarray(geometry["hidden"], dtype=bool).reshape(-1)
         offsets = np.asarray(geometry["offsets"], dtype=np.int64).reshape(-1)
         neighbors = np.asarray(geometry["neighbors"], dtype=np.int32).reshape(-1)
-        face_vertices = geometry["face_vertex_ids"]
+        face_vertices = _fill_preview_face_vertex_sequence(geometry)
     except (AttributeError, IndexError, KeyError, TypeError, ValueError):
         metrics["enclosed_component_reason"] = "schema"
         return np.empty(0, dtype=np.int32), metrics
@@ -18993,7 +19401,7 @@ def _fill_preview_resolve_sandwiched_bands(
         ).reshape(-1)
         centers = np.asarray(geometry["centers"], dtype=np.float64)
         normals = np.asarray(geometry["normals"], dtype=np.float64)
-        face_vertices = geometry["face_vertex_ids"]
+        face_vertices = _fill_preview_face_vertex_sequence(geometry)
         world_vertices = np.asarray(
             geometry["world_vertices"], dtype=np.float64
         )
@@ -22965,6 +23373,19 @@ def _fill_preview_make_result(state, radius):
         else:
             all_face_sets = np.empty(len(mesh.polygons), dtype=np.int32)
             face_set_attribute.data.foreach_get("value", all_face_sets)
+            # This is the live Face Set snapshot already required for the
+            # initial prior.  Reuse it as the cache's first change baseline so
+            # cold preparation does not perform a second full attribute read.
+            try:
+                adjacency_cache = _fill_preview_adjacency_cache.get(
+                    state.get("signature")
+                )
+                if isinstance(adjacency_cache, dict):
+                    adjacency_cache["face_set_fingerprint"] = (
+                        _fill_preview_array_fingerprint(all_face_sets)
+                    )
+            except (AttributeError, TypeError, ValueError):
+                pass
             seed_mesh_face = int(state.get("seed_face", -1))
             if seed_mesh_face < 0 or seed_mesh_face >= len(all_face_sets):
                 raise ValueError("seed-face-schema")
@@ -24058,15 +24479,28 @@ def _fill_preview_draw_text(state, result):
         # Blender's POST_PIXEL space the lower shelf occupies the last rows.
         x, y = max(18, width - 520), max(120, height - 100)
         if state["phase"] in {"prepare", "prepare_finalize"}:
-            cancel_line = (
-                "Esc queued; waiting for current processing step"
-                if state["phase"] == "prepare_finalize"
-                else "Esc cancel"
-            )
+            fraction = state.get("prepare_progress_fraction")
+            if state.get("prepare_progress_indeterminate") or fraction is None:
+                tick = int(time.perf_counter() * 8.0) % 4
+                progress_line = "Progress [" + ("." * tick) + ">" + ("." * (3 - tick)) + "] working"
+                eta_line = "ETA approximate: calculating"
+            else:
+                fraction = min(max(float(fraction), 0.0), 1.0)
+                filled = int(round(fraction * 20.0))
+                progress_line = f"Progress [{'#' * filled}{'-' * (20 - filled)}] {fraction * 100.0:5.1f}%"
+                eta = state.get("prepare_eta_seconds")
+                eta_line = (
+                    f"ETA approximate: {float(eta):.1f}s"
+                    if eta is not None
+                    else "ETA approximate: --"
+                )
             lines = [
                 "Smart Fill Preview - preparing surface data...",
+                f"Stage {int(state.get('prepare_stage_index', 0)) + 1}/{int(state.get('prepare_stage_count', 1))}: {state.get('prepare_stage', 'working')}",
+                progress_line,
                 f"Prep {float(state.get('prepare_seconds', 0.0)):.2f}s",
-                f"{cancel_line}; E again/Enter apply",
+                eta_line,
+                "Esc cancel (accepted between slices)",
             ]
         elif state["phase"] == "compute":
             lines = [
@@ -24356,6 +24790,74 @@ def _fill_preview_tag_redraw(state=None):
     _topology_color_tag_redraw_all()
 
 
+def _fill_preview_update_prepare_progress(state, token):
+    """Publish honest per-stage progress and an approximate ETA."""
+    if not isinstance(token, dict):
+        token = _fill_preview_prepare_token(str(token), phase="prepare-finalize")
+    stage = str(token.get("stage", "working"))
+    previous_stage = str(state.get("prepare_stage", ""))
+    if previous_stage != stage:
+        state["prepare_stage_started_at"] = time.perf_counter()
+    stage_order = {
+        "allocate": 0,
+        "vertices": 1,
+        "loop_edges": 2,
+        "loop_vertices": 3,
+        "totals": 4,
+        "hidden": 5,
+        "centers": 6,
+        "normals": 7,
+        "world-space": 8,
+        "world-space-ready": 8,
+        "edge-pairs": 9,
+        "edge-pairs-ready": 9,
+        "seam-detection": 10,
+        "seam-detection-ready": 10,
+        "topology-filter": 11,
+        "topology-filter-ready": 11,
+        "topology-fingerprint": 12,
+        "topology-fingerprint-ready": 12,
+        "topology-validity": 13,
+        "topology-validity-ready": 13,
+        "edge-metrics": 14,
+        "edge-metrics-ready": 14,
+        "face-vertex-schema": 15,
+        "face-vertex-schema-ready": 15,
+        "csr-order": 16,
+        "csr-order-ready": 16,
+        "csr-ready": 17,
+        "cache-fingerprints": 18,
+        "cache-fingerprints-ready": 18,
+        "cache-build": 19,
+        "cache-ready": 19,
+    }
+    if token.get("stage_index") is None and stage in stage_order:
+        token["stage_index"] = stage_order[stage]
+    state["prepare_stage"] = stage
+    state["prepare_progress_phase"] = str(token.get("phase", "prepare"))
+    state["prepare_progress_indeterminate"] = bool(token.get("indeterminate", True))
+    state["prepare_stage_done"] = int(token.get("done", 0))
+    state["prepare_stage_total"] = int(token.get("total", 0))
+    if token.get("stage_index") is not None:
+        state["prepare_stage_index"] = int(token["stage_index"])
+    if token.get("stage_count") is not None:
+        state["prepare_stage_count"] = int(token["stage_count"])
+    if state["prepare_progress_indeterminate"]:
+        state["prepare_progress_fraction"] = None
+        state["prepare_eta_seconds"] = None
+        return
+    total = max(int(state.get("prepare_stage_total", 0)), 1)
+    done = min(max(int(state.get("prepare_stage_done", 0)), 0), total)
+    fraction = float(done) / float(total)
+    state["prepare_progress_fraction"] = fraction
+    started = float(state.get("prepare_stage_started_at", time.perf_counter()))
+    elapsed = max(0.0, time.perf_counter() - started)
+    if fraction > 1.0e-6 and done < total:
+        state["prepare_eta_seconds"] = max(0.0, elapsed * (1.0 - fraction) / fraction)
+    else:
+        state["prepare_eta_seconds"] = None
+
+
 def _fill_preview_stop_draw():
     global _fill_preview_draw_handler, _fill_preview_text_draw_handler
     for handler in (_fill_preview_draw_handler, _fill_preview_text_draw_handler):
@@ -24371,6 +24873,7 @@ def _fill_preview_stop_draw():
 
 def _fill_preview_cancel(state=None, reason="cancel"):
     global _fill_preview_state
+    cleanup_started = time.perf_counter()
     current = _fill_preview_state
     if state is not None and current is not state:
         return
@@ -24414,6 +24917,14 @@ def _fill_preview_cancel(state=None, reason="cancel"):
     current["shadow_screen_overlay_batches"] = None
     current["shadow_screen_overlay_cache_key"] = None
     _fill_preview_stop_draw()
+    cleanup_seconds = time.perf_counter() - cleanup_started
+    current["metrics"]["cleanup_seconds"] = cleanup_seconds
+    cancel_requested_at = current["metrics"].get("cancel_requested_at")
+    if cancel_requested_at is not None:
+        current["metrics"]["cancel_finished_at"] = time.perf_counter()
+        current["metrics"]["cancel_finish_seconds"] = max(
+            0.0, current["metrics"]["cancel_finished_at"] - cancel_requested_at
+        )
     _fill_preview_state = None
     _fill_preview_tag_redraw(current)
 
@@ -24451,32 +24962,20 @@ def _fill_preview_shader_get():
 
 
 def _on_fill_preview_depsgraph_update(_scene, depsgraph):
-    """Invalidate cached graph data for updated objects/meshes.
+    """Mark volatile cache layers dirty without evicting topology indices.
 
-    Cache ownership is independent of an active preview session: a geometry or
-    visibility update while idle must not leave a reusable graph from the old
-    revision.  Blender exposes many Face Set writes as mesh updates too.  The
-    only exception is the short, confirm-owned token below: it is removed from
-    the handler scope before no other operation can interleave and its queued
-    target update is consumed before the token is cleared.  All later or
-    unowned updates take this normal invalidation path.
+    Blender reports Face Set attribute writes and sculpt geometry edits through
+    the same Mesh/Object update flag.  The graph therefore survives this
+    callback; the next E either takes the Face Set-only fast path or refreshes
+    geometry/visibility after a topology guard.  Undo/redo/load handlers still
+    clear all caches because those operations can restore an earlier datablock
+    revision without a reliable per-ID update batch.
     """
     state = _fill_preview_state
     try:
         updates = tuple(depsgraph.updates)
         updated_pointers = _fill_preview_update_pointers(updates)
         if not updated_pointers:
-            return
-        token = _fill_preview_self_face_set_update_token
-        if token is not None and token.get("active"):
-            _fill_preview_consume_self_update_batch(token, updates, updated_pointers)
-            if token.get("safe"):
-                return
-            # An unexpected target update is never suppressed.  The helper has
-            # already dropped target entries; keep the active session stale as
-            # well so it cannot confirm against unknown data.
-            if state is not None and state.get("active"):
-                _fill_preview_cancel(state, "stale")
             return
         affected_session = False
         if state is not None and state.get("active"):
@@ -24485,7 +24984,7 @@ def _on_fill_preview_depsgraph_update(_scene, depsgraph):
                 int(obj.as_pointer()) in updated_pointers
                 or int(obj.data.as_pointer()) in updated_pointers
             )
-        _fill_preview_invalidate_cache_pointers(updated_pointers)
+        _fill_preview_mark_cache_pointers_dirty(updated_pointers)
         if affected_session:
             _fill_preview_cancel(state, "stale")
     except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
@@ -24507,212 +25006,20 @@ def _fill_preview_update_pointers(updates):
     return pointers
 
 
-def _fill_preview_invalidate_cache_pointers(updated_pointers):
-    """Drop cache entries owned by any ID in *updated_pointers*."""
+def _fill_preview_mark_cache_pointers_dirty(updated_pointers):
+    """Mark volatile fields dirty while retaining the expensive graph."""
     for key in list(_fill_preview_adjacency_cache):
         if key[0] in updated_pointers or key[1] in updated_pointers:
-            _fill_preview_adjacency_cache.pop(key, None)
+            cached = _fill_preview_adjacency_cache.get(key)
+            if isinstance(cached, dict):
+                cached["geometry_dirty"] = True
+                cached["geometry_dirty_reason"] = "depsgraph-update"
     for key in list(_fill_preview_cursor_cache):
         if key[0] in updated_pointers or key[1] in updated_pointers:
-            _fill_preview_cursor_cache.pop(key, None)
-
-
-def _fill_preview_self_update_expected(token, update):
-    """Check one update against the confirm token's observed RNA shape."""
-    data = update.id
-    kind = type(data).__name__
-    if kind not in token.get("expected_update_types", ("Mesh", "Object")):
-        return False
-    pointer = int(data.as_pointer())
-    original = getattr(data, "original", None)
-    original_pointer = (
-        int(original.as_pointer()) if original is not None else None
-    )
-    if kind == "Mesh":
-        target = int(token["target_mesh_pointer"])
-    elif kind == "Object":
-        target = int(token["target_object_pointer"])
-    else:
-        return False
-    if pointer != target and original_pointer != target:
-        return False
-    # Blender 5.2.2 marks the Face Set write as geometry on both the direct
-    # Mesh and evaluated Object/Mesh notifications.  Transform-only Object
-    # updates are deliberately not accepted by this token.
-    return bool(getattr(update, "is_updated_geometry", False))
-
-
-def _fill_preview_consume_self_update_batch(token, updates, updated_pointers):
-    """Consume one token-scoped batch while still handling unrelated IDs."""
-    target_pointers = {
-        int(token["target_object_pointer"]),
-        int(token["target_mesh_pointer"]),
-    }
-    unrelated = set(updated_pointers) - target_pointers
-    if unrelated:
-        _fill_preview_invalidate_cache_pointers(unrelated)
-    target_updates = []
-    for update in updates:
-        data = update.id
-        pointer_set = {int(data.as_pointer())}
-        original = getattr(data, "original", None)
-        if original is not None:
-            pointer_set.add(int(original.as_pointer()))
-        if pointer_set & target_pointers:
-            target_updates.append(update)
-    if not target_updates:
-        return
-    token["observed_batches"] = int(token.get("observed_batches", 0)) + 1
-    if not all(_fill_preview_self_update_expected(token, update) for update in target_updates):
-        token["safe"] = False
-        token["unexpected_target_update"] = True
-        _fill_preview_invalidate_cache_pointers(target_pointers)
-
-
-def _fill_preview_self_face_set_update_begin(obj, state, context=None):
-    """Open a bounded ownership token for one confirmed Face Set write.
-
-    Face Set writes and geometry edits have indistinguishable Blender RNA
-    update flags.  This token is therefore scoped to one confirm operation and
-    one explicit dependency-graph drain; it is never a delayed or timeout
-    exemption.  The target Object/Mesh pointers, session operation and
-    generation are recorded so an unexpected callback fails closed.
-    """
-    global _fill_preview_self_face_set_update_token
-    if _fill_preview_self_face_set_update_token is not None:
-        raise RuntimeError("nested Smart Face Set Fill confirmation")
-    signature = _fill_preview_signature(obj)
-    if signature is None:
-        raise RuntimeError("preview target is unavailable")
-    handler_list = bpy.app.handlers.depsgraph_update_post
-    depsgraph = (
-        context.evaluated_depsgraph_get()
-        if context is not None
-        else None
-    )
-    handler_index = None
-    try:
-        handler_index = handler_list.index(_on_fill_preview_depsgraph_update)
-        handler_list.remove(_on_fill_preview_depsgraph_update)
-    except ValueError:
-        # Direct/unit calls may not have registered the handler.  In the real
-        # add-on register() always installs it; without it we fail closed in
-        # the end helper rather than claiming a drained notification.
-        handler_index = None
-    token = {
-        "active": True,
-        "target_object_pointer": int(obj.as_pointer()),
-        "target_mesh_pointer": int(obj.data.as_pointer()),
-        "signature": signature,
-        "confirm_generation": int(state.get("generation", -1)),
-        "operation": "SFSF-confirm-" + str(state.get("session_id", "unknown")),
-        "expected_update_types": ("Mesh", "Object"),
-        "expected_update_kind": "geometry-flagged-Face-Set-attribute-write",
-        "handler_removed": handler_index is not None,
-        "handler_index": handler_index,
-        "observed_batches": 0,
-        "unexpected_target_update": False,
-        "safe": True,
-        "drain_verified": False,
-        "write_succeeded": False,
-        "adjacency_key": signature if signature in _fill_preview_adjacency_cache else None,
-        "cursor_key": signature if signature in _fill_preview_cursor_cache else None,
-        "adjacency_identity": id(_fill_preview_adjacency_cache.get(signature)),
-        "cursor_identity": id(_fill_preview_cursor_cache.get(signature)),
-        "depsgraph": depsgraph,
-    }
-    _fill_preview_self_face_set_update_token = token
-    return token
-
-
-def _fill_preview_self_face_set_update_end(context, token, write_succeeded):
-    """Drain and consume a confirm token before future updates are observable."""
-    global _fill_preview_self_face_set_update_token
-    if token is None or _fill_preview_self_face_set_update_token is not token:
-        return
-    handler_list = bpy.app.handlers.depsgraph_update_post
-    target_pointers = {
-        int(token["target_object_pointer"]),
-        int(token["target_mesh_pointer"]),
-    }
-    token["write_succeeded"] = bool(write_succeeded)
-    try:
-        if not write_succeeded or not token.get("handler_removed"):
-            token["safe"] = False
-        if token.get("safe"):
-            # The first batch may be a direct Mesh notification; the second
-            # may be evaluated Object+Mesh.  Continue until Blender reports no
-            # pending updates instead of relying on a delay or fixed count.
-            stalled = 0
-            while True:
-                depsgraph = token.get("depsgraph")
-                if depsgraph is None:
-                    depsgraph = context.evaluated_depsgraph_get()
-                updates = tuple(depsgraph.updates)
-                if updates:
-                    before = int(token.get("observed_batches", 0))
-                    updated_pointers = _fill_preview_update_pointers(updates)
-                    _fill_preview_consume_self_update_batch(
-                        token, updates, updated_pointers
-                    )
-                    if int(token.get("observed_batches", 0)) == before:
-                        stalled += 1
-                    else:
-                        stalled = 0
-                try:
-                    context.view_layer.update()
-                except (
-                    AttributeError,
-                    ReferenceError,
-                    RuntimeError,
-                    TypeError,
-                    ValueError,
-                ):
-                    token["safe"] = False
-                    break
-                remaining = tuple(depsgraph.updates)
-                if not remaining:
-                    token["drain_verified"] = stalled == 0
-                    break
-                if stalled >= 2:
-                    # This is a safety escape for a pathological callback that
-                    # keeps producing updates; correctness does not depend on
-                    # it because the target is invalidated below.
-                    token["safe"] = False
-                    break
-            if token.get("safe") and token.get("drain_verified"):
-                if token.get("adjacency_key") is not None and id(
-                    _fill_preview_adjacency_cache.get(token["adjacency_key"])
-                ) != token.get("adjacency_identity"):
-                    token["safe"] = False
-                if token.get("cursor_key") is not None and id(
-                    _fill_preview_cursor_cache.get(token["cursor_key"])
-                ) != token.get("cursor_identity"):
-                    token["safe"] = False
-        if not token.get("safe") or not token.get("drain_verified"):
-            _fill_preview_invalidate_cache_pointers(target_pointers)
-    except (
-        AttributeError,
-        ReferenceError,
-        RuntimeError,
-        TypeError,
-        ValueError,
-    ):
-        token["safe"] = False
-        _fill_preview_invalidate_cache_pointers(target_pointers)
-    finally:
-        token["active"] = False
-        token["consumed"] = True
-        _fill_preview_self_face_set_update_token = None
-        if token.get("handler_removed") and _on_fill_preview_depsgraph_update not in handler_list:
-            index = token.get("handler_index")
-            if index is None:
-                handler_list.append(_on_fill_preview_depsgraph_update)
-            else:
-                handler_list.insert(
-                    min(int(index), len(handler_list)),
-                    _on_fill_preview_depsgraph_update,
-                )
+            cached = _fill_preview_cursor_cache.get(key)
+            if isinstance(cached, dict):
+                cached["geometry_dirty"] = True
+                cached["geometry_dirty_reason"] = "depsgraph-update"
 
 
 def _fill_average(values, first, second, count, iterations):
@@ -25192,6 +25499,15 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
             "prepare_finalize_job": None,
             "prepare_raw": None,
             "prepare_stage": "queued",
+            "prepare_stage_index": 0,
+            "prepare_stage_count": 8,
+            "prepare_stage_done": 0,
+            "prepare_stage_total": 0,
+            "prepare_progress_fraction": None,
+            "prepare_progress_indeterminate": True,
+            "prepare_progress_phase": "prepare",
+            "prepare_eta_seconds": None,
+            "prepare_stage_started_at": time.perf_counter(),
             "prepare_tick_times": [],
             "distance_state": None,
             "initial_radius": None,
@@ -25236,6 +25552,20 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
             "max_tick_seconds": 0.0,
             "timer": None,
             "last_timer_dispatch": 0.0,
+            "metrics": {
+                "modal_entries": 0,
+                "modal_max_seconds": 0.0,
+                "draw_count": 0,
+                "draw_max_seconds": 0.0,
+                "draw_max_interval": 0.0,
+                "cancel_requested_at": None,
+                "cancel_finished_at": None,
+                "cancel_finish_seconds": None,
+                "prepare_finalize_max_seconds": 0.0,
+                "cache_adoption_seconds": 0.0,
+                "make_result_seconds": 0.0,
+                "cleanup_seconds": 0.0,
+            },
         }
         if not bool(self.strict_mode):
             # A manual analysis-view owner remains visible by design.  There
@@ -25277,10 +25607,31 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
                 if state["prepare_job"] is None and state["prepare_raw"] is None:
                     signature = state["signature"]
                     cached = None if state.get("cursor_prepare") else _fill_preview_adjacency_cache.get(signature)
+                    refreshed = False
                     if cached is not None:
-                        visibility = _fill_preview_cached_visibility_check(
-                            state["obj"], cached
-                        )
+                        if cached.get("geometry_dirty"):
+                            refreshed = _fill_preview_refresh_cached_adjacency(
+                                state["obj"], cached
+                            )
+                            if not refreshed:
+                                _fill_preview_adjacency_cache.pop(signature, None)
+                                cached = None
+                                state["visibility_cache_invalidated"] = True
+                                state["visibility_cache_reason"] = "topology-changed"
+                    if cached is not None:
+                        cache_started = time.perf_counter()
+                        if refreshed and cached.pop("visibility_refresh_verified", False):
+                            visibility = {
+                                "matches": True,
+                                "reason": "match",
+                                "hidden_count": int(
+                                    cached.pop("visibility_refresh_hidden_count", 0)
+                                ),
+                            }
+                        else:
+                            visibility = _fill_preview_cached_visibility_check(
+                                state["obj"], cached
+                            )
                         state["visibility_cache_checked"] = True
                         state["visibility_cache_hidden_count"] = int(
                             visibility.get("hidden_count", 0)
@@ -25292,6 +25643,9 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
                             _fill_preview_adjacency_cache.pop(signature, None)
                             state["visibility_cache_invalidated"] = True
                             cached = None
+                        state["metrics"]["cache_adoption_seconds"] += (
+                            time.perf_counter() - cache_started
+                        )
                     if cached is not None:
                         state["adjacency"] = cached
                         state["initial_radius"] = _fill_preview_initial_radius(
@@ -25311,7 +25665,8 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
                     else:
                         state["prepare_job"] = _fill_preview_adjacency_steps(state["obj"])
                 try:
-                    state["prepare_stage"] = next(state["prepare_job"])
+                    prepare_token = next(state["prepare_job"])
+                    _fill_preview_update_prepare_progress(state, prepare_token)
                     state["prepare_job_tick"] = time.perf_counter() - started
                     state["prepare_tick_times"].append(
                         {"stage": state["prepare_stage"], "seconds": state["prepare_job_tick"]}
@@ -25330,6 +25685,9 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
                             )[0]
                         )
                         state["prepare_stage"] = "cursor-ready"
+                        state["prepare_progress_indeterminate"] = False
+                        state["prepare_progress_fraction"] = 1.0
+                        state["prepare_progress_phase"] = "ready"
                         state["phase"] = "compute"
                         state["pending"] = True
                         state["wheel_armed"] = False
@@ -25337,6 +25695,9 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
                     else:
                         state["prepare_raw"] = complete.value
                         state["prepare_stage"] = "arrays-ready"
+                        state["prepare_progress_phase"] = "prepare-finalize"
+                        state["prepare_progress_indeterminate"] = True
+                        state["prepare_progress_fraction"] = None
                         state["phase"] = "prepare_finalize"
                 elapsed = time.perf_counter() - started
                 state["last_tick_seconds"] = elapsed
@@ -25349,12 +25710,20 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
             if state["phase"] == "prepare_finalize":
                 started = time.perf_counter()
                 if state["prepare_finalize_job"] is None:
+                    state["prepare_stage_count"] = 20
+                    state["prepare_stage_index"] = 8
+                    state["prepare_stage_started_at"] = time.perf_counter()
                     state["prepare_finalize_job"] = _fill_preview_build_adjacency_cooperative(
                         state["obj"], prepared=state["prepare_raw"]
                     )
                 try:
-                    state["prepare_stage"] = next(state["prepare_finalize_job"])
+                    prepare_token = next(state["prepare_finalize_job"])
+                    _fill_preview_update_prepare_progress(state, prepare_token)
                     state["prepare_finalize_tick"] = time.perf_counter() - started
+                    state["metrics"]["prepare_finalize_max_seconds"] = max(
+                        float(state["metrics"].get("prepare_finalize_max_seconds", 0.0)),
+                        float(state["prepare_finalize_tick"]),
+                    )
                 except StopIteration as complete:
                     state["prepare_finalize_job"] = None
                     adjacency = complete.value
@@ -25365,6 +25734,9 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
                     )
                     state["desired_radius"] = state["initial_radius"]
                     state["prepare_stage"] = "adjacency-ready"
+                    state["prepare_progress_indeterminate"] = False
+                    state["prepare_progress_fraction"] = 1.0
+                    state["prepare_progress_phase"] = "ready"
                 elapsed = time.perf_counter() - started
                 state["prepare_tick_times"].append(
                     {"stage": state["prepare_stage"], "seconds": elapsed}
@@ -25372,6 +25744,10 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
                 state["last_tick_seconds"] = elapsed
                 state["max_tick_seconds"] = max(
                     float(state["max_tick_seconds"]), elapsed
+                )
+                state["metrics"]["prepare_finalize_max_seconds"] = max(
+                    float(state["metrics"].get("prepare_finalize_max_seconds", 0.0)),
+                    float(elapsed),
                 )
                 state["prepare_seconds"] += elapsed
                 if state["prepare_finalize_job"] is not None:
@@ -25398,7 +25774,12 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
                 cached = state["results"].get(key)
                 state["active_result_cache_hit"] = cached is not None
                 if cached is None:
+                    make_result_started = time.perf_counter()
                     cached = _fill_preview_make_result(state, radius)
+                    state["metrics"]["make_result_seconds"] = max(
+                        float(state["metrics"].get("make_result_seconds", 0.0)),
+                        time.perf_counter() - make_result_started,
+                    )
                     state["results"][key] = cached
                     while len(state["results"]) > 3:
                         state["results"].pop(next(iter(state["results"])), None)
@@ -25480,43 +25861,17 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
             changed = int(np.count_nonzero(values[faces] != int(state["seed_face_set"])))
             if changed:
                 values[faces] = int(state["seed_face_set"])
-                self_update_token = _fill_preview_self_face_set_update_begin(
-                    obj, state, context
-                )
-                write_succeeded = False
-                try:
-                    attr.data.foreach_set("value", values)
-                    obj.data.update()
-                    write_succeeded = True
-                finally:
-                    _fill_preview_self_face_set_update_end(
-                        context, self_update_token, write_succeeded
-                    )
+                # Face Set IDs are intentionally outside the reusable graph.
+                # Let the ordinary depsgraph handler mark its volatile layer
+                # dirty; no confirm-only exemption or delayed callback drain is
+                # needed, and the topology cache object remains in place.
+                attr.data.foreach_set("value", values)
+                obj.data.update()
                 result["self_face_set_cache_preserved"] = bool(
-                    self_update_token.get("safe")
-                    and self_update_token.get("drain_verified")
-                    and (
-                        self_update_token.get("adjacency_key") is None
-                        or id(
-                            _fill_preview_adjacency_cache.get(
-                                self_update_token["adjacency_key"]
-                            )
-                        )
-                        == self_update_token.get("adjacency_identity")
-                    )
-                    and (
-                        self_update_token.get("cursor_key") is None
-                        or id(
-                            _fill_preview_cursor_cache.get(
-                                self_update_token["cursor_key"]
-                            )
-                        )
-                        == self_update_token.get("cursor_identity")
-                    )
+                    state["signature"] in _fill_preview_adjacency_cache
+                    or state["signature"] in _fill_preview_cursor_cache
                 )
-                result["self_face_set_update_drain_verified"] = bool(
-                    self_update_token.get("drain_verified")
-                )
+                result["self_face_set_update_drain_verified"] = False
         except (
             AttributeError,
             IndexError,
@@ -25656,6 +26011,34 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
                 },
             )(),
         )
+
+
+# SFSF responsiveness diagnostics are deliberately installed at the function
+# boundary.  This keeps the hot-path selection semantics untouched while
+# measuring the full callback, including GPU batch construction and cleanup.
+_sfsf_draw_uninstrumented = _fill_preview_draw
+def _sfsf_draw_instrumented():
+    state = _fill_preview_state
+    started = time.perf_counter()
+    previous = float(state.get("last_actual_draw_at", 0.0)) if state else 0.0
+    try:
+        return _sfsf_draw_uninstrumented()
+    finally:
+        current = state if state is not None else _fill_preview_state
+        if current is not None:
+            now = time.perf_counter()
+            metrics = current.setdefault("metrics", {})
+            metrics["draw_count"] = int(metrics.get("draw_count", 0)) + 1
+            metrics["draw_max_seconds"] = max(
+                float(metrics.get("draw_max_seconds", 0.0)), now - started
+            )
+            if previous > 0.0:
+                metrics["draw_max_interval"] = max(
+                    float(metrics.get("draw_max_interval", 0.0)), now - previous
+                )
+            current["last_actual_draw_at"] = now
+
+_fill_preview_draw = _sfsf_draw_instrumented
 
 
 class VIEW3D_OT_mesh_focus_topology_color_assign(bpy.types.Operator):
@@ -26202,8 +26585,6 @@ def register():
 
 def unregister():
     global _is_registered, _guided_ridge_last_guide
-    global _fill_preview_self_face_set_update_token
-    _fill_preview_self_face_set_update_token = None
     _guided_ridge_last_guide = None
     _fill_preview_restore_manual_analysis_profiles()
     if not _is_registered:
@@ -26315,6 +26696,33 @@ def unregister():
         del bpy.types.Scene.mfo_reference_object
 
 
+# Wrap only the SFSF modal boundary so every event, including timer and Esc,
+# contributes to the responsiveness measurements shown in diagnostics.
+_sfsf_modal_uninstrumented = VIEW3D_OT_mesh_focus_local_face_set_grow.modal
+def _sfsf_modal_instrumented(self, context, event):
+    state = _fill_preview_state
+    started = time.perf_counter()
+    event_type = getattr(event, "type", "")
+    event_value = getattr(event, "value", None)
+    if state is not None:
+        metrics = state.setdefault("metrics", {})
+        metrics["modal_entries"] = int(metrics.get("modal_entries", 0)) + 1
+        if event_type == "ESC" and event_value in {None, "PRESS"}:
+            metrics["cancel_requested_at"] = time.perf_counter()
+    try:
+        return _sfsf_modal_uninstrumented(self, context, event)
+    finally:
+        current = state if state is not None else _fill_preview_state
+        if current is not None:
+            elapsed = time.perf_counter() - started
+            metrics = current.setdefault("metrics", {})
+            metrics["modal_max_seconds"] = max(
+                float(metrics.get("modal_max_seconds", 0.0)), elapsed
+            )
+
+VIEW3D_OT_mesh_focus_local_face_set_grow.modal = _sfsf_modal_instrumented
+
+
 if __name__ == "__main__":
     register()
 def _fill_preview_build_adjacency_cooperative(obj, prepared=None):
@@ -26332,10 +26740,24 @@ def _fill_preview_build_adjacency_cooperative(obj, prepared=None):
         raise RuntimeError("preview target is unavailable")
     cached = _fill_preview_adjacency_cache.get(signature)
     if cached is not None:
-        visibility = _fill_preview_cached_visibility_check(obj, cached)
-        if visibility.get("matches"):
+        refreshed = False
+        if cached.get("geometry_dirty"):
+            refreshed = _fill_preview_refresh_cached_adjacency(obj, cached)
+            if refreshed:
+                cached.pop("visibility_refresh_verified", None)
+                cached.pop("visibility_refresh_hidden_count", None)
+                return cached
+            _fill_preview_adjacency_cache.pop(signature, None)
+            cached = None
+        visibility = (
+            None
+            if cached is None
+            else _fill_preview_cached_visibility_check(obj, cached)
+        )
+        if visibility is not None and visibility.get("matches"):
             return cached
-        _fill_preview_adjacency_cache.pop(signature, None)
+        if cached is not None:
+            _fill_preview_adjacency_cache.pop(signature, None)
 
     if prepared is None:
         vertex_count = len(mesh.vertices)
@@ -26365,15 +26787,29 @@ def _fill_preview_build_adjacency_cooperative(obj, prepared=None):
         vertex_count = len(coordinates)
         face_count = len(totals)
 
+    # Hash the local coordinates while the raw array is already resident.
+    # The transformed graph only needs the fingerprint, not the raw buffer.
+    coordinate_fingerprint = _fill_preview_array_fingerprint(coordinates)
     transform = np.asarray(obj.matrix_world.to_3x3(), dtype=np.float64)
     world_matrix = np.asarray(obj.matrix_world, dtype=np.float64)
     translation = world_matrix[:3, 3]
+    # The following NumPy transform is indivisible, so publish an honest
+    # indeterminate state before entering it.  The timer records the wall
+    # time of the native call and returns on the next stage boundary.
+    yield _fill_preview_prepare_token("world-space", phase="prepare-finalize")
     world_vertices = coordinates.astype(np.float64) @ transform.T + translation
     centers = centers.astype(np.float64) @ transform.T + translation
     normals = normals.astype(np.float64) @ np.linalg.inv(transform)
     normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1.0e-20)
-    yield "world-space"
+    if isinstance(prepared, dict):
+        # ``prepared`` is the one-shot state payload owned by this modal
+        # session. Release the largest raw buffer once its world-space copy
+        # and fingerprint exist; topology arrays remain live below.
+        prepared.pop("coordinates", None)
+    del coordinates
+    yield _fill_preview_prepare_token("world-space-ready", 1, 1, phase="prepare-finalize")
 
+    yield _fill_preview_prepare_token("edge-pairs", phase="prepare-finalize")
     face_ids = np.repeat(np.arange(face_count, dtype=np.int32), totals)
     order = np.argsort(loop_edges, kind="stable")
     sorted_edges = loop_edges[order]
@@ -26389,9 +26825,9 @@ def _fill_preview_build_adjacency_cooperative(obj, prepared=None):
     )
     edge_v0 = loop_vertices[paired_loops]
     edge_v1 = loop_vertices[paired_next]
-    yield "edge-pairs"
+    yield _fill_preview_prepare_token("edge-pairs-ready", 1, 1, phase="prepare-finalize")
 
-    yield "seam-before"
+    yield _fill_preview_prepare_token("seam-detection", phase="prepare-finalize")
     # Preserve the existing unwelded-seam behavior.  Only coincident open
     # edges with opposite winding and compatible normals become bridges.
     border_loops = order[starts[lengths == 1]]
@@ -26430,11 +26866,31 @@ def _fill_preview_build_adjacency_cooperative(obj, prepared=None):
         edge_v0 = np.r_[edge_v0, loop_vertices[border_loops[ia[match]]]]
         edge_v1 = np.r_[edge_v1, loop_vertices[next_loops[ia[match]]]]
         seam_count = int(np.count_nonzero(match))
-        yield "seam-after"
+        yield _fill_preview_prepare_token("seam-detection-ready", 1, 1, phase="prepare-finalize")
 
+    yield _fill_preview_prepare_token("topology-filter", phase="prepare-finalize")
+    topology_first = np.asarray(first, dtype=np.int32)
+    topology_second = np.asarray(second, dtype=np.int32)
+    topology_edge_v0 = np.asarray(edge_v0, dtype=np.int32)
+    topology_edge_v1 = np.asarray(edge_v1, dtype=np.int32)
+    topology_fingerprint = _fill_preview_topology_fingerprint(
+        loop_edges, loop_vertices, totals
+    )
     valid = ~(hidden[first] | hidden[second]) & (first != second)
-    first, second = first[valid], second[valid]
-    edge_v0, edge_v1 = edge_v0[valid], edge_v1[valid]
+    all_visible = bool(np.all(valid))
+    if not all_visible:
+        # Hidden faces need an immutable raw pair list so visibility changes
+        # can rebuild the filtered CSR without re-sorting every loop.  When
+        # the common all-visible case applies, share the arrays with the
+        # visible graph and avoid four large duplicate allocations.
+        topology_first = topology_first.copy()
+        topology_second = topology_second.copy()
+        topology_edge_v0 = topology_edge_v0.copy()
+        topology_edge_v1 = topology_edge_v1.copy()
+        first, second = first[valid], second[valid]
+        edge_v0, edge_v1 = edge_v0[valid], edge_v1[valid]
+    yield _fill_preview_prepare_token("topology-validity-ready", 1, 1, phase="prepare-finalize")
+    yield _fill_preview_prepare_token("edge-metrics", phase="prepare-finalize")
     delta = centers[second] - centers[first]
     distance = np.maximum(np.linalg.norm(delta, axis=1), 1.0e-20)
     sources = np.r_[first, second]
@@ -26442,17 +26898,20 @@ def _fill_preview_build_adjacency_cooperative(obj, prepared=None):
     source_edges = np.r_[np.arange(len(first)), np.arange(len(first))]
     edge_v0_directed = np.r_[edge_v0, edge_v0]
     edge_v1_directed = np.r_[edge_v1, edge_v1]
-    face_vertex_ids = tuple(
-        tuple(
-            int(value)
-            for value in loop_vertices[
-                int(face_starts[face]):int(face_starts[face]) + int(totals[face])
-            ]
-        )
-        for face in range(face_count)
+    yield _fill_preview_prepare_token("edge-metrics-ready", 1, 1, phase="prepare-finalize")
+    # The full graph already has the flat loop vertex array and per-face
+    # offsets.  Keep that compact schema instead of allocating millions of
+    # Python tuples/integers; the compatibility accessor presents the same
+    # indexed sequence to the boundary resolvers.
+    yield _fill_preview_prepare_token("face-vertex-schema", phase="prepare-finalize")
+    face_vertex_flat = loop_vertices
+    face_vertex_offsets = np.asarray(face_starts, dtype=np.int64)
+    yield _fill_preview_prepare_token(
+        "face-vertex-schema-ready", 1, 1, phase="prepare-finalize"
     )
+    yield _fill_preview_prepare_token("csr-order", phase="prepare-finalize")
     order = np.argsort(sources, kind="stable")
-    yield "csr-before"
+    yield _fill_preview_prepare_token("csr-order-ready", 1, 1, phase="prepare-finalize")
     degree = np.bincount(sources, minlength=face_count)
     offsets = np.r_[0, np.cumsum(degree)].astype(np.int64)
     pair_edge_points = (
@@ -26460,7 +26919,15 @@ def _fill_preview_build_adjacency_cooperative(obj, prepared=None):
         if len(edge_v0)
         else np.empty((0, 2, 3), dtype=np.float64)
     )
-    yield "csr-after"
+    yield _fill_preview_prepare_token("csr-ready", 1, 1, phase="prepare-finalize")
+    yield _fill_preview_prepare_token("cache-fingerprints", phase="prepare-finalize")
+    # The first make-result call reads the live Face Set values anyway.  Its
+    # fingerprint is recorded there, avoiding a second full attribute read
+    # during cold graph assembly.  A missing fingerprint conservatively uses
+    # the ordinary geometry validation path on an early dirty notification.
+    face_set_fingerprint = None
+    yield _fill_preview_prepare_token("cache-fingerprints-ready", 1, 1, phase="prepare-finalize")
+    yield _fill_preview_prepare_token("cache-build", phase="prepare-finalize")
     cached = {
         "signature": signature,
         "count": int(face_count),
@@ -26483,10 +26950,21 @@ def _fill_preview_build_adjacency_cooperative(obj, prepared=None):
         "pair_v0": edge_v0,
         "pair_v1": edge_v1,
         "pair_edge_points": pair_edge_points,
-        "face_vertex_ids": face_vertex_ids,
+        "face_vertex_flat": face_vertex_flat,
+        "face_vertex_offsets": face_vertex_offsets,
+        "face_vertex_counts": totals.astype(np.int32, copy=False),
         "face_ids": np.arange(face_count, dtype=np.int32),
         "seam_count": seam_count,
         "vertex_id_space": "mesh-global",
+        "topology_fingerprint": topology_fingerprint,
+        "topology_first": topology_first,
+        "topology_second": topology_second,
+        "topology_edge_v0": topology_edge_v0,
+        "topology_edge_v1": topology_edge_v1,
+        "coordinate_fingerprint": coordinate_fingerprint,
+        "face_set_fingerprint": face_set_fingerprint,
+        "geometry_dirty": False,
+        "geometry_refresh_count": 0,
     }
     # Drop obsolete revisions for this mesh while retaining unrelated meshes.
     mesh_pointer = signature[1]
@@ -26494,4 +26972,5 @@ def _fill_preview_build_adjacency_cooperative(obj, prepared=None):
         if key[1] == mesh_pointer and key != signature:
             _fill_preview_adjacency_cache.pop(key, None)
     _fill_preview_adjacency_cache[signature] = cached
+    yield _fill_preview_prepare_token("cache-ready", 1, 1, phase="prepare-finalize")
     return cached
