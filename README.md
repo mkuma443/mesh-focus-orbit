@@ -2,7 +2,7 @@
 
 Blender 5.2 用のリトポロジー支援アドオンです。
 
-アドオンバージョン: **3.3.9**
+アドオンバージョン: **3.3.13**
 
 ## 主な機能
 
@@ -122,7 +122,7 @@ Edit Mode で面を選択し、`Ctrl + Alt + 1`〜`6` を押すと、表示中�
 
 A Blender 5.2 add-on for manual retopology workflows.
 
-Add-on version: **3.3.9**
+Add-on version: **3.3.13**
 
 ## Main features
 

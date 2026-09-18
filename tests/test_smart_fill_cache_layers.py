@@ -12,6 +12,7 @@ unlinked mesh and removes it before returning; no scene is changed or saved.
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import pathlib
 import sys
 
@@ -215,8 +216,53 @@ def _test_real_builder(module):
         bpy.data.meshes.remove(mesh)
 
 
+def _test_boundary_green_predicate(module):
+    """The green state follows only the displayed cyan/orange classification."""
+
+    # A cyan segment keeps the established cyan/orange split, regardless of
+    # the candidate count or any hypothetical next wheel stage.
+    assert not module._fill_preview_should_use_green_boundary([True, False])
+    # An all-orange boundary is green even when a later candidate would add
+    # faces: the display state is intentionally local to the current result.
+    assert module._fill_preview_should_use_green_boundary([True, True])
+    assert module._fill_preview_should_use_green_boundary([True])
+    # Shrinking back to a stage with a cyan segment immediately clears green.
+    assert not module._fill_preview_should_use_green_boundary([False, True])
+    assert not module._fill_preview_should_use_green_boundary([])
+    # The production mask includes non-boundary graph pairs.  Restricting it
+    # to the existing boundary mask must preserve the same all-orange result.
+    assert module._fill_preview_should_use_green_boundary(
+        [True, False, True], [True, False, True]
+    )
+    assert not module._fill_preview_should_use_green_boundary(
+        [True, False, True], [True, True, True]
+    )
+    return {
+        "mixed_cyan_orange": False,
+        "all_orange_with_future_growth": True,
+        "all_orange_terminal": True,
+        "shrink_cyan_restores_split": True,
+    }
+
+
+def _test_draw_uses_saved_color_flag(module):
+    """Drawing must consume the result flag without rescanning boundary rows."""
+
+    source = inspect.getsource(module._sfsf_draw_uninstrumented)
+    assert "boundary_all_orange" in source
+    assert "boundary_records" not in source
+    assert "np.asarray" not in source
+    return {
+        "saved_flag_used": True,
+        "boundary_records_rescan": False,
+        "draw_numpy_allocation": False,
+    }
+
+
 def run():
     module = _load_module()
+    boundary_green = _test_boundary_green_predicate(module)
+    draw_flag = _test_draw_uses_saved_color_flag(module)
     _test_real_builder(module)
     obj = _Object()
     _patch_foreach_get(obj.data)
@@ -275,6 +321,8 @@ def run():
         "geometry_refresh": "depsgraph-dirty",
         "visibility_refresh": "retained-topology",
         "same_count_rewire": "rebuild-required",
+        "boundary_green": boundary_green,
+        "draw_flag": draw_flag,
     }
 
 

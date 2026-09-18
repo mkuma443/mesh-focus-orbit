@@ -9,7 +9,7 @@ rotating the view.
 bl_info = {
     "name": "Mesh Focus Orbit",
     "author": "OpenAI",
-    "version": (3, 3, 9),
+    "version": (3, 3, 13),
     "blender": (5, 2, 0),
     "location": "3D View",
     "description": "Mesh-centered orbit, Face Set tools, Smart Fill, and Guided Ridge",
@@ -27,6 +27,7 @@ import json
 import math
 import os
 import statistics
+import struct
 import tempfile
 import time
 from array import array
@@ -37,7 +38,7 @@ from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, Po
 from bpy_extras import view3d_utils
 from gpu_extras.batch import batch_for_shader
 from mathutils import Vector
-from mathutils.geometry import intersect_ray_tri, tessellate_polygon
+from mathutils.geometry import tessellate_polygon
 from mathutils.bvhtree import BVHTree
 
 
@@ -2698,6 +2699,90 @@ def _distance_along_ray(origin, direction, point):
     return distance if distance > 1.0e-7 else None
 
 
+_FLOAT32_SIGN_MASK = 0x80000000
+_FLOAT32_MIN_SUBNORMAL = 1.401298464324817e-45
+
+
+def _float32_step_toward(value, direction):
+    """Return the next float32 spacing from ``value`` along ``direction``."""
+    value = float(value)
+    direction = float(direction)
+    if not math.isfinite(value) or direction == 0.0:
+        return None
+    if value == 0.0:
+        return _FLOAT32_MIN_SUBNORMAL
+
+    try:
+        bits = struct.unpack("<I", struct.pack("<f", value))[0]
+    except (OverflowError, struct.error):
+        return None
+
+    if direction > 0.0:
+        next_bits = bits - 1 if bits & _FLOAT32_SIGN_MASK else bits + 1
+    else:
+        next_bits = bits + 1 if bits & _FLOAT32_SIGN_MASK else bits - 1
+
+    try:
+        next_value = struct.unpack(
+            "<f", struct.pack("<I", next_bits)
+        )[0]
+    except (OverflowError, struct.error):
+        return None
+    spacing = abs(next_value - value)
+    return spacing if math.isfinite(spacing) and spacing > 0.0 else None
+
+
+def _edit_ray_advance_epsilon(local_location, local_direction, local_normal):
+    """Find the smallest float32-safe advance that exits a hidden hit."""
+    candidates = []
+    for coordinate, component in zip(local_location, local_direction):
+        component = float(component)
+        if not math.isfinite(component) or component == 0.0:
+            continue
+        spacing = _float32_step_toward(coordinate, component)
+        if spacing is None:
+            continue
+        epsilon = spacing / abs(component)
+        if math.isfinite(epsilon) and epsilon > 0.0:
+            candidates.append(epsilon)
+
+    if not candidates:
+        return None
+
+    try:
+        normal_length = local_normal.length
+    except (AttributeError, TypeError, ValueError):
+        normal_length = 0.0
+    ray_normal = (
+        local_normal.dot(local_direction) if normal_length > 1.0e-12 else 0.0
+    )
+
+    # Test candidates in ascending order using mathutils' actual float32
+    # vector arithmetic.  For a slanted ray, a tangent coordinate can be the
+    # first ULP candidate while the normal coordinate still rounds unchanged;
+    # reject that candidate and retain the smallest one that moves through the
+    # hit surface.  This avoids both same-face re-hits and over-large gaps.
+    for epsilon in sorted(set(candidates)):
+        epsilon = math.nextafter(epsilon, math.inf)
+        advanced = local_location + local_direction * epsilon
+        delta = advanced - local_location
+        if not any(float(value) != 0.0 for value in delta):
+            continue
+        if ray_normal != 0.0 and local_normal.dot(delta) * ray_normal <= 0.0:
+            continue
+        return epsilon
+
+    # A degenerate/zero BVH normal still gets the smallest candidate that
+    # actually changes a float32 component.  The caller's bounded retry loop
+    # remains the final guard for malformed geometry.
+    for epsilon in reversed(sorted(set(candidates))):
+        epsilon = math.nextafter(epsilon, math.inf)
+        advanced = local_location + local_direction * epsilon
+        if any(float(value) != 0.0 for value in advanced - local_location):
+            return epsilon
+    return None
+
+
 def _raycast_object(obj, depsgraph, origin, direction):
     """Ray cast an evaluated object and return (world_point, distance)."""
     try:
@@ -2731,52 +2816,93 @@ def _raycast_edit_object(obj, origin, direction):
     except (AttributeError, RuntimeError, TypeError):
         return None
 
-    matrix_world = obj.matrix_world
-    best = None
+    # FromBMesh consumes the live edit BMesh directly.  Refreshing the face
+    # lookup/index tables is a C-side operation and makes the BVH hit index
+    # map back to ``bm.faces[index]`` without copying millions of faces into
+    # Python.  The tree is deliberately local to this activation: an edit
+    # operation can invalidate both the BMesh and its spatial index.
+    try:
+        bm.faces.ensure_lookup_table()
+        bm.faces.index_update()
+        bvh = BVHTree.FromBMesh(bm)
+        matrix_world = obj.matrix_world
+        inverse = matrix_world.inverted_safe()
+        local_origin = inverse @ origin
+        local_direction = inverse.to_3x3() @ direction
+        if local_direction.length_squared == 0.0:
+            return None
+        local_direction.normalize()
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
 
-    for face in bm.faces:
-        if not face.is_valid or face.hide:
-            continue
+    # Blender's BVH includes hidden BMesh faces/vertices.  A hit on one is
+    # skipped by starting the next query just beyond the hit.  The bounded
+    # loop handles hidden layers and prevents malformed edit geometry from
+    # causing an unbounded sequence of ray casts.
+    ray_origin = local_origin
+    max_hidden_hits = 64
+    last_hidden_face_index = None
+    same_hidden_face_hits = 0
+    for _ in range(max_hidden_hits + 1):
+        try:
+            hit = bvh.ray_cast(ray_origin, local_direction)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return None
 
-        local_vertices = [loop.vert.co.copy() for loop in face.loops]
-        if len(local_vertices) < 3 or any(loop.vert.hide for loop in face.loops):
-            continue
+        local_location, local_normal, face_index, _local_distance = hit
+        if local_location is None or face_index is None:
+            return None
 
-        if len(local_vertices) == 3:
-            triangles = (local_vertices,)
-        else:
-            try:
-                triangle_indices = tessellate_polygon([local_vertices])
-                triangles = tuple(
-                    tuple(local_vertices[index] for index in triangle)
-                    for triangle in triangle_indices
-                )
-            except (RuntimeError, TypeError, ValueError):
-                # A fan is a useful fallback for unusual or temporarily
-                # invalid n-gons while the user is editing.
-                triangles = tuple(
-                    (local_vertices[0], local_vertices[index], local_vertices[index + 1])
-                    for index in range(1, len(local_vertices) - 1)
-                )
+        try:
+            face = bm.faces[int(face_index)]
+        except (IndexError, ReferenceError, RuntimeError, TypeError, ValueError):
+            return None
 
-        for triangle in triangles:
-            world_triangle = tuple(matrix_world @ vertex for vertex in triangle)
-            hit_location = intersect_ray_tri(
-                world_triangle[0],
-                world_triangle[1],
-                world_triangle[2],
-                direction,
-                origin,
-                True,
+        try:
+            visible = (
+                face.is_valid
+                and not face.hide
+                and not any(loop.vert.hide for loop in face.loops)
             )
-            if hit_location is None:
-                continue
+        except (AttributeError, ReferenceError, RuntimeError, TypeError):
+            return None
 
-            distance = _distance_along_ray(origin, direction, hit_location)
-            if distance is not None and (best is None or distance < best[1]):
-                best = (hit_location.copy(), distance)
+        try:
+            if local_normal is None or local_normal.length <= 1.0e-12:
+                local_normal = face.normal.copy()
+        except (AttributeError, ReferenceError, RuntimeError, TypeError):
+            local_normal = None
 
-    return best
+        if visible:
+            world_location = matrix_world @ local_location
+            distance = _distance_along_ray(origin, direction, world_location)
+            return (
+                (world_location.copy(), distance)
+                if distance is not None
+                else None
+            )
+
+        if face_index == last_hidden_face_index:
+            same_hidden_face_hits += 1
+        else:
+            last_hidden_face_index = face_index
+            same_hidden_face_hits = 1
+        if same_hidden_face_hits > max_hidden_hits:
+            return None
+
+        # Advance by the smallest float32-safe ULP along the ray.  The helper
+        # checks the hit normal so a slanted ray cannot choose a tangent-axis
+        # ULP that leaves the normal coordinate unchanged.
+        epsilon = _edit_ray_advance_epsilon(
+            local_location,
+            local_direction,
+            local_normal,
+        )
+        if epsilon is None:
+            return None
+        ray_origin = local_location + local_direction * epsilon
+
+    return None
 
 
 def _find_center_hit(context):
@@ -19095,6 +19221,31 @@ def _fill_preview_shape_boundary_mask(crossing, outside_distance, radius, edge_i
     )
 
 
+def _fill_preview_should_use_green_boundary(
+    shape_boundary_mask,
+    boundary_mask=None,
+):
+    """Return whether every currently displayed boundary segment is orange.
+
+    This is a display-only predicate over the existing cyan/orange
+    classification.  It deliberately does not inspect candidate faces,
+    wheel limits, or a future stage: the green state only communicates that
+    the current visible boundary has no cyan segment.
+    """
+    import numpy as np
+
+    try:
+        shape = np.asarray(shape_boundary_mask, dtype=bool).reshape(-1)
+        if boundary_mask is not None:
+            boundary = np.asarray(boundary_mask, dtype=bool).reshape(-1)
+            if len(boundary) != len(shape):
+                return False
+            shape = shape[boundary]
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return bool(len(shape) and np.all(shape))
+
+
 def _fill_preview_resolve_enclosed_components(
     geometry, distances, radius, selected_ids
 ):
@@ -24096,6 +24247,10 @@ def _fill_preview_make_result(state, radius):
         shape_boundary_mask = _fill_preview_shape_boundary_mask(
             boundary, draw_outside_distances, radius, pair_edge_indices
         )
+    patch_edge_reached = False if screen_mode else bool(
+        len(patch_ids)
+        and np.any(distances[patch_ids] >= patch_radius - max(patch_radius * 0.01, 1.e-8))
+    )
     for edge in np.flatnonzero(boundary):
         edge_index = -1
         # pair_v0/pair_v1 are generated together with the face pair and
@@ -24144,10 +24299,6 @@ def _fill_preview_make_result(state, radius):
             }
         )
         (shape_segments if shape_boundary else distance_segments).append(segment)
-    patch_edge_reached = False if screen_mode else bool(
-        len(patch_ids)
-        and np.any(distances[patch_ids] >= patch_radius - max(patch_radius * 0.01, 1.e-8))
-    )
     confirm_snapshot, confirm_domain_ids = _fill_preview_confirm_graph_snapshot(
         geometry, distances, radius
     )
@@ -24180,6 +24331,13 @@ def _fill_preview_make_result(state, radius):
         "faces": preview_faces,
         "candidate_count": int(len(preview_faces)),
         "boundary_edge_count": int(len(boundary_records)),
+        "boundary_all_orange": bool(
+            len(boundary_records)
+            and len(boundary_records) == int(np.count_nonzero(boundary))
+            and _fill_preview_should_use_green_boundary(
+                shape_boundary_mask, boundary
+            )
+        ),
         "analysis_faces": int(len(analysis_ids)),
         "popped_faces": int(popped),
         "shape_segments": shape_segments,
@@ -24732,11 +24890,14 @@ def _fill_preview_draw():
                     batch = result.get("gpu_batches", {}).get("triangles")
                     if batch is not None:
                         batch.draw(shader)
+                green_boundary = bool(result.get("boundary_all_orange", False))
                 for key, color, batch_key in (
                     ("distance_lines_np", (0.20, 0.86, 1.0, 0.95), "distance_lines"),
                     ("shape_lines_np", (1.0, 0.38, 0.08, 0.95), "shape_lines"),
                 ):
                     if len(result[key]):
+                        if green_boundary:
+                            color = (0.16, 1.0, 0.34, 0.95)
                         shader.bind()
                         shader.uniform_float("color", color)
                         gpu.state.line_width_set(2.0)
