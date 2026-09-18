@@ -9,10 +9,10 @@ rotating the view.
 bl_info = {
     "name": "Mesh Focus Orbit",
     "author": "OpenAI",
-    "version": (3, 3, 1),
+    "version": (3, 3, 5),
     "blender": (5, 2, 0),
     "location": "3D View",
-    "description": "Temporary mesh-centered orbit and local Smart Face Set Fill preview",
+    "description": "Mesh-centered orbit, Face Set tools, Smart Fill, and Guided Ridge",
     "category": "3D View",
 }
 
@@ -22,6 +22,7 @@ import blf
 import copy
 import gpu
 import heapq
+import hashlib
 import json
 import math
 import os
@@ -50,6 +51,11 @@ TUBE_SHAPE_OPERATOR_ID = "view3d.mesh_focus_tube_shape"
 TUBE_SHAPE_KEY = "T"
 LOCAL_FEATURE_BRUSH_OPERATOR_ID = "view3d.mesh_focus_local_feature_brush"
 LOCAL_FEATURE_BRUSH_KEY = "F"
+GUIDED_RIDGE_OPERATOR_ID = "view3d.mesh_focus_guided_ridge"
+GUIDED_RIDGE_KEY = "G"
+GUIDED_RIDGE_MAX_CONTROLS = 64
+GUIDED_RIDGE_MAX_CANDIDATE_FACES = 50000
+GUIDED_RIDGE_DISTANCE_MAX_PAIRS = 262144
 # The local-feature implementation is selected as a normal Sculpt Brush
 # asset.  The marker is an ID property saved with the dedicated asset; its
 # name and datablock pointer are deliberately not part of the identity.
@@ -87,6 +93,7 @@ _retopo_undo_tombstones = {}
 _local_face_set_adjacency_cache = {}
 _fill_preview_adjacency_cache = {}
 _fill_preview_cursor_cache = {}
+_fill_preview_self_face_set_update_token = None
 _fill_preview_state = None
 _fill_preview_last_confirm_metrics = {}
 _fill_preview_draw_handler = None
@@ -96,6 +103,8 @@ _tube_preview_state = None
 _tube_preview_draw_handler = None
 _tube_preview_text_draw_handler = None
 _tube_preview_shader = None
+_guided_ridge_state = None
+_guided_ridge_last_guide = None
 _local_feature_brush_states = {}
 _local_feature_brush_cache = {}
 _local_feature_brush_load_guard = False
@@ -175,6 +184,7 @@ _TOPOLOGY_COLOR_HANDLER_NAMES = {
 }
 _FILL_PREVIEW_HANDLER_NAMES = {
     "_on_fill_preview_depsgraph_update",
+    "_on_fill_preview_redo_post",
 }
 _TUBE_PREVIEW_HANDLER_NAMES = {
     "_on_tube_preview_depsgraph_update",
@@ -6481,6 +6491,11 @@ def _on_undo_post(_dummy):
     global _last_undo_post_perf
     _fill_preview_cancel(reason="undo")
     _tube_preview_cancel(reason="undo")
+    # Undo can restore coordinates/topology/visibility and may not expose a
+    # target Mesh update in the same callback turn.  Never let a pre-Undo
+    # surface graph survive on that assumption.
+    _fill_preview_adjacency_cache.clear()
+    _fill_preview_cursor_cache.clear()
     if not _undo_orphan_cleanup_pending:
         _last_undo_post_perf = time.perf_counter()
     _retopo_debug_emit(
@@ -6495,8 +6510,18 @@ def _on_undo_post(_dummy):
 
 
 @persistent
+def _on_fill_preview_redo_post(_dummy):
+    """Invalidate preview graphs after native Redo restores mesh state."""
+    _fill_preview_cancel(reason="redo")
+    _fill_preview_adjacency_cache.clear()
+    _fill_preview_cursor_cache.clear()
+
+
+@persistent
 def _on_load_pre(_dummy):
     """Clear viewport-bound state before Blender replaces the current file."""
+    global _fill_preview_self_face_set_update_token
+    _fill_preview_self_face_set_update_token = None
     _fill_preview_cancel(reason="load")
     _fill_preview_restore_manual_analysis_profiles()
     _tube_preview_cancel(reason="load")
@@ -6511,6 +6536,8 @@ def _on_load_pre(_dummy):
 @persistent
 def _on_load_post(_dummy):
     """Recover remnants loaded from a file saved during Face Set MFO."""
+    global _fill_preview_self_face_set_update_token
+    _fill_preview_self_face_set_update_token = None
     _fill_preview_cancel(reason="load-post")
     _fill_preview_restore_manual_analysis_profiles()
     _tube_preview_cancel(reason="load-post")
@@ -6917,13 +6944,105 @@ class VIEW3D_OT_mesh_focus_orbit(bpy.types.Operator):
         return {"FINISHED"}
 
 
+def _clip_sculpt_cursor_segment_to_planes(rv3d, start, end):
+    """Clip a world-space cursor segment by RegionView3D user planes.
+
+    ``RegionView3D.clip_planes`` stores the same four-component planes used
+    by Blender's native ``ED_view3d_clip_segment`` path.  The positive side
+    of each plane is inside the viewport.  Keeping this small slab clip in
+    Python avoids turning a rejected near/far segment back into an infinite
+    Object.ray_cast ray.
+    """
+    if not bool(getattr(rv3d, "use_clip_planes", False)):
+        return start, end
+
+    try:
+        segment = end - start
+        lower = 0.0
+        upper = 1.0
+        for plane in getattr(rv3d, "clip_planes", ()):
+            if len(plane) < 4:
+                continue
+            normal = Vector((float(plane[0]), float(plane[1]), float(plane[2])))
+            if normal.length_squared <= 1.0e-20:
+                continue
+            distance = float(plane[3])
+            value_start = float(normal.dot(start)) + distance
+            value_end = float(normal.dot(end)) + distance
+            if value_start < 0.0 and value_end < 0.0:
+                return None
+            if value_start < 0.0 or value_end < 0.0:
+                fraction = value_start / (value_start - value_end)
+                if value_start < 0.0:
+                    lower = max(lower, fraction)
+                else:
+                    upper = min(upper, fraction)
+                if lower > upper:
+                    return None
+        return start + segment * lower, start + segment * upper
+    except (AttributeError, IndexError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _sculpt_cursor_ray_segment(context, coord, direction):
+    """Return the same clipped world segment rendered for one cursor pixel.
+
+    ``RegionView3D.perspective_matrix`` is Blender's ``window_matrix *
+    view_matrix``.  Unprojecting that matrix at NDC z=-1 and z=+1 gives the
+    actual near/far world points for both perspective and orthographic views;
+    unlike ``region_2d_to_origin_3d`` alone, this cannot start before the
+    viewport's near plane or continue beyond its far plane.  The endpoints
+    are ordered along the public view3d_utils ray direction and then clipped
+    by optional custom RegionView3D planes.
+    """
+    try:
+        region = context.region
+        rv3d = context.space_data.region_3d
+        if region is None or rv3d is None:
+            return None
+        width = float(region.width)
+        height = float(region.height)
+        if width <= 0.0 or height <= 0.0:
+            return None
+
+        perspective_inverse = rv3d.perspective_matrix.inverted_safe()
+        ndc_x = (2.0 * float(coord.x) / width) - 1.0
+        ndc_y = (2.0 * float(coord.y) / height) - 1.0
+
+        def unproject(ndc_z):
+            point = perspective_inverse @ Vector((ndc_x, ndc_y, ndc_z, 1.0))
+            if abs(float(point.w)) <= 1.0e-12:
+                return None
+            return Vector((point.x, point.y, point.z)) / float(point.w)
+
+        near_point = unproject(-1.0)
+        far_point = unproject(1.0)
+        if near_point is None or far_point is None:
+            return None
+        segment = far_point - near_point
+        if segment.length_squared <= 1.0e-20:
+            return None
+
+        view_direction = Vector(direction)
+        if view_direction.length_squared <= 1.0e-20:
+            return None
+        view_direction.normalize()
+        if float(segment.dot(view_direction)) < 0.0:
+            near_point, far_point = far_point, near_point
+        return _clip_sculpt_cursor_segment_to_planes(rv3d, near_point, far_point)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+
+
 def _raycast_sculpt_face_set(context, coord):
     """Return the first visible active-mesh face under the cursor.
 
-    Object.ray_cast does not honor Sculpt face hiding.  When it returns a
-    hidden face, advance the local ray past that hit and continue until a
-    visible face is found.  The returned polygon index remains the original
-    mesh index used by the Face Set attribute and preview adjacency graph.
+    The cursor ray is bounded to Blender's rendered near/far segment and
+    optional custom RegionView3D clip planes.  Object.ray_cast does not honor
+    Sculpt face hiding.  When it returns a hidden face, advance the local ray
+    past that hit and continue until a visible face is found.  The returned
+    polygon index remains the face index used by the Face Set attribute and
+    preview adjacency graph.
     """
     obj = context.active_object
     if obj is None or obj.type != "MESH":
@@ -6937,33 +7056,54 @@ def _raycast_sculpt_face_set(context, coord):
         coord = Vector(coord)
         region = context.region
         rv3d = context.space_data.region_3d
-        origin = view3d_utils.region_2d_to_origin_3d(region, rv3d, coord)
         direction = view3d_utils.region_2d_to_vector_3d(region, rv3d, coord)
         if direction.length_squared == 0.0:
             return None
         direction.normalize()
 
+        world_segment = _sculpt_cursor_ray_segment(context, coord, direction)
+        if world_segment is None:
+            return None
+        world_start, world_end = world_segment
+        world_ray = world_end - world_start
+        world_ray_length_squared = float(world_ray.length_squared)
+        if world_ray_length_squared <= 1.0e-20:
+            return None
+        world_direction = world_ray.normalized()
+
         inverse = obj.matrix_world.inverted_safe()
-        local_origin = inverse @ origin
-        local_direction = inverse.to_3x3() @ direction
+        local_origin = inverse @ world_start
+        local_direction = inverse.to_3x3() @ world_direction
         if local_direction.length_squared == 0.0:
             return None
         local_direction.normalize()
 
         for _attempt in range(256):
-            hit, location, _normal, face_index = obj.ray_cast(
+            hit, location, _local_normal, face_index = obj.ray_cast(
                 local_origin,
                 local_direction,
             )
             if not hit or face_index < 0 or face_index >= len(face_set_attr.data):
                 return None
             polygon = obj.data.polygons[int(face_index)]
+            world_location = obj.matrix_world @ location
+            hit_fraction = float((world_location - world_start).dot(world_ray)) / world_ray_length_squared
+            if hit_fraction < -1.0e-6 or hit_fraction > 1.0 + 1.0e-6:
+                return None
+            # Match Sculpt's PBVH cursor ray: the nearest non-hidden triangle
+            # is the cursor surface regardless of winding.  ``use_frontface``
+            # / BRUSH_FRONTFACE filters the brush's affected vertices; it is
+            # not a seed-ray backface cull.  Rejecting by polygon normal here
+            # would make an inside-out but visible surface fall through to a
+            # farther Face Set, unlike native Sculpt.  Occluded geometry is
+            # already excluded by the nearest-hit rule, and hidden faces are
+            # handled by the retry below.
             if not bool(polygon.hide):
                 return (
                     obj,
                     int(face_index),
                     int(face_set_attr.data[face_index].value),
-                    obj.matrix_world @ location,
+                    world_location,
                     coord,
                 )
             # Blender's object ray cast includes hidden Sculpt faces.  Move
@@ -6971,12 +7111,1707 @@ def _raycast_sculpt_face_set(context, coord):
             # same hidden polygon would be returned indefinitely.  Keep the
             # step small relative to the hit distance and cap it so large
             # models do not skip a nearby visible layer.
-            hit_distance = max((location - local_origin).length, 1.0e-7)
+            hit_distance = max((world_location - world_start).length, 1.0e-7)
             advance = min(max(hit_distance * 1.0e-6, 1.0e-7), 1.0e-3)
-            local_origin = location + local_direction * advance
+            local_origin = inverse @ (world_location + world_direction * advance)
         return None
     except (AttributeError, RuntimeError, TypeError, ValueError):
         return None
+
+
+def _sculpt_cursor_region_coordinate(context, event):
+    """Return the event cursor in the owning View3D WINDOW region.
+
+    Blender exposes both window-space (``mouse_x/y``) and region-space
+    (``mouse_region_x/y``) event fields.  The latter is normally correct, but
+    it is not a sufficient ownership check when an operator is reached from a
+    keymap while a sibling region (header/sidebar/asset shelf) is under the
+    pointer.  Smart Face Set Fill must never silently reinterpret such an
+    event as a different point in the 3D view.
+
+    Use the absolute event position and the actual WINDOW region origin as the
+    authoritative conversion.  The region-space fields are retained only as
+    a compatibility fallback for synthetic events and older event shims that
+    do not expose window coordinates.  This helper is deliberately cursor
+    only; it does not call or share the viewport-center ray helpers used by
+    Mesh Focus Orbit.
+    """
+    try:
+        region = context.region
+        if region is None or str(region.type) != "WINDOW":
+            return None
+        width = float(region.width)
+        height = float(region.height)
+        if width <= 0.0 or height <= 0.0:
+            return None
+
+        # ``Region.x/y`` are screen/window coordinates in Blender.  Prefer
+        # this path even when mouse_region_* are present so a stale or
+        # sibling-region relative value cannot select another surface.
+        mouse_x = getattr(event, "mouse_x", None)
+        mouse_y = getattr(event, "mouse_y", None)
+        if mouse_x is not None and mouse_y is not None:
+            x = float(mouse_x) - float(region.x)
+            y = float(mouse_y) - float(region.y)
+            if 0.0 <= x < width and 0.0 <= y < height:
+                return Vector((x, y))
+            # Absolute coordinates are available and prove that this event
+            # belongs to a sibling region (or another area).  Do not fall
+            # back to a stale region-relative pair in that case.
+            return None
+
+        # Keep direct unit tests and old event shims usable when absolute
+        # window coordinates are unavailable.  Still reject out-of-region
+        # values instead of raycasting a guessed/clamped point.
+        region_x = getattr(event, "mouse_region_x", None)
+        region_y = getattr(event, "mouse_region_y", None)
+        if region_x is None or region_y is None:
+            return None
+        x = float(region_x)
+        y = float(region_y)
+        if 0.0 <= x < width and 0.0 <= y < height:
+            return Vector((x, y))
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Guided Ridge
+# ---------------------------------------------------------------------------
+
+def _guided_ridge_smoothstep(value):
+    value = max(0.0, min(1.0, float(value)))
+    return value * value * (3.0 - 2.0 * value)
+
+
+def _guided_ridge_catmull_rom(points, samples_per_segment=8, max_points=256):
+    """Interpolate every control point and bound the viewport preview size."""
+    points = [Vector(point) for point in points]
+    if len(points) < 2:
+        return points[:]
+    if len(points) > 64:
+        raise ValueError("Guided Ridge accepts at most 64 control points")
+    segments = len(points) - 1
+    steps = max(2, min(int(samples_per_segment), max(2, (max_points - 1) // segments)))
+    result = []
+    for index in range(segments):
+        p0 = points[max(0, index - 1)]
+        p1 = points[index]
+        p2 = points[index + 1]
+        p3 = points[min(len(points) - 1, index + 2)]
+        for step in range(steps):
+            t = step / float(steps)
+            t2, t3 = t * t, t * t * t
+            value = (
+                p0 * (-0.5 * t3 + t2 - 0.5 * t)
+                + p1 * (1.5 * t3 - 2.5 * t2 + 1.0)
+                + p2 * (-1.5 * t3 + 2.0 * t2 + 0.5 * t)
+                + p3 * (0.5 * t3 - 0.5 * t2)
+            )
+            # Avoid overshoot on tight hair sections before surface projection.
+            value = Vector((
+                max(min(q.x for q in (p0, p1, p2, p3)), min(max(q.x for q in (p0, p1, p2, p3)), value.x)),
+                max(min(q.y for q in (p0, p1, p2, p3)), min(max(q.y for q in (p0, p1, p2, p3)), value.y)),
+                max(min(q.z for q in (p0, p1, p2, p3)), min(max(q.z for q in (p0, p1, p2, p3)), value.z)),
+            ))
+            result.append(value)
+    result.append(points[-1].copy())
+    return result[:max_points]
+
+
+def _guided_ridge_segment_distance(a, b, c, d):
+    """Closest distance between two finite 3D segments."""
+    u, v, w = b - a, d - c, a - c
+    aa, bb, cc = u.dot(u), u.dot(v), v.dot(v)
+    dd, ee = u.dot(w), v.dot(w)
+    if aa <= 1.0e-24 and cc <= 1.0e-24:
+        return (a - c).length
+    if aa <= 1.0e-24:
+        t = max(0.0, min(1.0, ee / cc if cc else 0.0))
+        return (a - (c + v * t)).length
+    if cc <= 1.0e-24:
+        s = max(0.0, min(1.0, -dd / aa if aa else 0.0))
+        return ((a + u * s) - c).length
+    denom = aa * cc - bb * bb
+    if abs(denom) <= 1.0e-12 * max(aa * cc, 1.0e-30):
+        def point_segment(point, first, second):
+            edge = second - first
+            length_sq = edge.dot(edge)
+            if length_sq <= 1.0e-24:
+                return (point - first).length
+            t = max(0.0, min(1.0, (point - first).dot(edge) / length_sq))
+            return (point - (first + edge * t)).length
+        return min(point_segment(a, c, d), point_segment(b, c, d),
+                   point_segment(c, a, b), point_segment(d, a, b))
+    s = (bb * ee - cc * dd) / denom
+    t = (aa * ee - bb * dd) / denom
+    if s < 0.0:
+        s = 0.0
+        t = max(0.0, min(1.0, ee / cc))
+    elif s > 1.0:
+        s = 1.0
+        t = max(0.0, min(1.0, (bb + ee) / cc))
+    elif t < 0.0:
+        t = 0.0
+        s = max(0.0, min(1.0, -dd / aa))
+    elif t > 1.0:
+        t = 1.0
+        s = max(0.0, min(1.0, (bb - dd) / aa))
+    return ((a + u * s) - (c + v * t)).length
+
+
+def _guided_ridge_validate_curve(points, curve=None, min_distance=1.0e-7):
+    points = [Vector(point) for point in points]
+    if len(points) < 2:
+        return {"ok": False, "reason": "at_least_two_points_required"}
+    for first, second in zip(points, points[1:]):
+        if (second - first).length <= min_distance:
+            return {"ok": False, "reason": "duplicate_or_too_close_control_points"}
+    curve = [Vector(point) for point in (curve or points)]
+    if len(curve) < 2:
+        return {"ok": False, "reason": "curve_has_too_few_points"}
+    total = sum((b - a).length for a, b in zip(curve, curve[1:]))
+    direct = (curve[-1] - curve[0]).length
+    if direct > min_distance and total / direct > 18.0:
+        return {"ok": False, "reason": "extreme_meandering"}
+    cross_distance = max(min_distance * 0.1, total * 0.0001)
+    for index in range(len(curve) - 1):
+        for other in range(index + 2, len(curve) - 1):
+            if _guided_ridge_segment_distance(
+                curve[index], curve[index + 1], curve[other], curve[other + 1]
+            ) <= cross_distance:
+                return {"ok": False, "reason": "self_crossing_or_near_crossing"}
+    return {"ok": True, "total_length": float(total), "direct_length": float(direct)}
+
+
+def _guided_ridge_hash_array(values):
+    try:
+        import numpy as np
+        return hashlib.sha256(np.asarray(values).tobytes()).hexdigest()
+    except (ImportError, TypeError, ValueError):
+        return hashlib.sha256(repr(values).encode("utf-8")).hexdigest()
+
+
+def _guided_ridge_face_set_attribute(obj):
+    try:
+        attr = obj.data.attributes.get(".sculpt_face_set")
+        if attr is not None and attr.domain == "FACE" and attr.data_type == "INT":
+            return attr
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        pass
+    return None
+
+
+def _guided_ridge_safety_reason(obj):
+    """Return a direct-coordinate-write rejection reason, if any."""
+    if obj is None:
+        return "active mesh is unavailable"
+    try:
+        mesh = obj.data
+        if int(getattr(mesh, "users", 1)) > 1:
+            return "shared mesh data is not a safe direct-write target"
+        if getattr(obj, "library", None) is not None or getattr(mesh, "library", None) is not None:
+            return "linked library mesh is read-only"
+        if getattr(obj, "override_library", None) is not None or getattr(mesh, "override_library", None) is not None:
+            return "library override mesh is not a safe direct-write target"
+        if bool(getattr(obj, "is_evaluated", False)) or bool(getattr(mesh, "is_evaluated", False)):
+            return "evaluated mesh is not a safe direct-write target"
+        if getattr(mesh, "shape_keys", None) is not None:
+            return "shape-key coordinates are not a safe direct-write target"
+        if bool(getattr(obj, "use_dynamic_topology_sculpting", False)):
+            return "Dyntopo is active; stable source vertex mapping is unavailable"
+        for modifier in getattr(obj, "modifiers", ()):
+            if str(getattr(modifier, "type", "")) == "MULTIRES":
+                return "Multires modifier is active; stable source vertex mapping is unavailable"
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return "mesh safety state could not be read"
+    return None
+
+
+def _guided_ridge_matrix_signature(matrix):
+    try:
+        return tuple(float(value) for row in matrix for value in row)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _guided_ridge_context_signature(context):
+    try:
+        area = context.area
+        region = context.region
+        window = context.window
+        space = context.space_data
+        region_3d = space.region_3d
+        active_object = context.active_object
+        return {
+            "area_pointer": int(area.as_pointer()),
+            "region_pointer": int(region.as_pointer()),
+            "window_pointer": int(window.as_pointer()) if window is not None else 0,
+            "space_pointer": int(space.as_pointer()),
+            "scene_pointer": int(context.scene.as_pointer()),
+            "active_object_pointer": int(active_object.as_pointer()),
+            "mesh_pointer": int(active_object.data.as_pointer()),
+            "mode": str(context.mode),
+            "space_type": str(space.type),
+            "region_size": (int(region.width), int(region.height)),
+            "view_matrix": _guided_ridge_matrix_signature(region_3d.view_matrix),
+            "view_location": tuple(float(value) for value in region_3d.view_location),
+            "view_distance": float(region_3d.view_distance),
+        }
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _guided_ridge_context_matches(context, state):
+    snapshot = (state or {}).get("snapshot") or {}
+    expected = snapshot.get("context_signature")
+    current = _guided_ridge_context_signature(context)
+    if expected is None or current is None:
+        return False
+    stable_keys = (
+        "area_pointer",
+        "region_pointer",
+        "window_pointer",
+        "space_pointer",
+        "scene_pointer",
+        "active_object_pointer",
+        "mesh_pointer",
+        "mode",
+        "space_type",
+    )
+    return all(current.get(key) == expected.get(key) for key in stable_keys)
+
+
+def _guided_ridge_prepare_snapshot(obj, seed_face, seed_face_set):
+    """Capture one connected visible Face Set component and a world BVH."""
+    import numpy as np
+    safety_reason = _guided_ridge_safety_reason(obj)
+    if safety_reason is not None:
+        return None, safety_reason
+    attr = _guided_ridge_face_set_attribute(obj)
+    if attr is None:
+        return None, "active mesh has no .sculpt_face_set attribute"
+    mesh = obj.data
+    try:
+        ids = np.empty(len(attr.data), dtype=np.int32)
+        attr.data.foreach_get("value", ids)
+        hidden_faces = np.zeros(len(mesh.polygons), dtype=bool)
+        mesh.polygons.foreach_get("hide", hidden_faces)
+        hidden_vertices = np.zeros(len(mesh.vertices), dtype=bool)
+        mesh.vertices.foreach_get("hide", hidden_vertices)
+        sculpt_mask = np.zeros(len(mesh.vertices), dtype=np.float64)
+        mask_attr = mesh.attributes.get(".sculpt_mask")
+        if mask_attr is not None and mask_attr.domain == "POINT" and len(mask_attr.data) == len(sculpt_mask):
+            mask_attr.data.foreach_get("value", sculpt_mask)
+        sculpt_mask = np.clip(sculpt_mask, 0.0, 1.0)
+        if seed_face < 0 or seed_face >= len(ids) or int(ids[seed_face]) != int(seed_face_set):
+            return None, "ray hit is outside the active Face Set"
+        candidates = np.flatnonzero((ids == int(seed_face_set)) & ~hidden_faces)
+        if len(candidates) > GUIDED_RIDGE_MAX_CANDIDATE_FACES:
+            return None, "Face Set candidate exceeds 50,000 faces"
+        edge_faces = {}
+        face_vertices = {}
+        for face_index in candidates:
+            vertices = tuple(int(v) for v in mesh.polygons[int(face_index)].vertices)
+            if len(vertices) < 3:
+                continue
+            face_vertices[int(face_index)] = vertices
+            for offset, first in enumerate(vertices):
+                second = vertices[(offset + 1) % len(vertices)]
+                edge = (min(first, second), max(first, second))
+                edge_faces.setdefault(edge, []).append(int(face_index))
+        if int(seed_face) not in face_vertices:
+            return None, "ray hit face is hidden or degenerate"
+        component = {int(seed_face)}
+        pending = [int(seed_face)]
+        while pending:
+            current = pending.pop()
+            for offset, first in enumerate(face_vertices[current]):
+                second = face_vertices[current][(offset + 1) % len(face_vertices[current])]
+                for other in edge_faces.get((min(first, second), max(first, second)), ()):
+                    if other not in component:
+                        component.add(other)
+                        pending.append(other)
+                        if len(component) > GUIDED_RIDGE_MAX_CANDIDATE_FACES:
+                            return None, "Face Set component exceeds 50,000 faces"
+        face_indices = sorted(component)
+        vertex_indices = sorted({v for face in face_indices for v in face_vertices[face]})
+        component_face_set = set(face_indices)
+        component_vertex_set = set(vertex_indices)
+        # A vertex is not writable when any face outside the captured visible
+        # Face Set component owns it.  This covers vertex-only contacts and
+        # non-manifold third faces, including hidden faces that are excluded
+        # from the candidate graph above.
+        externally_shared_vertices = set()
+        for outside_face_index, polygon in enumerate(mesh.polygons):
+            if int(outside_face_index) in component_face_set:
+                continue
+            for vertex in polygon.vertices:
+                vertex = int(vertex)
+                if vertex in component_vertex_set:
+                    externally_shared_vertices.add(vertex)
+        protected_vertices = sorted(externally_shared_vertices)
+        local_index = {global_index: index for index, global_index in enumerate(vertex_indices)}
+        coords_local = np.asarray([mesh.vertices[index].co[:] for index in vertex_indices], dtype=np.float64)
+        world_matrix = obj.matrix_world.copy()
+        coords_world = np.asarray([world_matrix @ Vector(co) for co in coords_local], dtype=np.float64)
+        triangles = []
+        triangle_face_indices = []
+        for face_index in face_indices:
+            polygon = face_vertices[face_index]
+            for offset in range(1, len(polygon) - 1):
+                triangles.append((local_index[polygon[0]], local_index[polygon[offset]], local_index[polygon[offset + 1]]))
+                triangle_face_indices.append(int(face_index))
+        if not triangles:
+            return None, "Face Set component has no triangles"
+        edge_counts = {}
+        for polygon in (face_vertices[index] for index in face_indices):
+            for offset, first in enumerate(polygon):
+                second = polygon[(offset + 1) % len(polygon)]
+                edge = (min(first, second), max(first, second))
+                edge_counts[edge] = edge_counts.get(edge, 0) + 1
+        boundary_vertices = sorted(
+            {v for edge, count in edge_counts.items() if count == 1 for v in edge}
+            | set(protected_vertices)
+        )
+        boundary_edges = [
+            (local_index[first], local_index[second])
+            for (first, second), count in edge_counts.items()
+            if count == 1 and first in local_index and second in local_index
+        ]
+        adjacency = [[] for _ in vertex_indices]
+        for first, second, third in triangles:
+            adjacency[first].extend((second, third))
+            adjacency[second].extend((first, third))
+            adjacency[third].extend((first, second))
+        adjacency = [tuple(sorted(set(neighbors))) for neighbors in adjacency]
+        try:
+            bvh = BVHTree.FromPolygons(coords_world.tolist(), triangles, all_triangles=True)
+        except TypeError:
+            bvh = BVHTree.FromPolygons(coords_world.tolist(), triangles)
+        edge_lengths = [
+            float(np.linalg.norm(coords_world[local_index[first]] - coords_world[local_index[second]]))
+            for first, second in edge_counts
+            if first in local_index and second in local_index
+        ]
+        normal_matrix = world_matrix.inverted_safe().transposed().to_3x3()
+        normals_world = np.asarray([
+            tuple((normal_matrix @ mesh.vertices[index].normal).normalized())
+            for index in vertex_indices
+        ], dtype=np.float64)
+        signature = {
+            "object_pointer": int(obj.as_pointer()),
+            "mesh_pointer": int(mesh.as_pointer()),
+            "counts": (len(mesh.vertices), len(mesh.edges), len(mesh.polygons), len(mesh.loops)),
+            "face_indices": tuple(face_indices),
+            "face_vertices": tuple(tuple(face_vertices[index]) for index in face_indices),
+            "face_set_hash": _guided_ridge_hash_array(ids[face_indices]),
+            "hidden_faces_hash": _guided_ridge_hash_array(hidden_faces[face_indices]),
+            "hidden_vertices_hash": _guided_ridge_hash_array(hidden_vertices[vertex_indices]),
+            "sculpt_mask_hash": _guided_ridge_hash_array(sculpt_mask[vertex_indices]),
+            "protected_vertices_hash": _guided_ridge_hash_array(
+                np.asarray(protected_vertices, dtype=np.int64)
+            ),
+            "coordinate_hash": _guided_ridge_hash_array(coords_local),
+            "matrix_world": _guided_ridge_matrix_signature(world_matrix),
+            "component_topology_signature": _guided_ridge_component_topology_signature(
+                face_indices,
+                [face_vertices[index] for index in face_indices],
+            ),
+        }
+        snapshot = {
+            "object_pointer": signature["object_pointer"],
+            "mesh_pointer": signature["mesh_pointer"],
+            "counts": signature["counts"],
+            "face_set_id": int(seed_face_set),
+            "face_indices": face_indices,
+            "face_vertices": [face_vertices[index] for index in face_indices],
+            "vertex_indices": vertex_indices,
+            "triangles": triangles,
+            "triangle_face_indices": triangle_face_indices,
+            "boundary_vertices": boundary_vertices,
+            "protected_vertices": protected_vertices,
+            "boundary_edges": boundary_edges,
+            "adjacency": adjacency,
+            "coords_local": coords_local,
+            "coords_world": coords_world,
+            "normals_world": normals_world,
+            "hidden_vertices": np.array(hidden_vertices[vertex_indices], dtype=bool, copy=True),
+            "sculpt_mask": np.array(sculpt_mask[vertex_indices], dtype=np.float64, copy=True),
+            "matrix_world": world_matrix.copy(),
+            "bvh": bvh,
+            "average_edge": float(sum(edge_lengths) / max(len(edge_lengths), 1)),
+            "signature": signature,
+        }
+        return snapshot, None
+    except (AttributeError, IndexError, MemoryError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None, "could not prepare the Face Set component"
+
+
+def _guided_ridge_ray(context, coord):
+    origin = view3d_utils.region_2d_to_origin_3d(
+        context.region, context.space_data.region_3d, coord
+    )
+    direction = view3d_utils.region_2d_to_vector_3d(
+        context.region, context.space_data.region_3d, coord
+    )
+    if direction.length_squared <= 1.0e-24:
+        return None
+    direction.normalize()
+    return origin, direction
+
+
+def _guided_ridge_snapshot_hit(context, snapshot, coord):
+    ray = _guided_ridge_ray(context, coord)
+    if ray is None:
+        return None
+    try:
+        location, normal, triangle_index, distance = snapshot["bvh"].ray_cast(*ray)
+        if location is None or triangle_index is None or int(triangle_index) < 0:
+            return None
+        return Vector(location), Vector(normal).normalized(), int(triangle_index), float(distance)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _guided_ridge_project_curve(snapshot, controls):
+    raw = _guided_ridge_catmull_rom(controls)
+    projected = []
+    max_distance = 0.0
+    for point in raw:
+        nearest = snapshot["bvh"].find_nearest(point)
+        if not nearest or nearest[0] is None:
+            return None, "guide projection failed"
+        location, _normal, _triangle, distance = nearest
+        max_distance = max(max_distance, float(distance or 0.0))
+        projected.append(Vector(location))
+    # Clicks were already on the component; this bound catches a curve that
+    # leaves the component between controls without changing the source mesh.
+    if max_distance > max(1.0e-7, snapshot.get("average_edge", 1.0e-4) * 4.0):
+        return None, "guide leaves the Face Set component"
+    result = _guided_ridge_validate_curve(controls, projected)
+    if not result.get("ok"):
+        return None, result.get("reason", "invalid guide")
+    return projected, None
+
+
+def _guided_ridge_barycentric(point, first, second, third):
+    """Return finite triangle barycentrics for a surface anchor."""
+    import numpy as np
+    a = np.asarray(tuple(first), dtype=np.float64)
+    b = np.asarray(tuple(second), dtype=np.float64)
+    c = np.asarray(tuple(third), dtype=np.float64)
+    p = np.asarray(tuple(point), dtype=np.float64)
+    edge0 = b - a
+    edge1 = c - a
+    rel = p - a
+    d00 = float(np.dot(edge0, edge0))
+    d01 = float(np.dot(edge0, edge1))
+    d11 = float(np.dot(edge1, edge1))
+    d20 = float(np.dot(rel, edge0))
+    d21 = float(np.dot(rel, edge1))
+    denominator = d00 * d11 - d01 * d01
+    if not np.isfinite(denominator) or abs(denominator) <= 1.0e-24:
+        return None
+    second_weight = (d11 * d20 - d01 * d21) / denominator
+    third_weight = (d00 * d21 - d01 * d20) / denominator
+    first_weight = 1.0 - second_weight - third_weight
+    weights = (first_weight, second_weight, third_weight)
+    if not np.all(np.isfinite(weights)) or min(weights) < -1.0e-5 or max(weights) > 1.00001:
+        return None
+    return tuple(float(max(0.0, min(1.0, weight))) for weight in weights)
+
+
+def _guided_ridge_surface_anchors(snapshot, controls):
+    """Encode guide points as bounded surface anchors without copying the mesh."""
+    anchors = []
+    try:
+        for control in controls:
+            nearest = snapshot["bvh"].find_nearest(control)
+            if not nearest or nearest[0] is None or nearest[2] is None:
+                return None, "guide anchor projection failed"
+            location, _normal, triangle_index, _distance = nearest
+            triangle_index = int(triangle_index)
+            if triangle_index < 0 or triangle_index >= len(snapshot["triangles"]):
+                return None, "guide anchor triangle is invalid"
+            triangle = snapshot["triangles"][triangle_index]
+            vertices_world = [snapshot["coords_world"][int(index)] for index in triangle]
+            barycentric = _guided_ridge_barycentric(location, *vertices_world)
+            if barycentric is None:
+                return None, "guide anchor is on a degenerate triangle"
+            anchors.append({
+                "face_index": int(snapshot["triangle_face_indices"][triangle_index]),
+                "vertex_indices": tuple(int(snapshot["vertex_indices"][int(index)]) for index in triangle),
+                "barycentric": barycentric,
+            })
+    except (AttributeError, IndexError, MemoryError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None, "guide anchor projection failed"
+    return anchors, None
+
+
+def _guided_ridge_component_topology_signature(face_indices, face_vertices):
+    """Hash only the saved Face Set component's loops and edge membership."""
+    digest = hashlib.sha256()
+    component_faces = tuple(
+        (int(face_index), tuple(int(vertex) for vertex in vertices))
+        for face_index, vertices in zip(face_indices, face_vertices)
+    )
+    for face_index, vertices in component_faces:
+        digest.update(b"F")
+        digest.update(face_index.to_bytes(8, "little", signed=True))
+        digest.update(len(vertices).to_bytes(8, "little", signed=False))
+        for vertex in vertices:
+            digest.update(vertex.to_bytes(8, "little", signed=True))
+    edge_membership = {}
+    for face_index, vertices in component_faces:
+        for offset, first in enumerate(vertices):
+            second = vertices[(offset + 1) % len(vertices)]
+            edge = (min(first, second), max(first, second))
+            edge_membership.setdefault(edge, []).append(face_index)
+    for edge in sorted(edge_membership):
+        vertices = tuple(int(vertex) for vertex in edge)
+        digest.update(b"E")
+        for vertex in vertices:
+            digest.update(vertex.to_bytes(8, "little", signed=True))
+        members = tuple(sorted(edge_membership[edge]))
+        digest.update(len(members).to_bytes(8, "little", signed=False))
+        for face_index in members:
+            digest.update(int(face_index).to_bytes(8, "little", signed=True))
+    return digest.hexdigest()
+
+
+def _guided_ridge_build_last_guide(state, anchors=None):
+    """Build a bounded Repeat Last payload before mesh coordinates are written."""
+    import numpy as np
+    snapshot = state.get("snapshot") if state else None
+    obj = state.get("obj") if state else None
+    controls = state.get("controls") if state else None
+    if snapshot is None or obj is None or not controls:
+        return None, "last guide state is unavailable"
+    if anchors is None:
+        anchors, reason = _guided_ridge_surface_anchors(snapshot, controls)
+        if anchors is None:
+            return None, reason or "could not save surface anchors"
+    signature = snapshot.get("signature", {})
+    payload = {
+        "object_name": str(getattr(obj, "name", "")),
+        "data_name": str(getattr(obj.data, "name", "")),
+        "object_pointer": int(snapshot.get("object_pointer", 0)),
+        "mesh_pointer": int(snapshot.get("mesh_pointer", 0)),
+        "counts": tuple(snapshot.get("counts", ())),
+        "face_set_id": int(snapshot.get("face_set_id", 0)),
+        "seed_face": int(snapshot.get("face_indices", [0])[0]),
+        "face_indices_hash": _guided_ridge_hash_array(np.asarray(snapshot.get("face_indices", ()), dtype=np.int64)),
+        "face_vertices_hash": _guided_ridge_hash_array(
+            np.asarray([vertex for face in snapshot.get("face_vertices", ()) for vertex in face], dtype=np.int64)
+        ),
+        "face_set_hash": signature.get("face_set_hash"),
+        "hidden_faces_hash": signature.get("hidden_faces_hash"),
+        "hidden_vertices_hash": signature.get("hidden_vertices_hash"),
+        "sculpt_mask_hash": signature.get("sculpt_mask_hash"),
+        "protected_vertices_hash": signature.get("protected_vertices_hash"),
+        "matrix_world": signature.get("matrix_world"),
+        "component_topology_signature": signature.get("component_topology_signature"),
+        "anchors": anchors,
+    }
+    return payload, None
+
+
+def _guided_ridge_store_last_guide(state, anchors=None):
+    """Publish a prebuilt surface-anchor payload for Repeat Last."""
+    global _guided_ridge_last_guide
+    payload, reason = _guided_ridge_build_last_guide(state, anchors)
+    if payload is None:
+        return False, reason or "could not save surface anchors"
+    _guided_ridge_last_guide = payload
+    return True, None
+
+
+def _guided_ridge_prepare_repeat_snapshot(obj, last_guide):
+    """Prepare current geometry and accept coordinate changes from prior ridge commits."""
+    import numpy as np
+    snapshot, reason = _guided_ridge_prepare_snapshot(
+        obj,
+        int(last_guide.get("seed_face", -1)),
+        int(last_guide.get("face_set_id", 0)),
+    )
+    if snapshot is None:
+        return None, reason or "could not prepare the saved guide component"
+    signature = snapshot.get("signature", {})
+    try:
+        if tuple(snapshot.get("counts", ())) != tuple(last_guide.get("counts", ())):
+            return None, "Guided Ridge Repeat cancelled: mesh topology changed"
+        if signature.get("face_set_hash") != last_guide.get("face_set_hash"):
+            return None, "Guided Ridge Repeat cancelled: Face Set changed"
+        if signature.get("hidden_faces_hash") != last_guide.get("hidden_faces_hash"):
+            return None, "Guided Ridge Repeat cancelled: hidden faces changed"
+        if signature.get("hidden_vertices_hash") != last_guide.get("hidden_vertices_hash"):
+            return None, "Guided Ridge Repeat cancelled: hidden vertices changed"
+        if signature.get("sculpt_mask_hash") != last_guide.get("sculpt_mask_hash"):
+            return None, "Guided Ridge Repeat cancelled: sculpt mask changed"
+        if signature.get("protected_vertices_hash") != last_guide.get("protected_vertices_hash"):
+            return None, "Guided Ridge Repeat cancelled: protected boundary changed"
+        if signature.get("matrix_world") != last_guide.get("matrix_world"):
+            return None, "Guided Ridge Repeat cancelled: object transform changed"
+        if signature.get("component_topology_signature") != last_guide.get("component_topology_signature"):
+            return None, "Guided Ridge Repeat cancelled: Face Set component topology/connectivity changed"
+        if _guided_ridge_hash_array(np.asarray(snapshot.get("face_indices", ()), dtype=np.int64)) != last_guide.get("face_indices_hash"):
+            return None, "Guided Ridge Repeat cancelled: Face Set component topology changed"
+        if _guided_ridge_hash_array(
+            np.asarray([vertex for face in snapshot.get("face_vertices", ()) for vertex in face], dtype=np.int64)
+        ) != last_guide.get("face_vertices_hash"):
+            return None, "Guided Ridge Repeat cancelled: component faces changed"
+    except (MemoryError, TypeError, ValueError):
+        return None, "Guided Ridge Repeat cancelled: component signature is invalid"
+    return snapshot, None
+
+
+def _guided_ridge_repeat_controls(snapshot, last_guide):
+    """Reconstruct control points and normals from current surface anchors."""
+    import numpy as np
+    local_index = {int(global_index): index for index, global_index in enumerate(snapshot["vertex_indices"])}
+    controls = []
+    normals = []
+    try:
+        for anchor in last_guide.get("anchors", ()):
+            globals_for_triangle = tuple(int(index) for index in anchor["vertex_indices"])
+            local_triangle = tuple(local_index[index] for index in globals_for_triangle)
+            barycentric = np.asarray(anchor["barycentric"], dtype=np.float64)
+            if len(local_triangle) != 3 or len(barycentric) != 3 or not np.all(np.isfinite(barycentric)):
+                return None, None, "saved guide anchor is invalid"
+            point = np.sum(
+                snapshot["coords_world"][list(local_triangle)] * barycentric[:, None],
+                axis=0,
+            )
+            normal = np.sum(
+                snapshot["normals_world"][list(local_triangle)] * barycentric[:, None],
+                axis=0,
+            )
+            norm = float(np.linalg.norm(normal))
+            if norm <= 1.0e-12 or not np.all(np.isfinite(point)):
+                return None, None, "saved guide normal is invalid"
+            controls.append(Vector(tuple(point)))
+            normals.append(Vector(tuple(normal / norm)))
+    except (KeyError, IndexError, MemoryError, TypeError, ValueError):
+        return None, None, "saved guide anchor no longer matches the component"
+    if len(controls) < 2 or len(controls) > GUIDED_RIDGE_MAX_CONTROLS:
+        return None, None, "saved guide point count is invalid"
+    return controls, normals, None
+
+
+def _guided_ridge_current_signature(obj, snapshot):
+    import numpy as np
+    mesh = obj.data
+    try:
+        if int(obj.as_pointer()) != int(snapshot["object_pointer"]) or int(mesh.as_pointer()) != int(snapshot["mesh_pointer"]):
+            return None
+        counts = (len(mesh.vertices), len(mesh.edges), len(mesh.polygons), len(mesh.loops))
+        if counts != tuple(snapshot["counts"]):
+            return None
+        attr = _guided_ridge_face_set_attribute(obj)
+        if attr is None:
+            return None
+        ids = np.empty(len(attr.data), dtype=np.int32)
+        attr.data.foreach_get("value", ids)
+        if _guided_ridge_hash_array(ids[snapshot["face_indices"]]) != snapshot["signature"]["face_set_hash"]:
+            return None
+        if _guided_ridge_matrix_signature(obj.matrix_world) != snapshot["signature"]["matrix_world"]:
+            return None
+        current_face_vertices = tuple(
+            tuple(int(vertex) for vertex in mesh.polygons[index].vertices)
+            for index in snapshot["face_indices"]
+        )
+        if current_face_vertices != snapshot["signature"]["face_vertices"]:
+            return None
+        coords_local = np.asarray([mesh.vertices[index].co[:] for index in snapshot["vertex_indices"]], dtype=np.float64)
+        if _guided_ridge_hash_array(coords_local) != snapshot["signature"]["coordinate_hash"]:
+            return None
+        hidden = np.asarray([bool(mesh.polygons[index].hide) for index in snapshot["face_indices"]], dtype=bool)
+        if _guided_ridge_hash_array(hidden) != snapshot["signature"]["hidden_faces_hash"]:
+            return None
+        hidden_vertices = np.zeros(len(mesh.vertices), dtype=bool)
+        mesh.vertices.foreach_get("hide", hidden_vertices)
+        if _guided_ridge_hash_array(hidden_vertices[snapshot["vertex_indices"]]) != snapshot["signature"]["hidden_vertices_hash"]:
+            return None
+        sculpt_mask = np.zeros(len(mesh.vertices), dtype=np.float64)
+        mask_attr = mesh.attributes.get(".sculpt_mask")
+        if mask_attr is not None and mask_attr.domain == "POINT" and len(mask_attr.data) == len(sculpt_mask):
+            mask_attr.data.foreach_get("value", sculpt_mask)
+        sculpt_mask = np.clip(sculpt_mask, 0.0, 1.0)
+        if _guided_ridge_hash_array(sculpt_mask[snapshot["vertex_indices"]]) != snapshot["signature"]["sculpt_mask_hash"]:
+            return None
+        return coords_local
+    except (AttributeError, IndexError, MemoryError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _guided_ridge_restore_coordinates(context, state, coordinates_local):
+    """Restore the immutable component coordinates after a failed write."""
+    import numpy as np
+    obj = state.get("obj") if state else None
+    snapshot = state.get("snapshot") if state else None
+    if obj is None or snapshot is None:
+        return False, "rollback state is unavailable"
+    try:
+        mesh = obj.data
+        values = np.asarray(coordinates_local, dtype=np.float64)
+        vertex_indices = snapshot["vertex_indices"]
+        if len(values) != len(vertex_indices):
+            return False, "rollback coordinate count mismatch"
+        for local_index, vertex_index in enumerate(vertex_indices):
+            mesh.vertices[int(vertex_index)].co = tuple(values[local_index])
+        mesh.update()
+        obj.update_tag(refresh={"DATA"})
+        context.view_layer.update()
+        return True, None
+    except (AttributeError, IndexError, MemoryError, ReferenceError, RuntimeError, TypeError, ValueError) as error:
+        return False, str(error)
+
+
+def _guided_ridge_build_candidate(snapshot, guide):
+    """Build the bounded C-like ridge candidate in world space."""
+    import numpy as np
+    before = np.asarray(snapshot["coords_world"], dtype=np.float64)
+    guide = np.asarray([tuple(point) for point in guide], dtype=np.float64)
+    if len(guide) < 2:
+        raise ValueError("at least two guide points are required")
+    segment_lengths = np.linalg.norm(np.diff(guide, axis=0), axis=1)
+    cumulative = np.r_[0.0, np.cumsum(segment_lengths)]
+    length = float(cumulative[-1])
+    if length <= 1.0e-8:
+        raise ValueError("guide is too short")
+    tangents = np.zeros_like(guide)
+    tangents[0] = guide[1] - guide[0]
+    tangents[-1] = guide[-1] - guide[-2]
+    if len(guide) > 2:
+        tangents[1:-1] = guide[2:] - guide[:-2]
+    tangent_norm = np.linalg.norm(tangents, axis=1, keepdims=True)
+    tangents /= np.maximum(tangent_norm, 1.0e-12)
+    normals = np.asarray(snapshot["normals_world"], dtype=np.float64)
+    vertices = before
+    distances = np.linalg.norm(vertices[:, None, :] - guide[None, :, :], axis=2)
+    station_index = np.argmin(distances, axis=1)
+    station = cumulative[station_index]
+    tangent = tangents[station_index]
+    normal = normals.copy()
+    normal -= np.sum(normal * tangent, axis=1, keepdims=True) * tangent
+    normal /= np.maximum(np.linalg.norm(normal, axis=1, keepdims=True), 1.0e-12)
+    lateral = np.cross(tangent, normal)
+    lateral /= np.maximum(np.linalg.norm(lateral, axis=1, keepdims=True), 1.0e-12)
+    guide_at_vertex = guide[station_index]
+    rel = vertices - guide_at_vertex
+    q = np.sum(rel * lateral, axis=1)
+    h = np.sum(rel * normal, axis=1)
+    boundary_mask = np.zeros(len(vertices), dtype=bool)
+    boundary_local = [snapshot["vertex_indices"].index(index) for index in snapshot["boundary_vertices"]]
+    boundary_mask[boundary_local] = True
+    # Estimate two actual side anchors at each guide station from boundary
+    # vertices.  This keeps the cross section broad and preserves the edge.
+    boundary_q = q[boundary_mask]
+    boundary_h = h[boundary_mask]
+    if len(boundary_q) < 2:
+        raise ValueError("component boundary is unavailable")
+    qlo = float(np.min(boundary_q))
+    qhi = float(np.max(boundary_q))
+    hlo = float(np.median(boundary_h[boundary_q <= qlo + max(abs(qlo) * 0.05, 1.0e-8)]))
+    hhi = float(np.median(boundary_h[boundary_q >= qhi - max(abs(qhi) * 0.05, 1.0e-8)]))
+    target = np.where(
+        q <= 0.0,
+        (q / min(qlo, -1.0e-10)) * hlo,
+        (q / max(qhi, 1.0e-10)) * hhi,
+    )
+    root_guard = np.asarray([_guided_ridge_smoothstep((s / length - 0.29) / 0.13) for s in station])
+    tip_hold = 0.08 * length
+    tip_fade = 0.04 * length
+    tip_guard = np.asarray([
+        _guided_ridge_smoothstep((length - tip_fade - s) / max(tip_fade, 1.0e-12))
+        for s in station
+    ])
+    boundary_distance = np.min(
+        np.linalg.norm(vertices[:, None, :] - vertices[boundary_mask][None, :, :], axis=2), axis=1
+    )
+    boundary_width = max(length * 0.0092, 1.0e-7)
+    boundary_guard = np.asarray([_guided_ridge_smoothstep(distance / boundary_width) for distance in boundary_distance])
+    weight = 0.82 * root_guard * tip_guard * boundary_guard
+    weight[boundary_mask] = 0.0
+    weight[station <= 0.0] = 0.0
+    delta_h = (target - h) * weight
+    anchored = boundary_mask | (station <= 0.0)
+    for _ in range(2):
+        relaxed = delta_h.copy()
+        for index, neighbors in enumerate(snapshot["adjacency"]):
+            if anchored[index] or not neighbors:
+                continue
+            relaxed[index] = 0.72 * delta_h[index] + 0.28 * float(np.mean(delta_h[list(neighbors)]))
+        relaxed[anchored] = 0.0
+        delta_h = relaxed
+    candidate = before + delta_h[:, None] * normal
+    # Candidate-C-only correction: preserve A's broad field and add a limited
+    # quarter-strength tip hold in the final 12% of the normalized guide.
+    correction = np.asarray([
+        0.25 * _guided_ridge_smoothstep((s - (length - 0.16 * length)) / (0.04 * length))
+        for s in station
+    ])
+    candidate += (delta_h * correction)[:, None] * normal
+    if not np.all(np.isfinite(candidate)):
+        raise ValueError("candidate contains non-finite coordinates")
+    return candidate, {
+        "length": length,
+        "station": station,
+        "boundary_mask": boundary_mask,
+        "weight": weight,
+        "delta_h": delta_h,
+        "normal": normal,
+    }
+
+
+def _guided_ridge_smooth_array(values, sigma=1.8):
+    import numpy as np
+    radius = max(1, int(math.ceil(3.0 * sigma)))
+    offsets = np.arange(-radius, radius + 1, dtype=np.float64)
+    kernel = np.exp(-0.5 * (offsets / sigma) ** 2)
+    kernel /= np.sum(kernel)
+    padded = np.pad(np.asarray(values, dtype=np.float64), (radius, radius), mode="edge")
+    return np.convolve(padded, kernel, mode="valid")
+
+
+def _guided_ridge_unit_array(values):
+    import numpy as np
+    values = np.asarray(values, dtype=np.float64)
+    return values / np.maximum(np.linalg.norm(values, axis=-1, keepdims=True), 1.0e-12)
+
+
+def _guided_ridge_stable_frame(before, faces, guide, controls, control_normals):
+    import numpy as np
+    guide = np.asarray(guide, dtype=np.float64)
+    segment = np.diff(guide, axis=0)
+    segment_length = np.linalg.norm(segment, axis=1)
+    if np.any(segment_length <= 1.0e-10):
+        raise ValueError("guide contains a zero-length segment")
+    arc = np.r_[0.0, np.cumsum(segment_length)]
+    tangent = np.empty_like(guide)
+    tangent[0] = segment[0] / segment_length[0]
+    tangent[-1] = segment[-1] / segment_length[-1]
+    tangent[1:-1] = _guided_ridge_unit_array(guide[2:] - guide[:-2])
+    raw_tangent = tangent.copy()
+    controls = np.asarray(controls, dtype=np.float64)
+    control_normals = _guided_ridge_unit_array(np.asarray(control_normals, dtype=np.float64))
+    control_arc = np.asarray([arc[int(np.argmin(np.linalg.norm(guide - point[None, :], axis=1)))] for point in controls])
+    order = np.argsort(control_arc)
+    control_arc = control_arc[order]
+    control_normals = control_normals[order]
+    keep = np.r_[True, np.diff(control_arc) > 1.0e-10]
+    control_arc, control_normals = control_arc[keep], control_normals[keep]
+    if len(control_arc) < 2:
+        raise ValueError("guide controls do not span an arc")
+    control_points_tangent = np.empty_like(controls)
+    if len(controls) == 2:
+        control_points_tangent[0] = controls[1] - controls[0]
+        control_points_tangent[1] = controls[1] - controls[0]
+    else:
+        control_points_tangent[0] = controls[1] - controls[0]
+        control_points_tangent[-1] = controls[-1] - controls[-2]
+        control_points_tangent[1:-1] = controls[2:] - controls[:-2]
+    control_points_tangent = _guided_ridge_unit_array(control_points_tangent)
+    tangent = np.column_stack([
+        np.interp(arc, control_arc, control_points_tangent[order][keep][:, axis]) for axis in range(3)
+    ])
+    tangent = _guided_ridge_unit_array(np.column_stack([_guided_ridge_smooth_array(tangent[:, axis], 1.8) for axis in range(3)]))
+    tangent *= np.where(np.sum(tangent * raw_tangent, axis=1) < 0.0, -1.0, 1.0)[:, None]
+    tangent = _guided_ridge_unit_array(tangent)
+    base_normal = np.column_stack([
+        np.interp(arc, control_arc, control_normals[:, axis]) for axis in range(3)
+    ])
+    base_normal = _guided_ridge_unit_array(base_normal)
+    base_normal -= np.sum(base_normal * tangent, axis=1, keepdims=True) * tangent
+    base_normal = _guided_ridge_unit_array(base_normal)
+    base_normal = np.column_stack([_guided_ridge_smooth_array(base_normal[:, axis], 1.4) for axis in range(3)])
+    tri = before[faces]
+    cross = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    vertex_normals = np.zeros_like(before)
+    np.add.at(vertex_normals, faces[:, 0], cross)
+    np.add.at(vertex_normals, faces[:, 1], cross)
+    np.add.at(vertex_normals, faces[:, 2], cross)
+    vertex_normals = _guided_ridge_unit_array(vertex_normals)
+    for index, point in enumerate(guide):
+        distances = np.linalg.norm(before - point[None, :], axis=1)
+        nearest_count = min(48, len(distances))
+        nearest = np.argpartition(distances, nearest_count - 1)[:nearest_count]
+        local = np.average(vertex_normals[nearest], axis=0, weights=1.0 / np.maximum(distances[nearest], 1.0e-9))
+        if float(np.dot(base_normal[index], local)) < 0.0:
+            base_normal[index] *= -1.0
+    base_normal = np.column_stack([_guided_ridge_smooth_array(base_normal[:, axis], 1.8) for axis in range(3)])
+    base_normal -= np.sum(base_normal * tangent, axis=1, keepdims=True) * tangent
+    normal = _guided_ridge_unit_array(base_normal)
+    lateral = _guided_ridge_unit_array(np.cross(tangent, normal))
+    normal = _guided_ridge_unit_array(np.cross(lateral, tangent))
+    return {"guide": guide, "arc": arc, "tangent": tangent, "normal": normal, "lateral": lateral, "length": float(arc[-1])}
+
+
+def _guided_ridge_frame_at(frame, station):
+    import numpy as np
+    index = int(np.clip(np.searchsorted(frame["arc"], station) - 1, 0, len(frame["arc"]) - 2))
+    span = frame["arc"][index + 1] - frame["arc"][index]
+    t = (station - frame["arc"][index]) / max(span, 1.0e-12)
+    origin = frame["guide"][index] + t * (frame["guide"][index + 1] - frame["guide"][index])
+    tangent = _guided_ridge_unit_array((1.0 - t) * frame["tangent"][index] + t * frame["tangent"][index + 1]).reshape(3)
+    normal = _guided_ridge_unit_array((1.0 - t) * frame["normal"][index] + t * frame["normal"][index + 1]).reshape(3)
+    normal = _guided_ridge_unit_array(normal - float(np.dot(normal, tangent)) * tangent).reshape(3)
+    lateral = _guided_ridge_unit_array(np.cross(tangent, normal)).reshape(3)
+    normal = _guided_ridge_unit_array(np.cross(lateral, tangent)).reshape(3)
+    return origin, tangent, normal, lateral
+
+
+def _guided_ridge_plane_boundary(points, faces, origin, plane_normal, boundary_edges):
+    import numpy as np
+    distance = (points - origin[None, :]) @ plane_normal
+    boundary_points = []
+    for first, second in boundary_edges:
+        va, vb = float(distance[first]), float(distance[second])
+        if abs(va) <= 1.0e-10:
+            boundary_points.append(points[first].copy())
+        if abs(vb) <= 1.0e-10:
+            boundary_points.append(points[second].copy())
+        if va * vb < -1.0e-20:
+            boundary_points.append(points[first] + (va / (va - vb)) * (points[second] - points[first]))
+    unique = []
+    for point in boundary_points:
+        if not any(np.linalg.norm(point - old) <= 1.0e-9 for old in unique):
+            unique.append(point)
+    return unique
+
+
+def _guided_ridge_boundary_record(points, faces, boundary_edges, frame, station, previous_axis):
+    import numpy as np
+    origin, tangent, frame_normal, frame_lateral = _guided_ridge_frame_at(frame, station)
+    cloud = np.asarray(_guided_ridge_plane_boundary(points, faces, origin, tangent, boundary_edges), dtype=np.float64).reshape(-1, 3)
+    if len(cloud) < 2:
+        return None
+    orient = frame_lateral if previous_axis is None else previous_axis
+    orient = _guided_ridge_unit_array(orient - np.dot(orient, tangent) * tangent).reshape(3)
+    scalar = (cloud - origin[None, :]) @ orient
+    lo_point, hi_point = cloud[int(np.argmin(scalar))], cloud[int(np.argmax(scalar))]
+    axis = hi_point - lo_point
+    axis -= np.dot(axis, tangent) * tangent
+    if np.linalg.norm(axis) <= 1.0e-8:
+        pair = max(((i, j) for i in range(len(cloud)) for j in range(i + 1, len(cloud))), key=lambda pair: np.linalg.norm(cloud[pair[1]] - cloud[pair[0]]))
+        lo_point, hi_point = cloud[pair[0]], cloud[pair[1]]
+        axis = hi_point - lo_point
+        axis -= np.dot(axis, tangent) * tangent
+    axis = _guided_ridge_unit_array(axis).reshape(3)
+    if np.dot(axis, orient) < 0.0:
+        axis *= -1.0
+        lo_point, hi_point = hi_point, lo_point
+    height_axis = _guided_ridge_unit_array(np.cross(tangent, axis)).reshape(3)
+    if np.dot(height_axis, frame_normal) < 0.0:
+        height_axis *= -1.0
+    qlo = float(np.dot(lo_point - origin, axis))
+    qhi = float(np.dot(hi_point - origin, axis))
+    hlo = float(np.dot(lo_point - origin, height_axis))
+    hhi = float(np.dot(hi_point - origin, height_axis))
+    if not qlo < qhi:
+        return None
+    return {"station": station, "axis": axis, "height_axis": height_axis, "qlo": qlo, "qhi": qhi, "hlo": hlo, "hhi": hhi}
+
+
+def _guided_ridge_bounded_pairwise_chunk_size(primary_count, secondary_count):
+    return max(
+        1,
+        min(
+            int(primary_count),
+            GUIDED_RIDGE_DISTANCE_MAX_PAIRS // max(int(secondary_count), 1),
+        ),
+    )
+
+
+def _guided_ridge_bounded_boundary_distance(before, boundary_mask):
+    import numpy as np
+    boundary_points = np.asarray(before[boundary_mask], dtype=np.float64)
+    if len(boundary_points) == 0:
+        raise ValueError("component boundary is unavailable")
+    result = np.empty(len(before), dtype=np.float64)
+    chunk_size = _guided_ridge_bounded_pairwise_chunk_size(len(before), len(boundary_points))
+    for start in range(0, len(before), chunk_size):
+        stop = min(start + chunk_size, len(before))
+        delta = before[start:stop, None, :] - boundary_points[None, :, :]
+        result[start:stop] = np.min(np.linalg.norm(delta, axis=2), axis=1)
+    return result, chunk_size, len(boundary_points)
+
+
+def _guided_ridge_exact_candidate(snapshot, guide, controls, control_normals):
+    import numpy as np
+    before = np.asarray(snapshot["coords_world"], dtype=np.float64)
+    faces = np.asarray(snapshot["triangles"], dtype=np.int64)
+    frame = _guided_ridge_stable_frame(before, faces, guide, controls, control_normals)
+    boundary_edges = np.asarray(snapshot["boundary_edges"], dtype=np.int64)
+    stations = np.linspace(0.001, frame["length"] - 0.001, 64)
+    records = []
+    previous_axis = None
+    for station in stations:
+        record = _guided_ridge_boundary_record(before, faces, boundary_edges, frame, float(station), previous_axis)
+        if record is not None:
+            records.append(record)
+            previous_axis = record["axis"]
+    if len(records) < 8:
+        raise ValueError("too few valid boundary sections")
+    valid = np.asarray([record["station"] for record in records], dtype=float)
+    arrays = {key: np.asarray([record[key] for record in records], dtype=float) for key in ("axis", "height_axis", "qlo", "qhi", "hlo", "hhi")}
+    anchors = {}
+    for key, values in arrays.items():
+        if values.ndim == 2:
+            anchors[key] = np.column_stack([np.interp(stations, valid, values[:, axis]) for axis in range(3)])
+        else:
+            anchors[key] = np.interp(stations, valid, values)
+    segment = np.diff(frame["guide"], axis=0)
+    length2 = np.sum(segment * segment, axis=1)
+    if not np.all(np.isfinite(length2)) or np.any(length2 <= 1.0e-16):
+        raise ValueError("guide contains a degenerate segment")
+    seg_index = np.empty(len(before), dtype=np.int32)
+    t = np.empty(len(before), dtype=np.float64)
+    chunk_size = _guided_ridge_bounded_pairwise_chunk_size(len(before), len(segment))
+    for start in range(0, len(before), chunk_size):
+        stop = min(start + chunk_size, len(before))
+        block = before[start:stop, None, :] - frame["guide"][:-1][None, :, :]
+        parameter = np.clip(np.sum(block * segment[None, :, :], axis=2) / length2[None, :], 0.0, 1.0)
+        distance2 = np.sum((block - parameter[:, :, None] * segment[None, :, :]) ** 2, axis=2)
+        seg_index[start:stop] = np.argmin(distance2, axis=1)
+        t[start:stop] = parameter[np.arange(stop - start), seg_index[start:stop]]
+    origin = frame["guide"][seg_index] + t[:, None] * segment[seg_index]
+    station = frame["arc"][seg_index] + t * (frame["arc"][seg_index + 1] - frame["arc"][seg_index])
+    tangent = _guided_ridge_unit_array((1.0 - t)[:, None] * frame["tangent"][seg_index] + t[:, None] * frame["tangent"][seg_index + 1])
+    u = np.clip(station / frame["length"] * (len(stations) - 1), 0.0, len(stations) - 1)
+    i0 = np.floor(u).astype(int)
+    i1 = np.minimum(i0 + 1, len(stations) - 1)
+    ft = u - i0
+    axis = _guided_ridge_unit_array((1.0 - ft)[:, None] * anchors["axis"][i0] + ft[:, None] * anchors["axis"][i1])
+    raw_height_axis = _guided_ridge_unit_array((1.0 - ft)[:, None] * anchors["height_axis"][i0] + ft[:, None] * anchors["height_axis"][i1])
+    axis -= np.sum(axis * tangent, axis=1, keepdims=True) * tangent
+    axis = _guided_ridge_unit_array(axis)
+    height_axis = _guided_ridge_unit_array(np.cross(tangent, axis))
+    signs = np.sum(height_axis * raw_height_axis, axis=1)
+    height_axis *= np.where(signs < 0.0, -1.0, 1.0)[:, None]
+    q = np.sum((before - origin) * axis, axis=1)
+    h = np.sum((before - origin) * height_axis, axis=1)
+    qlo = (1.0 - ft) * anchors["qlo"][i0] + ft * anchors["qlo"][i1]
+    qhi = (1.0 - ft) * anchors["qhi"][i0] + ft * anchors["qhi"][i1]
+    hlo = (1.0 - ft) * anchors["hlo"][i0] + ft * anchors["hlo"][i1]
+    hhi = (1.0 - ft) * anchors["hhi"][i0] + ft * anchors["hhi"][i1]
+    target = np.where(q <= 0.0, (q / np.minimum(qlo, -1.0e-8)) * hlo, (q / np.maximum(qhi, 1.0e-8)) * hhi)
+    boundary_mask = np.zeros(len(before), dtype=bool)
+    boundary_mask[[snapshot["vertex_indices"].index(index) for index in snapshot["boundary_vertices"]]] = True
+    hidden_vertices = np.asarray(
+        snapshot.get("hidden_vertices", np.zeros(len(before), dtype=bool)), dtype=bool
+    )
+    sculpt_mask = np.clip(
+        np.asarray(snapshot.get("sculpt_mask", np.zeros(len(before), dtype=np.float64)), dtype=np.float64),
+        0.0,
+        1.0,
+    )
+    if len(hidden_vertices) != len(before) or len(sculpt_mask) != len(before):
+        raise ValueError("protected Sculpt state does not match the component")
+    root_start, root_fade = 0.29 * frame["length"], 0.13 * frame["length"]
+    old_tip_fade = max(0.010 / 0.07595313195548941 * frame["length"], 1.0e-9)
+    new_tip_fade = max(0.003 / 0.07595313195548941 * frame["length"], 1.0e-9)
+    boundary_width = max(0.00070 / 0.07595313195548941 * frame["length"], 1.0e-9)
+    root_guard = np.asarray([_guided_ridge_smoothstep((value - root_start) / root_fade) for value in station])
+    old_tip_guard = np.asarray([_guided_ridge_smoothstep((frame["length"] - old_tip_fade - value) / old_tip_fade) for value in station])
+    new_tip_guard = np.asarray([_guided_ridge_smoothstep((frame["length"] - new_tip_fade - value) / new_tip_fade) for value in station])
+    boundary_distance, boundary_distance_chunk_size, boundary_count = _guided_ridge_bounded_boundary_distance(before, boundary_mask)
+    boundary_guard = np.asarray([_guided_ridge_smoothstep(value / boundary_width) for value in boundary_distance])
+    # Protected vertices are applied to their own final displacement below.
+    # Keeping them out of the smoothing loop prevents a local mask/hidden
+    # value from changing the candidate at neighboring unmasked vertices.
+    anchored = boundary_mask | (station <= 0.0)
+    def apply(weight, delta_source=None):
+        delta = (target - h) * (0.82 * weight if delta_source is None else delta_source)
+        for _ in range(2):
+            relaxed = delta.copy()
+            for index, neighbors in enumerate(snapshot["adjacency"]):
+                if anchored[index] or not neighbors:
+                    continue
+                relaxed[index] = 0.72 * delta[index] + 0.28 * float(np.mean(delta[list(neighbors)]))
+            relaxed[anchored] = 0.0
+            delta = relaxed
+        return delta
+    delta_current = apply(root_guard * old_tip_guard * boundary_guard)
+    current = before + delta_current[:, None] * height_axis
+    active = (0.82 * root_guard * old_tip_guard * boundary_guard) > 0.05
+    bins = np.linspace(0.0, frame["length"], 32 + 1)
+    raw = np.full(32, np.nan, dtype=float)
+    abs_delta = np.abs(delta_current)
+    for index in range(32):
+        mask = active & (station >= bins[index]) & (station < bins[index + 1])
+        if np.any(mask):
+            raw[index] = float(np.quantile(abs_delta[mask], 0.90))
+    finite = np.isfinite(raw)
+    center = float(np.median(raw[finite])) if np.any(finite) else 0.0
+    filled = np.where(finite, raw, center)
+    smooth_profile = _guided_ridge_smooth_array(filled, 1.8)
+    scale_profile = np.clip((0.85 * smooth_profile + 0.15 * center) / np.maximum(filled, 1.0e-12), 0.70, 1.35)
+    scale = np.interp(station, 0.5 * (bins[:-1] + bins[1:]), scale_profile, left=1.0, right=1.0)
+    scale[~active] = 1.0
+    variant_a = before + (delta_current * scale)[:, None] * height_axis
+    current_new = before + apply(root_guard * new_tip_guard * boundary_guard)[:, None] * height_axis
+    candidate = variant_a + 0.25 * (current_new - current) * scale[:, None]
+    protected_weight = np.clip(1.0 - sculpt_mask, 0.0, 1.0)
+    protected_weight[hidden_vertices] = 0.0
+    protected_weight[boundary_mask] = 0.0
+    # Apply protection locally to each vertex's final displacement. The
+    # unmasked/visible candidate stays unchanged when another vertex is
+    # masked, hidden, or a boundary anchor.
+    candidate_delta = candidate - before
+    candidate_delta *= protected_weight[:, None]
+    affected = (sculpt_mask > 1.0e-12) | hidden_vertices | boundary_mask
+    if np.any(affected):
+        final_delta_h = np.sum(candidate_delta * height_axis, axis=1)
+        final_bound = np.abs(target - h) * 0.82 * root_guard * new_tip_guard * boundary_guard * protected_weight
+        final_delta_h[affected] = np.clip(
+            final_delta_h[affected], -final_bound[affected], final_bound[affected]
+        )
+        candidate_delta[affected] = final_delta_h[affected, None] * height_axis[affected]
+    candidate = before + candidate_delta
+    return candidate, {
+        "length": frame["length"],
+        "station": station,
+        "boundary_mask": boundary_mask,
+        "weight": 0.82 * root_guard * new_tip_guard * boundary_guard * protected_weight,
+        "delta_h": np.sum((candidate - before) * height_axis, axis=1),
+        "boundary_distance_chunk_size": int(boundary_distance_chunk_size),
+        "boundary_count": int(boundary_count),
+        "vertex_guide_chunk_size": int(chunk_size),
+    }
+
+
+def _guided_ridge_mesh_integrity(snapshot, before, after):
+    import numpy as np
+    faces = np.asarray(snapshot["triangles"], dtype=np.int64)
+    before_tri = before[faces]
+    after_tri = after[faces]
+    cross_before = np.cross(before_tri[:, 1] - before_tri[:, 0], before_tri[:, 2] - before_tri[:, 0])
+    cross_after = np.cross(after_tri[:, 1] - after_tri[:, 0], after_tri[:, 2] - after_tri[:, 0])
+    area_before = np.linalg.norm(cross_before, axis=1) * 0.5
+    area_after = np.linalg.norm(cross_after, axis=1) * 0.5
+    dot = np.sum(cross_before * cross_after, axis=1) / np.maximum(
+        np.linalg.norm(cross_before, axis=1) * np.linalg.norm(cross_after, axis=1), 1.0e-30
+    )
+    return {
+        "finite": bool(np.all(np.isfinite(after))),
+        "normal_pair_flips": int(np.count_nonzero(dot < 0.0)),
+        "normal_pair_dot_min": float(np.min(dot)) if len(dot) else 1.0,
+        "new_degenerate_faces": int(np.count_nonzero((area_after <= 1.0e-12) & (area_before > 1.0e-12))),
+    }
+
+
+def _guided_ridge_overlay_tag(state):
+    if state is not None:
+        _tag_redraw(state.get("area"))
+
+
+def _guided_ridge_stop_draw():
+    global _guided_ridge_state
+    state = _guided_ridge_state
+    if state is None:
+        return
+    for key in ("draw_handler", "text_draw_handler"):
+        handler = state.get(key)
+        if handler is None:
+            continue
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(handler, "WINDOW")
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            pass
+        state[key] = None
+
+
+def _guided_ridge_cancel(state=None, reason="cancel"):
+    global _guided_ridge_state
+    current = _guided_ridge_state
+    if state is not None and current is not state:
+        return
+    if current is None:
+        return
+    current["active"] = False
+    _guided_ridge_stop_draw()
+    _guided_ridge_state = None
+    _guided_ridge_overlay_tag(current)
+
+
+def _guided_ridge_draw():
+    state = _guided_ridge_state
+    if state is None or not state.get("active"):
+        return
+    try:
+        context = bpy.context
+        if context.area is None or int(context.area.as_pointer()) != int(state["area_key"]):
+            return
+        shader = _fill_preview_shader_get()
+        if shader is None:
+            return
+        guide = state.get("guide") or []
+        if len(guide) < 1:
+            return
+        coords = [tuple(point) for point in guide]
+        if len(coords) >= 2:
+            batch = batch_for_shader(shader, "LINE_STRIP", {"pos": coords})
+            gpu.state.blend_set("ALPHA")
+            shader.bind()
+            shader.uniform_float("color", (0.12, 0.82, 1.0, 0.95))
+            batch.draw(shader)
+        points = batch_for_shader(shader, "POINTS", {"pos": coords})
+        shader.bind()
+        shader.uniform_float("color", (1.0, 0.35, 0.08, 1.0))
+        try:
+            gpu.state.point_size_set(8.0)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            pass
+        points.draw(shader)
+        gpu.state.blend_set("NONE")
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        try:
+            gpu.state.blend_set("NONE")
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            pass
+
+
+def _guided_ridge_draw_text():
+    state = _guided_ridge_state
+    if state is None or not state.get("active"):
+        return
+    try:
+        context = bpy.context
+        if context.area is None or int(context.area.as_pointer()) != int(state["area_key"]):
+            return
+        width = int(getattr(state.get("region"), "width", 0))
+        height = int(getattr(state.get("region"), "height", 0))
+        font_id = 0
+        blf.size(font_id, 13)
+        lines = [
+            "Guided Ridge",
+            "LMB: 点追加  Backspace: 戻す  Enter: 適用  Esc/RMB: 取消",
+        ]
+        x, y = max(18, width - 620), max(100, height - 54)
+        for index, line in enumerate(lines):
+            blf.position(font_id, x, y - index * 18, 0)
+            blf.color(font_id, 0.92, 0.96, 1.0, 1.0)
+            blf.draw(font_id, line)
+        # Two screen-space buttons are deliberately kept away from the guide.
+        for label, rect, color in (
+            ("適用", state["apply_rect"], (0.16, 0.55, 0.25, 0.95)),
+            ("取消", state["cancel_rect"], (0.55, 0.16, 0.16, 0.95)),
+        ):
+            x0, y0, x1, y1 = rect
+            gpu.state.blend_set("ALPHA")
+            shader = _fill_preview_shader_get()
+            if shader is not None:
+                shader.bind()
+                shader.uniform_float("color", color)
+                batch_for_shader(shader, "TRIS", {"pos": ((x0, y0), (x1, y0), (x1, y1), (x0, y0), (x1, y1), (x0, y1))}).draw(shader)
+            blf.position(font_id, x0 + 14, y0 + 10, 0)
+            blf.color(font_id, 1.0, 1.0, 1.0, 1.0)
+            blf.draw(font_id, label)
+        gpu.state.blend_set("NONE")
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        try:
+            gpu.state.blend_set("NONE")
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            pass
+
+
+def _guided_ridge_event_in_rect(event, rect):
+    x = float(getattr(event, "mouse_region_x", -1))
+    y = float(getattr(event, "mouse_region_y", -1))
+    x0, y0, x1, y1 = rect
+    return x0 <= x <= x1 and y0 <= y <= y1
+
+
+def _guided_ridge_conflict_reason(context):
+    if _guided_ridge_state is not None and _guided_ridge_state.get("active"):
+        return "Guided Ridge is already active"
+    if _fill_preview_state is not None and _fill_preview_state.get("active"):
+        return "Smart Face Set Fill is active"
+    if _tube_preview_state is not None and _tube_preview_state.get("active"):
+        return "Tube Shape is active"
+    try:
+        area_key = int(context.area.as_pointer())
+        existing = _active_states.get(area_key)
+        if existing is not None and getattr(existing, "active", False):
+            return "another MFO modal session is active"
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return "MFO viewport state is unavailable"
+    return None
+
+
+class VIEW3D_OT_mesh_focus_guided_ridge(bpy.types.Operator):
+    """Place a surface guide and apply one bounded C-like ridge."""
+
+    bl_idname = GUIDED_RIDGE_OPERATOR_ID
+    bl_label = "Guided Ridge"
+    bl_description = "Place a smooth surface guide and form a broad ridge on one connected Face Set"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = getattr(context, "active_object", None)
+        attr = _guided_ridge_face_set_attribute(obj) if obj is not None else None
+        conflict = _guided_ridge_conflict_reason(context)
+        # An active state is accepted only so EXEC_DEFAULT can route through
+        # the same production commit path.  invoke() rejects a second modal
+        # session explicitly below; a state-free EXEC_DEFAULT remains denied.
+        active_guided_state = _guided_ridge_state is not None and _guided_ridge_state.get("active")
+        if conflict is not None and not (active_guided_state and conflict == "Guided Ridge is already active"):
+            return False
+        return bool(
+            context.area is not None
+            and context.area.type == "VIEW_3D"
+            and context.region is not None
+            and context.region.type == "WINDOW"
+            and context.mode == "SCULPT"
+            and obj is not None
+            and obj.type == "MESH"
+            and attr is not None
+        )
+
+    def _commit(self, context, state):
+        import numpy as np
+        global _guided_ridge_last_guide
+        if len(state.get("controls", ())) < 2:
+            self.report({"WARNING"}, "Guided Ridge: at least two guide points are required")
+            return False
+        safety_reason = _guided_ridge_safety_reason(state.get("obj"))
+        if safety_reason is not None:
+            self.report({"WARNING"}, f"Guided Ridge: {safety_reason}; no changes applied")
+            _guided_ridge_cancel(state, "unsafe-commit")
+            return False
+        if not _guided_ridge_context_matches(context, state):
+            self.report({"WARNING"}, "Guided Ridge: viewport/object context changed; no changes applied")
+            _guided_ridge_cancel(state, "context-changed")
+            return False
+        pending_anchors, anchor_reason = _guided_ridge_surface_anchors(
+            state["snapshot"], state.get("controls", ())
+        )
+        if pending_anchors is None:
+            self.report({"WARNING"}, f"Guided Ridge: {anchor_reason or 'surface anchors are invalid'}")
+            return False
+        try:
+            pending_last_guide, guide_reason = _guided_ridge_build_last_guide(state, pending_anchors)
+        except (AttributeError, IndexError, MemoryError, ReferenceError, RuntimeError, TypeError, ValueError) as guide_error:
+            pending_last_guide, guide_reason = None, str(guide_error)
+        if pending_last_guide is None:
+            self.report({"WARNING"}, f"Guided Ridge: guide save preparation failed ({guide_reason})")
+            return False
+        if state.get("repeat"):
+            current = np.asarray(state["snapshot"].get("coords_local", ()), dtype=np.float64).copy()
+            if len(current) != len(state["snapshot"].get("vertex_indices", ())):
+                self.report({"WARNING"}, "Guided Ridge Repeat cancelled: current coordinates are unavailable")
+                return False
+        else:
+            current = _guided_ridge_current_signature(state["obj"], state["snapshot"])
+        if current is None:
+            self.report({"WARNING"}, "Guided Ridge: source mesh, Face Set, or coordinates changed")
+            return False
+        try:
+            projected, reason = _guided_ridge_project_curve(state["snapshot"], state["controls"])
+            if projected is None:
+                self.report({"WARNING"}, f"Guided Ridge: {reason}")
+                return False
+            candidate, info = _guided_ridge_exact_candidate(
+                state["snapshot"], projected, state["controls"], state["control_normals"]
+            )
+            integrity = _guided_ridge_mesh_integrity(state["snapshot"], state["snapshot"]["coords_world"], candidate)
+            if not integrity["finite"] or integrity["normal_pair_flips"] or integrity["new_degenerate_faces"]:
+                self.report({"WARNING"}, "Guided Ridge: unsafe geometry candidate; no changes applied")
+                return False
+            obj = state["obj"]
+            inverse = obj.matrix_world.inverted_safe()
+            coords_local = np.asarray([tuple(inverse @ Vector(point)) for point in candidate], dtype=np.float64)
+            if not np.all(np.isfinite(coords_local)):
+                self.report({"WARNING"}, "Guided Ridge: non-finite local coordinates")
+                return False
+            before_local = np.asarray(current, dtype=np.float64).copy()
+            mesh = obj.data
+            try:
+                for local_index, vertex_index in enumerate(state["snapshot"]["vertex_indices"]):
+                    mesh.vertices[int(vertex_index)].co = coords_local[local_index]
+                    failure_after = state.get("_test_failure_after")
+                    if failure_after is not None and local_index >= int(failure_after):
+                        raise RuntimeError("injected Guided Ridge write failure")
+                mesh.update()
+                obj.update_tag(refresh={"DATA"})
+                context.view_layer.update()
+            except (AttributeError, IndexError, MemoryError, ReferenceError, RuntimeError, TypeError, ValueError) as write_error:
+                rollback_ok, rollback_error = _guided_ridge_restore_coordinates(context, state, before_local)
+                if rollback_ok:
+                    self.report({"WARNING"}, f"Guided Ridge: commit failed; coordinates rolled back ({write_error})")
+                else:
+                    self.report({"ERROR"}, f"Guided Ridge: commit and rollback failed ({write_error}; {rollback_error})")
+                    _guided_ridge_cancel(state, "rollback-failed")
+                return False
+            # The complete Repeat Last payload was prepared before writing.  The
+            # assignment is intentionally the only post-write bookkeeping step.
+            _guided_ridge_last_guide = pending_last_guide
+            state["committed"] = True
+            self.report({"INFO"}, f"Guided Ridge: applied to {len(state['snapshot']['vertex_indices'])} vertices")
+            _guided_ridge_cancel(state, "confirm")
+            return True
+        except (AttributeError, IndexError, MemoryError, ReferenceError, RuntimeError, TypeError, ValueError) as error:
+            self.report({"WARNING"}, f"Guided Ridge: commit failed ({error})")
+            return False
+
+    def _execute_repeat(self, context, last_guide):
+        """Rebuild a current component snapshot and route Repeat Last through _commit."""
+        global _guided_ridge_state, _guided_ridge_last_guide
+        def reject(message):
+            global _guided_ridge_last_guide
+            if _guided_ridge_last_guide is last_guide:
+                _guided_ridge_last_guide = None
+            self.report({"WARNING"}, message)
+            return False
+
+        if not self.poll(context):
+            return reject("Guided Ridge Repeat cancelled: SCULPT Face Set context required")
+        obj = context.active_object
+        try:
+            object_pointer = int(obj.as_pointer())
+            mesh_pointer = int(obj.data.as_pointer())
+            if object_pointer != int(last_guide.get("object_pointer", 0)):
+                return reject("Guided Ridge Repeat cancelled: object RNA datablock changed")
+            if mesh_pointer != int(last_guide.get("mesh_pointer", 0)):
+                return reject("Guided Ridge Repeat cancelled: mesh RNA datablock changed")
+            if str(getattr(obj, "name", "")) != str(last_guide.get("object_name", "")):
+                return reject("Guided Ridge Repeat cancelled: active object changed")
+            if str(getattr(obj.data, "name", "")) != str(last_guide.get("data_name", "")):
+                return reject("Guided Ridge Repeat cancelled: active mesh changed")
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            return reject("Guided Ridge Repeat cancelled: active object is unavailable")
+        safety_reason = _guided_ridge_safety_reason(obj)
+        if safety_reason is not None:
+            return reject(f"Guided Ridge Repeat cancelled: {safety_reason}; no changes applied")
+        snapshot, reason = _guided_ridge_prepare_repeat_snapshot(obj, last_guide)
+        if snapshot is None:
+            return reject(reason or "Guided Ridge Repeat cancelled: component changed")
+        controls, control_normals, reason = _guided_ridge_repeat_controls(snapshot, last_guide)
+        if controls is None:
+            return reject(reason or "Guided Ridge Repeat cancelled: guide anchors are invalid")
+        context_signature = _guided_ridge_context_signature(context)
+        if context_signature is None:
+            return reject("Guided Ridge Repeat cancelled: viewport context is unavailable")
+        snapshot["context_signature"] = context_signature
+        repeat_state = {
+            "active": True,
+            "repeat": True,
+            "operator": self,
+            "obj": obj,
+            "snapshot": snapshot,
+            "controls": controls,
+            "control_normals": control_normals,
+            "guide": list(controls),
+            "last_cursor": controls[-1],
+            "area": context.area,
+            "area_key": int(context.area.as_pointer()),
+            "region": context.region,
+            "window_manager": context.window_manager,
+            "window_key": int(context.window.as_pointer()) if context.window else 0,
+            "draw_handler": None,
+            "text_draw_handler": None,
+            "committed": False,
+        }
+        _guided_ridge_state = repeat_state
+        try:
+            result = bool(self._commit(context, repeat_state))
+            if not result:
+                _guided_ridge_last_guide = None
+            return result
+        finally:
+            if _guided_ridge_state is repeat_state:
+                _guided_ridge_cancel(repeat_state, "repeat-finished")
+
+    def execute(self, context):
+        """Execute the active modal commit or Blender's standard Repeat Last path."""
+        state = _guided_ridge_state
+        if state is None or not state.get("active"):
+            if _guided_ridge_last_guide is None:
+                self.report({"WARNING"}, "Guided Ridge: no saved guide is available for Repeat Last")
+                return {"CANCELLED"}
+            return {"FINISHED"} if self._execute_repeat(context, _guided_ridge_last_guide) else {"CANCELLED"}
+        try:
+            if context.area is None or int(context.area.as_pointer()) != int(state["area_key"]):
+                self.report({"WARNING"}, "Guided Ridge: EXEC_DEFAULT context does not match the active guide")
+                return {"CANCELLED"}
+            if context.active_object is not state["obj"] or context.mode != "SCULPT":
+                self.report({"WARNING"}, "Guided Ridge: EXEC_DEFAULT active object does not match the guide")
+                return {"CANCELLED"}
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            self.report({"WARNING"}, "Guided Ridge: EXEC_DEFAULT context is unavailable")
+            return {"CANCELLED"}
+        return {"FINISHED"} if self._commit(context, state) else {"CANCELLED"}
+
+    def invoke(self, context, event):
+        global _guided_ridge_state
+        if _guided_ridge_state is not None and _guided_ridge_state.get("active"):
+            self.report({"WARNING"}, "Guided Ridge is already active")
+            return {"CANCELLED"}
+        if not self.poll(context):
+            reason = _guided_ridge_conflict_reason(context)
+            self.report({"WARNING"}, f"Guided Ridge: {reason or 'SCULPT Face Set context required'}")
+            return {"CANCELLED"}
+        coord = _sculpt_cursor_region_coordinate(context, event)
+        if coord is None:
+            self.report({"WARNING"}, "Guided Ridge: cursor is outside the View3D window region")
+            return {"CANCELLED"}
+        hit = _raycast_sculpt_face_set(context, coord)
+        if hit is None:
+            self.report({"WARNING"}, "Guided Ridge: visible Face Set surface not found under cursor")
+            return {"CANCELLED"}
+        obj, face_index, face_set_id, _location, _screen = hit
+        safety_reason = _guided_ridge_safety_reason(obj)
+        if safety_reason is not None:
+            self.report({"WARNING"}, f"Guided Ridge: {safety_reason}; no changes applied")
+            return {"CANCELLED"}
+        snapshot, reason = _guided_ridge_prepare_snapshot(obj, face_index, face_set_id)
+        if snapshot is None:
+            self.report({"WARNING"}, f"Guided Ridge: {reason}")
+            return {"CANCELLED"}
+        start_hit = _guided_ridge_snapshot_hit(context, snapshot, coord)
+        if start_hit is None:
+            self.report({"WARNING"}, "Guided Ridge: start point could not be projected")
+            return {"CANCELLED"}
+        context_signature = _guided_ridge_context_signature(context)
+        if context_signature is None:
+            self.report({"WARNING"}, "Guided Ridge: viewport context is unavailable")
+            return {"CANCELLED"}
+        snapshot["context_signature"] = context_signature
+        width = int(getattr(context.region, "width", 0))
+        height = int(getattr(context.region, "height", 0))
+        _guided_ridge_state = {
+            "active": True,
+            "operator": self,
+            "obj": obj,
+            "snapshot": snapshot,
+            "controls": [start_hit[0]],
+            "control_normals": [start_hit[1]],
+            "guide": [start_hit[0]],
+            "last_cursor": start_hit[0],
+            "area": context.area,
+            "area_key": int(context.area.as_pointer()),
+            "region": context.region,
+            "window_manager": context.window_manager,
+            "window_key": int(context.window.as_pointer()) if context.window else 0,
+            "draw_handler": None,
+            "text_draw_handler": None,
+            "apply_rect": (max(18, width - 230), 22, max(19, width - 140), 54),
+            "cancel_rect": (max(24, width - 130), 22, max(25, width - 40), 54),
+            "committed": False,
+        }
+        state = _guided_ridge_state
+        try:
+            state["draw_handler"] = bpy.types.SpaceView3D.draw_handler_add(_guided_ridge_draw, (), "WINDOW", "POST_VIEW")
+            state["text_draw_handler"] = bpy.types.SpaceView3D.draw_handler_add(_guided_ridge_draw_text, (), "WINDOW", "POST_PIXEL")
+            context.window_manager.modal_handler_add(self)
+            _guided_ridge_overlay_tag(state)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            _guided_ridge_cancel(state, "start")
+            return {"CANCELLED"}
+        return {"RUNNING_MODAL"}
+
+    def modal(self, context, event):
+        state = _guided_ridge_state
+        if state is None or state.get("operator") is not self:
+            return {"CANCELLED"}
+        event_type = getattr(event, "type", "")
+        event_value = getattr(event, "value", None)
+        if event_type in {"ESC", "RIGHTMOUSE"} and event_value in {None, "PRESS"}:
+            _guided_ridge_cancel(state, "cancel")
+            return {"CANCELLED"}
+        if event_type == "BACK_SPACE" and event_value in {None, "PRESS"}:
+            if len(state["controls"]) > 1:
+                state["controls"].pop()
+                state["control_normals"].pop()
+                state["guide"], _reason = _guided_ridge_project_curve(state["snapshot"], state["controls"])
+                if state["guide"] is None:
+                    state["guide"] = list(state["controls"])
+                _guided_ridge_overlay_tag(state)
+            return {"RUNNING_MODAL"}
+        if event_type in {"RET", "NUMPAD_ENTER", "ENTER"} and event_value in {None, "PRESS"}:
+            self._commit(context, state)
+            return {"FINISHED" if state.get("committed") else "RUNNING_MODAL"}
+        if event_type == "LEFTMOUSE" and event_value == "PRESS":
+            if _guided_ridge_event_in_rect(event, state["apply_rect"]):
+                self._commit(context, state)
+                return {"FINISHED" if state.get("committed") else "RUNNING_MODAL"}
+            if _guided_ridge_event_in_rect(event, state["cancel_rect"]):
+                _guided_ridge_cancel(state, "cancel-button")
+                return {"CANCELLED"}
+            coord = _sculpt_cursor_region_coordinate(context, event)
+            if coord is None:
+                return {"RUNNING_MODAL"}
+            hit = _guided_ridge_snapshot_hit(context, state["snapshot"], coord)
+            if hit is None:
+                self.report({"WARNING"}, "Guided Ridge: click must hit the same Face Set component")
+                return {"RUNNING_MODAL"}
+            point = hit[0]
+            if state["controls"] and (point - state["controls"][-1]).length <= 1.0e-7:
+                return {"RUNNING_MODAL"}
+            if len(state["controls"]) >= GUIDED_RIDGE_MAX_CONTROLS:
+                self.report({"WARNING"}, "Guided Ridge: maximum 64 guide points reached")
+                return {"RUNNING_MODAL"}
+            candidate_controls = state["controls"] + [point]
+            projected, reason = _guided_ridge_project_curve(state["snapshot"], candidate_controls)
+            if projected is None:
+                self.report({"WARNING"}, f"Guided Ridge: {reason}")
+                return {"RUNNING_MODAL"}
+            state["controls"] = candidate_controls
+            state["control_normals"] = state["control_normals"] + [hit[1]]
+            state["guide"] = projected
+            _guided_ridge_overlay_tag(state)
+            return {"RUNNING_MODAL"}
+        if event_type == "MOUSEMOVE":
+            coord = _sculpt_cursor_region_coordinate(context, event)
+            if coord is None:
+                return {"RUNNING_MODAL"}
+            hit = _guided_ridge_snapshot_hit(context, state["snapshot"], coord)
+            if hit is not None:
+                state["last_cursor"] = hit[0]
+                _guided_ridge_overlay_tag(state)
+            return {"RUNNING_MODAL"}
+        if event_type in {"MIDDLEMOUSE", "WHEELUPMOUSE", "WHEELDOWNMOUSE"}:
+            return {"PASS_THROUGH"}
+        return {"RUNNING_MODAL"}
+
+
+@persistent
+def _on_guided_ridge_depsgraph_update(_scene, depsgraph):
+    state = _guided_ridge_state
+    if state is None or not state.get("active"):
+        return
+    try:
+        pointers = set()
+        for update in depsgraph.updates:
+            data = update.id
+            pointers.add(int(data.as_pointer()))
+            original = getattr(data, "original", None)
+            if original is not None:
+                pointers.add(int(original.as_pointer()))
+        if int(state["obj"].as_pointer()) in pointers or int(state["obj"].data.as_pointer()) in pointers:
+            # Input is read-only; an external sculpt/undo/topology update ends
+            # the guide and releases every draw handler immediately.
+            _guided_ridge_cancel(state, "stale")
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        _guided_ridge_cancel(state, "stale")
+
+
+@persistent
+def _on_guided_ridge_load_pre(_scene):
+    global _guided_ridge_last_guide
+    _guided_ridge_last_guide = None
+    _guided_ridge_cancel(reason="load-pre")
+
+
+@persistent
+def _on_guided_ridge_load_post(_scene):
+    global _guided_ridge_last_guide
+    _guided_ridge_last_guide = None
+    _guided_ridge_cancel(reason="load-post")
 
 
 # ---------------------------------------------------------------------------
@@ -9913,11 +11748,11 @@ class VIEW3D_OT_mesh_focus_tube_shape(bpy.types.Operator):
         if safety_reason:
             self.report({"WARNING"}, f"Tube Shape: {safety_reason}")
             return {"CANCELLED"}
-        mouse_x = getattr(event, "mouse_region_x", None)
-        mouse_y = getattr(event, "mouse_region_y", None)
-        if mouse_x is None or mouse_y is None:
+        coord = _sculpt_cursor_region_coordinate(context, event)
+        if coord is None:
+            self.report({"WARNING"}, "Tube Shape: cursor is outside the View3D window region")
             return {"CANCELLED"}
-        hit = _raycast_sculpt_face_set(context, Vector((int(mouse_x), int(mouse_y))))
+        hit = _raycast_sculpt_face_set(context, coord)
         if hit is None:
             self.report({"WARNING"}, "Tube Shape: visible Sculpt Face Set face not found")
             return {"CANCELLED"}
@@ -9935,8 +11770,8 @@ class VIEW3D_OT_mesh_focus_tube_shape(bpy.types.Operator):
             return {"CANCELLED"}
         if signature is None:
             return {"CANCELLED"}
-        self.mouse_region_x = int(mouse_x)
-        self.mouse_region_y = int(mouse_y)
+        self.mouse_region_x = int(round(coord.x))
+        self.mouse_region_y = int(round(coord.y))
         self._tube_session_id = _next_session_id()
         state = {
             "active": True, "phase": "prepare", "operator": self,
@@ -10134,7 +11969,10 @@ def _fill_preview_signature(obj):
 
     Geometry changes are invalidated by the dependency-graph callback below;
     this signature is deliberately limited to ownership, topology counts and
-    transform so that a wheel event never performs a full mesh digest.
+    transform so that a wheel event never performs a full mesh digest.  The
+    live ``.sculpt_face_set`` values are intentionally not part of either
+    surface-cache key; a new session reads the current attribute for its seed
+    Face Set prior.
     """
     try:
         mesh = obj.data
@@ -22003,12 +23841,13 @@ def _fill_preview_record_confirm_metrics(result, metrics):
 
 
 def _fill_preview_confirm_flood(state, result):
-    """Resolve one generation's boundary snapshot into mesh-global faces.
+    """Validate and return the ready result's complete mesh-global candidate.
 
-    Confirmation uses the compact graph captured by the ready result, never
-    the provisional ``result['faces']`` array.  Hidden faces are hard barriers
-    in the recorded domain.  Visibility changes outside that domain do not
-    invalidate an otherwise visible seed component.
+    ``result['faces']`` is the authority for confirmation.  It is already the
+    immutable, mesh-global face set represented by the ready preview, so a
+    second seed-connected flood would silently drop disconnected candidate
+    islands.  The compact graph remains useful for drawing and diagnostics,
+    but is deliberately not a confirmation filter.
     """
     import numpy as np
 
@@ -22017,7 +23856,11 @@ def _fill_preview_confirm_flood(state, result):
         "visible_domain_count": 0,
         "hidden_excluded_count": 0,
         "outside_domain_visibility_change_ignored": 0,
-        "reached_visible_count": 0,
+        "outside_candidate_visibility_change_ignored": 0,
+        "candidate_count": 0,
+        "candidate_domain_count": 0,
+        "candidate_snapshot_hidden_count": 0,
+        "candidate_current_hidden_count": 0,
     }
 
     def fail(reason, **updates):
@@ -22042,28 +23885,76 @@ def _fill_preview_confirm_flood(state, result):
         face_ids = np.arange(count, dtype=np.int32)
     else:
         try:
-            face_ids = np.asarray(face_ids, dtype=np.int32).reshape(-1)
+            raw_face_ids = np.asarray(face_ids)
         except (TypeError, ValueError):
             return fail("schema-face-ids")
+        if raw_face_ids.ndim != 1 or raw_face_ids.dtype.kind not in "iu":
+            return fail("schema-face-ids")
+        face_ids = raw_face_ids.astype(np.int64, copy=False)
     if len(face_ids) != count:
         return fail("schema-face-ids")
+    if np.any(face_ids < 0):
+        return fail("schema-face-id-range")
+    if len(np.unique(face_ids)) != count:
+        return fail("schema-face-ids-duplicate")
     try:
         mesh = state["obj"].data
         current_hidden = np.empty(len(mesh.polygons), dtype=bool)
         mesh.polygons.foreach_get("hide", current_hidden)
     except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
         return fail("visibility-read-error")
-    snapshot_hidden = np.asarray(
-        geometry.get("hidden", np.zeros(count, dtype=bool)), dtype=bool
-    ).reshape(-1)
-    if len(snapshot_hidden) != count:
+    try:
+        raw_snapshot_hidden = np.asarray(
+            geometry.get("hidden", np.zeros(count, dtype=bool))
+        )
+    except (TypeError, ValueError):
         return fail("schema-hidden")
-    if np.any(face_ids < 0) or np.any(face_ids >= len(current_hidden)):
+    if raw_snapshot_hidden.ndim != 1 or raw_snapshot_hidden.dtype.kind != "b":
+        return fail("schema-hidden")
+    snapshot_hidden = raw_snapshot_hidden.astype(bool, copy=False)
+    if len(snapshot_hidden) != count:
+        return fail("schema-face-id-range")
+    if np.any(face_ids >= len(current_hidden)):
         return fail("schema-face-id-range")
 
-    domain_ids = np.asarray(
-        result.get("confirm_domain_ids", ()), dtype=np.int32
-    ).reshape(-1)
+    candidate_raw = result.get("faces")
+    if candidate_raw is None:
+        return fail("missing-candidate")
+    try:
+        candidate_array = np.asarray(candidate_raw)
+    except (TypeError, ValueError):
+        return fail("schema-candidate")
+    if candidate_array.ndim != 1 or candidate_array.dtype.kind not in "iu":
+        return fail("schema-candidate")
+    if len(candidate_array) == 0:
+        return fail("candidate-empty")
+    candidate = candidate_array.astype(np.int64, copy=False)
+    if np.any(candidate < 0) or np.any(candidate >= len(current_hidden)):
+        return fail("candidate-face-id-range")
+    if len(np.unique(candidate)) != len(candidate):
+        return fail("candidate-face-id-duplicate")
+    candidate_local = np.flatnonzero(np.isin(face_ids, candidate)).astype(
+        np.int64, copy=False
+    )
+    if len(candidate_local) != len(candidate):
+        return fail("candidate-not-in-confirm-snapshot")
+    candidate_mask = np.zeros(count, dtype=bool)
+    candidate_mask[candidate_local] = True
+    metrics["candidate_count"] = int(len(candidate))
+
+    try:
+        raw_domain_ids = np.asarray(result.get("confirm_domain_ids", ()))
+    except (TypeError, ValueError):
+        return fail("schema-confirm-domain")
+    if raw_domain_ids.ndim != 1 or raw_domain_ids.dtype.kind not in "iu":
+        return fail("schema-confirm-domain")
+    domain_ids = raw_domain_ids.astype(np.int64, copy=False)
+    if len(domain_ids) == 0:
+        return fail("domain-empty")
+    if np.any(domain_ids < 0) or np.any(domain_ids >= count):
+        return fail("confirm-domain-range")
+    if len(np.unique(domain_ids)) != len(domain_ids):
+        return fail("confirm-domain-duplicate")
     domain = np.zeros(count, dtype=bool)
     domain_ids = domain_ids[(domain_ids >= 0) & (domain_ids < count)]
     domain[domain_ids] = True
@@ -22072,74 +23963,49 @@ def _fill_preview_confirm_flood(state, result):
     metrics["outside_domain_visibility_change_ignored"] = int(
         np.count_nonzero(changed_hidden & ~domain)
     )
+    metrics["outside_candidate_visibility_change_ignored"] = int(
+        np.count_nonzero(changed_hidden & domain & ~candidate_mask)
+    )
     hidden_in_domain = domain & (snapshot_hidden | current_hidden_local)
     visible_domain = domain & ~snapshot_hidden & ~current_hidden_local
     metrics["hidden_excluded_count"] = int(np.count_nonzero(hidden_in_domain))
     metrics["visible_domain_count"] = int(np.count_nonzero(visible_domain))
+    candidate_in_domain = domain[candidate_local]
+    metrics["candidate_domain_count"] = int(np.count_nonzero(candidate_in_domain))
+    if not np.all(candidate_in_domain):
+        return fail(
+            "candidate-outside-confirm-domain",
+            candidate_domain_count=int(np.count_nonzero(candidate_in_domain)),
+        )
+    candidate_snapshot_hidden = snapshot_hidden[candidate_local]
+    candidate_current_hidden = current_hidden_local[candidate_local]
+    metrics["candidate_snapshot_hidden_count"] = int(
+        np.count_nonzero(candidate_snapshot_hidden)
+    )
+    metrics["candidate_current_hidden_count"] = int(
+        np.count_nonzero(candidate_current_hidden)
+    )
+    if np.any(candidate_snapshot_hidden):
+        return fail("candidate-snapshot-hidden")
+    if np.any(candidate_current_hidden):
+        return fail("candidate-hidden-changed")
     seed = int(result.get("confirm_seed_local", -1))
     if seed < 0 or seed >= count:
         return fail("seed-invalid")
+    if not candidate_mask[seed]:
+        return fail("seed-outside-candidate")
     if snapshot_hidden[seed] or current_hidden_local[seed]:
         return fail("seed-hidden")
     if not domain[seed] or not visible_domain[seed]:
         return fail("seed-outside-visible-domain")
-    # A face that was part of the confirmation domain but became hidden is a
-    # stale generation, not a reason to traverse through the hidden face.
-    # Abort before any write; hidden changes outside this local domain remain
-    # irrelevant to the candidate.
-    if np.any(domain & snapshot_hidden):
-        return fail(
-            "domain-snapshot-hidden",
-            domain_hidden_count=int(np.count_nonzero(domain & snapshot_hidden)),
-        )
-    if np.any(domain & current_hidden_local):
-        return fail(
-            "domain-hidden-changed",
-            domain_hidden_count=int(np.count_nonzero(domain & current_hidden_local)),
-        )
-    if not np.any(visible_domain):
+    if not np.all(visible_domain[candidate_local]):
+        return fail("candidate-outside-visible-domain")
+    if not np.any(candidate_mask):
         return fail("domain-empty")
-
-    boundary_pairs = set()
-    for record in result.get("boundary_records", ()):
-        try:
-            first = int(record["geometry_face_a"])
-            second = int(record["geometry_face_b"])
-        except (KeyError, TypeError, ValueError):
-            return fail("boundary-schema")
-        if (
-            first < 0
-            or second < 0
-            or first >= count
-            or second >= count
-            or first == second
-        ):
-            return fail("boundary-face-range")
-        boundary_pairs.add((min(first, second), max(first, second)))
-
-    offsets = np.asarray(geometry.get("offsets"), dtype=np.int64)
-    neighbors = np.asarray(geometry.get("neighbors"), dtype=np.int32)
-    if len(offsets) != count + 1 or len(neighbors) != int(offsets[-1]):
-        return fail("confirm-graph-schema")
-    reached = np.zeros(count, dtype=bool)
-    reached[seed] = True
-    pending = [seed]
-    while pending:
-        face = pending.pop()
-        start, end = int(offsets[face]), int(offsets[face + 1])
-        for neighbor in neighbors[start:end]:
-            neighbor = int(neighbor)
-            if neighbor < 0 or neighbor >= count or not visible_domain[neighbor]:
-                continue
-            if (min(face, neighbor), max(face, neighbor)) in boundary_pairs:
-                continue
-            if not reached[neighbor]:
-                reached[neighbor] = True
-                pending.append(neighbor)
-    reached_ids = face_ids[np.flatnonzero(reached)].astype(np.int32, copy=False)
-    metrics.update({"reason": "ok", "reached_visible_count": int(len(reached_ids))})
+    candidate_ids = candidate.astype(np.int32, copy=True)
+    metrics["reason"] = "ok"
     _fill_preview_record_confirm_metrics(result, metrics)
-    return reached_ids
+    return candidate_ids
 
 
 def _fill_preview_confirm_graph_snapshot(geometry, distances, radius):
@@ -22589,22 +24455,28 @@ def _on_fill_preview_depsgraph_update(_scene, depsgraph):
 
     Cache ownership is independent of an active preview session: a geometry or
     visibility update while idle must not leave a reusable graph from the old
-    revision.  Blender exposes many Face Set writes as mesh updates too, so
-    those updates conservatively drop the cache; this costs a rebuild but never
-    permits stale geometry to reach a later E invocation.
+    revision.  Blender exposes many Face Set writes as mesh updates too.  The
+    only exception is the short, confirm-owned token below: it is removed from
+    the handler scope before no other operation can interleave and its queued
+    target update is consumed before the token is cleared.  All later or
+    unowned updates take this normal invalidation path.
     """
     state = _fill_preview_state
     try:
-        updated_pointers = set()
-        for update in depsgraph.updates:
-            data = update.id
-            updated_pointers.add(int(data.as_pointer()))
-            # depsgraph updates commonly expose evaluated Object/Mesh copies;
-            # cache keys are owned by the original datablocks.
-            original = getattr(data, "original", None)
-            if original is not None:
-                updated_pointers.add(int(original.as_pointer()))
+        updates = tuple(depsgraph.updates)
+        updated_pointers = _fill_preview_update_pointers(updates)
         if not updated_pointers:
+            return
+        token = _fill_preview_self_face_set_update_token
+        if token is not None and token.get("active"):
+            _fill_preview_consume_self_update_batch(token, updates, updated_pointers)
+            if token.get("safe"):
+                return
+            # An unexpected target update is never suppressed.  The helper has
+            # already dropped target entries; keep the active session stale as
+            # well so it cannot confirm against unknown data.
+            if state is not None and state.get("active"):
+                _fill_preview_cancel(state, "stale")
             return
         affected_session = False
         if state is not None and state.get("active"):
@@ -22613,17 +24485,234 @@ def _on_fill_preview_depsgraph_update(_scene, depsgraph):
                 int(obj.as_pointer()) in updated_pointers
                 or int(obj.data.as_pointer()) in updated_pointers
             )
-        for key in list(_fill_preview_adjacency_cache):
-            if key[0] in updated_pointers or key[1] in updated_pointers:
-                _fill_preview_adjacency_cache.pop(key, None)
-        for key in list(_fill_preview_cursor_cache):
-            if key[0] in updated_pointers or key[1] in updated_pointers:
-                _fill_preview_cursor_cache.pop(key, None)
+        _fill_preview_invalidate_cache_pointers(updated_pointers)
         if affected_session:
             _fill_preview_cancel(state, "stale")
     except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
         if state is not None and state.get("active"):
             _fill_preview_cancel(state, "stale")
+
+
+def _fill_preview_update_pointers(updates):
+    """Return original and evaluated IDs from a depsgraph update batch."""
+    pointers = set()
+    for update in updates:
+        data = update.id
+        pointers.add(int(data.as_pointer()))
+        # Depsgraph updates commonly expose evaluated Object/Mesh copies;
+        # cache keys are owned by the original datablocks.
+        original = getattr(data, "original", None)
+        if original is not None:
+            pointers.add(int(original.as_pointer()))
+    return pointers
+
+
+def _fill_preview_invalidate_cache_pointers(updated_pointers):
+    """Drop cache entries owned by any ID in *updated_pointers*."""
+    for key in list(_fill_preview_adjacency_cache):
+        if key[0] in updated_pointers or key[1] in updated_pointers:
+            _fill_preview_adjacency_cache.pop(key, None)
+    for key in list(_fill_preview_cursor_cache):
+        if key[0] in updated_pointers or key[1] in updated_pointers:
+            _fill_preview_cursor_cache.pop(key, None)
+
+
+def _fill_preview_self_update_expected(token, update):
+    """Check one update against the confirm token's observed RNA shape."""
+    data = update.id
+    kind = type(data).__name__
+    if kind not in token.get("expected_update_types", ("Mesh", "Object")):
+        return False
+    pointer = int(data.as_pointer())
+    original = getattr(data, "original", None)
+    original_pointer = (
+        int(original.as_pointer()) if original is not None else None
+    )
+    if kind == "Mesh":
+        target = int(token["target_mesh_pointer"])
+    elif kind == "Object":
+        target = int(token["target_object_pointer"])
+    else:
+        return False
+    if pointer != target and original_pointer != target:
+        return False
+    # Blender 5.2.2 marks the Face Set write as geometry on both the direct
+    # Mesh and evaluated Object/Mesh notifications.  Transform-only Object
+    # updates are deliberately not accepted by this token.
+    return bool(getattr(update, "is_updated_geometry", False))
+
+
+def _fill_preview_consume_self_update_batch(token, updates, updated_pointers):
+    """Consume one token-scoped batch while still handling unrelated IDs."""
+    target_pointers = {
+        int(token["target_object_pointer"]),
+        int(token["target_mesh_pointer"]),
+    }
+    unrelated = set(updated_pointers) - target_pointers
+    if unrelated:
+        _fill_preview_invalidate_cache_pointers(unrelated)
+    target_updates = []
+    for update in updates:
+        data = update.id
+        pointer_set = {int(data.as_pointer())}
+        original = getattr(data, "original", None)
+        if original is not None:
+            pointer_set.add(int(original.as_pointer()))
+        if pointer_set & target_pointers:
+            target_updates.append(update)
+    if not target_updates:
+        return
+    token["observed_batches"] = int(token.get("observed_batches", 0)) + 1
+    if not all(_fill_preview_self_update_expected(token, update) for update in target_updates):
+        token["safe"] = False
+        token["unexpected_target_update"] = True
+        _fill_preview_invalidate_cache_pointers(target_pointers)
+
+
+def _fill_preview_self_face_set_update_begin(obj, state, context=None):
+    """Open a bounded ownership token for one confirmed Face Set write.
+
+    Face Set writes and geometry edits have indistinguishable Blender RNA
+    update flags.  This token is therefore scoped to one confirm operation and
+    one explicit dependency-graph drain; it is never a delayed or timeout
+    exemption.  The target Object/Mesh pointers, session operation and
+    generation are recorded so an unexpected callback fails closed.
+    """
+    global _fill_preview_self_face_set_update_token
+    if _fill_preview_self_face_set_update_token is not None:
+        raise RuntimeError("nested Smart Face Set Fill confirmation")
+    signature = _fill_preview_signature(obj)
+    if signature is None:
+        raise RuntimeError("preview target is unavailable")
+    handler_list = bpy.app.handlers.depsgraph_update_post
+    depsgraph = (
+        context.evaluated_depsgraph_get()
+        if context is not None
+        else None
+    )
+    handler_index = None
+    try:
+        handler_index = handler_list.index(_on_fill_preview_depsgraph_update)
+        handler_list.remove(_on_fill_preview_depsgraph_update)
+    except ValueError:
+        # Direct/unit calls may not have registered the handler.  In the real
+        # add-on register() always installs it; without it we fail closed in
+        # the end helper rather than claiming a drained notification.
+        handler_index = None
+    token = {
+        "active": True,
+        "target_object_pointer": int(obj.as_pointer()),
+        "target_mesh_pointer": int(obj.data.as_pointer()),
+        "signature": signature,
+        "confirm_generation": int(state.get("generation", -1)),
+        "operation": "SFSF-confirm-" + str(state.get("session_id", "unknown")),
+        "expected_update_types": ("Mesh", "Object"),
+        "expected_update_kind": "geometry-flagged-Face-Set-attribute-write",
+        "handler_removed": handler_index is not None,
+        "handler_index": handler_index,
+        "observed_batches": 0,
+        "unexpected_target_update": False,
+        "safe": True,
+        "drain_verified": False,
+        "write_succeeded": False,
+        "adjacency_key": signature if signature in _fill_preview_adjacency_cache else None,
+        "cursor_key": signature if signature in _fill_preview_cursor_cache else None,
+        "adjacency_identity": id(_fill_preview_adjacency_cache.get(signature)),
+        "cursor_identity": id(_fill_preview_cursor_cache.get(signature)),
+        "depsgraph": depsgraph,
+    }
+    _fill_preview_self_face_set_update_token = token
+    return token
+
+
+def _fill_preview_self_face_set_update_end(context, token, write_succeeded):
+    """Drain and consume a confirm token before future updates are observable."""
+    global _fill_preview_self_face_set_update_token
+    if token is None or _fill_preview_self_face_set_update_token is not token:
+        return
+    handler_list = bpy.app.handlers.depsgraph_update_post
+    target_pointers = {
+        int(token["target_object_pointer"]),
+        int(token["target_mesh_pointer"]),
+    }
+    token["write_succeeded"] = bool(write_succeeded)
+    try:
+        if not write_succeeded or not token.get("handler_removed"):
+            token["safe"] = False
+        if token.get("safe"):
+            # The first batch may be a direct Mesh notification; the second
+            # may be evaluated Object+Mesh.  Continue until Blender reports no
+            # pending updates instead of relying on a delay or fixed count.
+            stalled = 0
+            while True:
+                depsgraph = token.get("depsgraph")
+                if depsgraph is None:
+                    depsgraph = context.evaluated_depsgraph_get()
+                updates = tuple(depsgraph.updates)
+                if updates:
+                    before = int(token.get("observed_batches", 0))
+                    updated_pointers = _fill_preview_update_pointers(updates)
+                    _fill_preview_consume_self_update_batch(
+                        token, updates, updated_pointers
+                    )
+                    if int(token.get("observed_batches", 0)) == before:
+                        stalled += 1
+                    else:
+                        stalled = 0
+                try:
+                    context.view_layer.update()
+                except (
+                    AttributeError,
+                    ReferenceError,
+                    RuntimeError,
+                    TypeError,
+                    ValueError,
+                ):
+                    token["safe"] = False
+                    break
+                remaining = tuple(depsgraph.updates)
+                if not remaining:
+                    token["drain_verified"] = stalled == 0
+                    break
+                if stalled >= 2:
+                    # This is a safety escape for a pathological callback that
+                    # keeps producing updates; correctness does not depend on
+                    # it because the target is invalidated below.
+                    token["safe"] = False
+                    break
+            if token.get("safe") and token.get("drain_verified"):
+                if token.get("adjacency_key") is not None and id(
+                    _fill_preview_adjacency_cache.get(token["adjacency_key"])
+                ) != token.get("adjacency_identity"):
+                    token["safe"] = False
+                if token.get("cursor_key") is not None and id(
+                    _fill_preview_cursor_cache.get(token["cursor_key"])
+                ) != token.get("cursor_identity"):
+                    token["safe"] = False
+        if not token.get("safe") or not token.get("drain_verified"):
+            _fill_preview_invalidate_cache_pointers(target_pointers)
+    except (
+        AttributeError,
+        ReferenceError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ):
+        token["safe"] = False
+        _fill_preview_invalidate_cache_pointers(target_pointers)
+    finally:
+        token["active"] = False
+        token["consumed"] = True
+        _fill_preview_self_face_set_update_token = None
+        if token.get("handler_removed") and _on_fill_preview_depsgraph_update not in handler_list:
+            index = token.get("handler_index")
+            if index is None:
+                handler_list.append(_on_fill_preview_depsgraph_update)
+            else:
+                handler_list.insert(
+                    min(int(index), len(handler_list)),
+                    _on_fill_preview_depsgraph_update,
+                )
 
 
 def _fill_average(values, first, second, count, iterations):
@@ -23022,19 +25111,17 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
             self.report({"WARNING"}, "Smart Face Set Fill: 先に Tube Shape の予測を終了してください")
             return {"CANCELLED"}
 
-        mouse_x = getattr(event, "mouse_region_x", None)
-        mouse_y = getattr(event, "mouse_region_y", None)
-        if mouse_x is None or mouse_y is None:
+        coord = _sculpt_cursor_region_coordinate(context, event)
+        if coord is None:
+            self.report({"WARNING"}, "Smart Face Set Fill: cursor is outside the View3D window region")
             return {"CANCELLED"}
 
-        self.mouse_region_x = int(mouse_x)
-        self.mouse_region_y = int(mouse_y)
+        self.mouse_region_x = int(round(coord.x))
+        self.mouse_region_y = int(round(coord.y))
         self.strict_mode = bool(
             self.strict_mode or getattr(event, "ctrl", False)
         )
-        hit = _raycast_sculpt_face_set(
-            context, Vector((self.mouse_region_x, self.mouse_region_y))
-        )
+        hit = _raycast_sculpt_face_set(context, coord)
         if hit is None:
             self.report({"WARNING"}, "Smart Face Set Fill: no visible face under cursor")
             return {"CANCELLED"}
@@ -23381,9 +25468,9 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
             _fill_preview_cancel(state, "face-set-layer")
             return {"CANCELLED"}
         try:
-            # Resolve the generation's immutable outer-boundary snapshot only
-            # after the second E/Enter.  The provisional face array is never a
-            # write source; an incomplete flood aborts before attr mutation.
+            # Resolve the generation's immutable candidate snapshot only after
+            # the second E/Enter.  The ready result's mesh-global face array is
+            # the write source; validation aborts before attr mutation.
             faces = _fill_preview_confirm_flood(state, result)
             if faces is None or len(faces) == 0:
                 _fill_preview_cancel(state, "confirm-graph")
@@ -23393,8 +25480,43 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
             changed = int(np.count_nonzero(values[faces] != int(state["seed_face_set"])))
             if changed:
                 values[faces] = int(state["seed_face_set"])
-                attr.data.foreach_set("value", values)
-                obj.data.update()
+                self_update_token = _fill_preview_self_face_set_update_begin(
+                    obj, state, context
+                )
+                write_succeeded = False
+                try:
+                    attr.data.foreach_set("value", values)
+                    obj.data.update()
+                    write_succeeded = True
+                finally:
+                    _fill_preview_self_face_set_update_end(
+                        context, self_update_token, write_succeeded
+                    )
+                result["self_face_set_cache_preserved"] = bool(
+                    self_update_token.get("safe")
+                    and self_update_token.get("drain_verified")
+                    and (
+                        self_update_token.get("adjacency_key") is None
+                        or id(
+                            _fill_preview_adjacency_cache.get(
+                                self_update_token["adjacency_key"]
+                            )
+                        )
+                        == self_update_token.get("adjacency_identity")
+                    )
+                    and (
+                        self_update_token.get("cursor_key") is None
+                        or id(
+                            _fill_preview_cursor_cache.get(
+                                self_update_token["cursor_key"]
+                            )
+                        )
+                        == self_update_token.get("cursor_identity")
+                    )
+                )
+                result["self_face_set_update_drain_verified"] = bool(
+                    self_update_token.get("drain_verified")
+                )
         except (
             AttributeError,
             IndexError,
@@ -23682,6 +25804,31 @@ class VIEW3D_PT_mesh_focus_local_feature_brush(bpy.types.Panel):
         layout.label(text="LMB applies; Shift+LMB is native Smooth")
 
 
+class VIEW3D_PT_mesh_focus_guided_ridge(bpy.types.Panel):
+    """Compact Sculpt entry for the Guided Ridge modal."""
+
+    bl_idname = "VIEW3D_PT_mesh_focus_guided_ridge"
+    bl_label = "Guided Ridge"
+    bl_category = TOPOLOGY_COLOR_PANEL_CATEGORY
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+
+    @classmethod
+    def poll(cls, context):
+        obj = getattr(context, "active_object", None)
+        return bool(
+            getattr(context, "mode", None) == "SCULPT"
+            and obj is not None
+            and obj.type == "MESH"
+            and _guided_ridge_face_set_attribute(obj) is not None
+        )
+
+    def draw(self, context):
+        layout = self.layout
+        layout.label(text="Guided Ridge: Ctrl + G")
+        layout.label(text="LMB: 点追加 / Enter: 適用 / Esc: 取消")
+
+
 def _remove_keymaps():
     for keymap, keymap_item in _addon_keymaps:
         try:
@@ -23703,6 +25850,7 @@ def _remove_keymaps():
             LOCAL_FACE_SET_GROW_OPERATOR_ID,
             TUBE_SHAPE_OPERATOR_ID,
             LOCAL_FEATURE_BRUSH_OPERATOR_ID,
+            GUIDED_RIDGE_OPERATOR_ID,
             TOPOLOGY_COLOR_ASSIGN_OPERATOR_ID,
             "view3d.mesh_focus_shadow_analysis_toggle",
         }
@@ -23816,6 +25964,19 @@ def _rebuild_keymaps():
         )
         local_feature_item.active = True
         _addon_keymaps.append((sculpt_keymap, local_feature_item))
+
+        guided_ridge_item = sculpt_keymap.keymap_items.new(
+            GUIDED_RIDGE_OPERATOR_ID,
+            GUIDED_RIDGE_KEY,
+            "PRESS",
+            any=False,
+            shift=False,
+            ctrl=True,
+            alt=False,
+            head=True,
+        )
+        guided_ridge_item.active = True
+        _addon_keymaps.append((sculpt_keymap, guided_ridge_item))
 
         for color_index, key in enumerate(
             ("ONE", "TWO", "THREE", "FOUR", "FIVE", "SIX", "ZERO"),
@@ -23961,6 +26122,7 @@ CLASSES = (
     VIEW3D_OT_mesh_focus_orbit_watcher,
     VIEW3D_OT_mesh_focus_face_set_activate,
     VIEW3D_OT_mesh_focus_orbit,
+    VIEW3D_OT_mesh_focus_guided_ridge,
     VIEW3D_OT_mesh_focus_shadow_analysis_toggle,
     VIEW3D_OT_mesh_focus_local_face_set_grow,
     VIEW3D_OT_mesh_focus_tube_shape,
@@ -23968,6 +26130,7 @@ CLASSES = (
     VIEW3D_OT_mesh_focus_local_feature_brush_stroke,
     VIEW3D_OT_mesh_focus_topology_color_assign,
     VIEW3D_PT_mesh_focus_local_feature_brush,
+    VIEW3D_PT_mesh_focus_guided_ridge,
     VIEW3D_PT_mesh_focus_topology_colors,
     MESH_FOCUS_ORBIT_AddonPreferences,
 )
@@ -24000,6 +26163,8 @@ def register():
         bpy.app.handlers.load_post.append(_on_load_post)
     if _on_undo_post not in bpy.app.handlers.undo_post:
         bpy.app.handlers.undo_post.append(_on_undo_post)
+    if _on_fill_preview_redo_post not in bpy.app.handlers.redo_post:
+        bpy.app.handlers.redo_post.append(_on_fill_preview_redo_post)
     if _on_topology_color_depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(
             _on_topology_color_depsgraph_update
@@ -24014,6 +26179,12 @@ def register():
         bpy.app.handlers.load_post.append(_on_topology_color_load_post)
     if _on_fill_preview_depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(_on_fill_preview_depsgraph_update)
+    if _on_guided_ridge_depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(_on_guided_ridge_depsgraph_update)
+    if _on_guided_ridge_load_pre not in bpy.app.handlers.load_pre:
+        bpy.app.handlers.load_pre.append(_on_guided_ridge_load_pre)
+    if _on_guided_ridge_load_post not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_on_guided_ridge_load_post)
     if _on_tube_preview_depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(_on_tube_preview_depsgraph_update)
     if _on_local_feature_brush_depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
@@ -24030,11 +26201,15 @@ def register():
 
 
 def unregister():
-    global _is_registered
+    global _is_registered, _guided_ridge_last_guide
+    global _fill_preview_self_face_set_update_token
+    _fill_preview_self_face_set_update_token = None
+    _guided_ridge_last_guide = None
     _fill_preview_restore_manual_analysis_profiles()
     if not _is_registered:
         _fill_preview_cancel(reason="unregister")
         _tube_preview_cancel(reason="unregister")
+        _guided_ridge_cancel(reason="unregister")
         _local_feature_cancel_all("unregister", restore=True)
         _cancel_undo_orphan_cleanup()
         _retopo_undo_tombstones.clear()
@@ -24042,6 +26217,8 @@ def unregister():
         _retopo_debug_retired_sessions.clear()
         if _on_undo_post in bpy.app.handlers.undo_post:
             bpy.app.handlers.undo_post.remove(_on_undo_post)
+        if _on_fill_preview_redo_post in bpy.app.handlers.redo_post:
+            bpy.app.handlers.redo_post.remove(_on_fill_preview_redo_post)
         for _handler_list_name, _handler in (
             ("depsgraph_update_post", _on_topology_color_depsgraph_update),
             ("undo_post", _on_topology_color_undo_post),
@@ -24056,6 +26233,12 @@ def unregister():
             bpy.app.handlers.depsgraph_update_post.remove(_on_fill_preview_depsgraph_update)
         if _on_tube_preview_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
             bpy.app.handlers.depsgraph_update_post.remove(_on_tube_preview_depsgraph_update)
+        if _on_guided_ridge_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
+            bpy.app.handlers.depsgraph_update_post.remove(_on_guided_ridge_depsgraph_update)
+        if _on_guided_ridge_load_pre in bpy.app.handlers.load_pre:
+            bpy.app.handlers.load_pre.remove(_on_guided_ridge_load_pre)
+        if _on_guided_ridge_load_post in bpy.app.handlers.load_post:
+            bpy.app.handlers.load_post.remove(_on_guided_ridge_load_post)
         for _handler_list_name, _handler in (
             ("depsgraph_update_post", _on_local_feature_brush_depsgraph_update),
             ("undo_post", _on_local_feature_brush_undo_post),
@@ -24072,6 +26255,7 @@ def unregister():
     _finish_all_states()
     _fill_preview_cancel(reason="unregister")
     _tube_preview_cancel(reason="unregister")
+    _guided_ridge_cancel(reason="unregister")
     _local_feature_cancel_all("unregister", restore=True)
     _cancel_undo_orphan_cleanup()
     _cleanup_orphan_face_set_proxies()
@@ -24085,6 +26269,8 @@ def unregister():
         bpy.app.handlers.load_post.remove(_on_load_post)
     if _on_undo_post in bpy.app.handlers.undo_post:
         bpy.app.handlers.undo_post.remove(_on_undo_post)
+    if _on_fill_preview_redo_post in bpy.app.handlers.redo_post:
+        bpy.app.handlers.redo_post.remove(_on_fill_preview_redo_post)
     for _handler_list_name, _handler in (
         ("depsgraph_update_post", _on_topology_color_depsgraph_update),
         ("undo_post", _on_topology_color_undo_post),
@@ -24099,6 +26285,12 @@ def unregister():
         bpy.app.handlers.depsgraph_update_post.remove(_on_fill_preview_depsgraph_update)
     if _on_tube_preview_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(_on_tube_preview_depsgraph_update)
+    if _on_guided_ridge_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(_on_guided_ridge_depsgraph_update)
+    if _on_guided_ridge_load_pre in bpy.app.handlers.load_pre:
+        bpy.app.handlers.load_pre.remove(_on_guided_ridge_load_pre)
+    if _on_guided_ridge_load_post in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_on_guided_ridge_load_post)
     for _handler_list_name, _handler in (
         ("depsgraph_update_post", _on_local_feature_brush_depsgraph_update),
         ("undo_post", _on_local_feature_brush_undo_post),
