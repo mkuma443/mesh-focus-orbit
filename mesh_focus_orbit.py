@@ -9,7 +9,7 @@ rotating the view.
 bl_info = {
     "name": "Mesh Focus Orbit",
     "author": "OpenAI",
-    "version": (3, 3, 13),
+    "version": (3, 3, 34),
     "blender": (5, 2, 0),
     "location": "3D View",
     "description": "Mesh-centered orbit, Face Set tools, Smart Fill, and Guided Ridge",
@@ -54,9 +54,16 @@ LOCAL_FEATURE_BRUSH_OPERATOR_ID = "view3d.mesh_focus_local_feature_brush"
 LOCAL_FEATURE_BRUSH_KEY = "F"
 GUIDED_RIDGE_OPERATOR_ID = "view3d.mesh_focus_guided_ridge"
 GUIDED_RIDGE_KEY = "G"
+TOOL_NORMAL_OPERATOR_ID = "view3d.mesh_focus_orbit_tool"
+TOOL_FACE_SET_OPERATOR_ID = "view3d.mesh_focus_face_set_tool"
 GUIDED_RIDGE_MAX_CONTROLS = 64
 GUIDED_RIDGE_MAX_CANDIDATE_FACES = 50000
 GUIDED_RIDGE_DISTANCE_MAX_PAIRS = 262144
+GUIDED_RIDGE_PREPARE_WORK_CHUNK = 256
+# Phase 1 deliberately exposes only the non-destructive guide/rail UI.  Keep
+# this switch beside the Guided Ridge contract so the future deformation
+# engine can be reconnected in one explicit, reviewable place.
+GUIDED_RIDGE_UI_PROTOTYPE = False
 # The local-feature implementation is selected as a normal Sculpt Brush
 # asset.  The marker is an ID property saved with the dedicated asset; its
 # name and datablock pointer are deliberately not part of the identity.
@@ -105,6 +112,12 @@ _tube_preview_text_draw_handler = None
 _tube_preview_shader = None
 _guided_ridge_state = None
 _guided_ridge_last_guide = None
+GUIDED_RIDGE_WIDTH_EDGE_MULTIPLIER = 8.0
+GUIDED_RIDGE_WIDTH_MIN_EDGE_MULTIPLIER = 4.0
+GUIDED_RIDGE_WIDTH_MAX_EXTENT_FRACTION = 0.45
+GUIDED_RIDGE_WIDTH_STEP_FACTOR = 1.18
+GUIDED_RIDGE_WIDTH_GUIDE_BAND_FRACTION = 0.08
+GUIDED_RIDGE_WIDTH_ANCHOR_BAND_FRACTION = 0.14
 _local_feature_brush_states = {}
 _local_feature_brush_cache = {}
 _local_feature_brush_load_guard = False
@@ -2639,9 +2652,30 @@ def _world_ray_from_view_center(context):
     rv3d = context.space_data.region_3d
     center_2d = Vector((region.width * 0.5, region.height * 0.5))
 
+    return _world_ray_from_region_coordinate(context, center_2d)
+
+
+def _world_ray_from_region_coordinate(context, coordinate):
+    """Return a world ray for one owning WINDOW-region coordinate.
+
+    Tool activation must use the actual click location.  Keeping this helper
+    separate from the center-ray wrapper makes it difficult for a toolbar
+    event to accidentally regress to the old viewport-center behaviour.
+    """
+    region = getattr(context, "region", None)
+    space_data = getattr(context, "space_data", None)
+    rv3d = getattr(space_data, "region_3d", None)
+    if region is None or rv3d is None:
+        return None
+
     try:
-        origin = view3d_utils.region_2d_to_origin_3d(region, rv3d, center_2d)
-        direction = view3d_utils.region_2d_to_vector_3d(region, rv3d, center_2d)
+        coordinate = Vector(coordinate)
+        if not (0.0 <= float(coordinate.x) < float(region.width)):
+            return None
+        if not (0.0 <= float(coordinate.y) < float(region.height)):
+            return None
+        origin = view3d_utils.region_2d_to_origin_3d(region, rv3d, coordinate)
+        direction = view3d_utils.region_2d_to_vector_3d(region, rv3d, coordinate)
     except (AttributeError, RuntimeError, TypeError, ValueError):
         return None
 
@@ -2905,9 +2939,8 @@ def _raycast_edit_object(obj, origin, direction):
     return None
 
 
-def _find_center_hit(context):
-    """Find the nearest visible mesh surface under the viewport center."""
-    ray = _world_ray_from_view_center(context)
+def _find_mesh_hit(context, ray):
+    """Find the nearest visible mesh surface along an already chosen ray."""
     if ray is None:
         return None
     origin, direction = ray
@@ -2939,8 +2972,21 @@ def _find_center_hit(context):
     return best
 
 
-def _raycast_reference_face_set(context):
-    """Return the center hit and Face Set ID from the configured reference."""
+def _find_center_hit(context):
+    """Find the nearest visible mesh surface under the viewport center."""
+    return _find_mesh_hit(context, _world_ray_from_view_center(context))
+
+
+def _find_mesh_hit_at_coordinate(context, coordinate):
+    """Find the nearest visible mesh surface under *coordinate*."""
+    return _find_mesh_hit(
+        context,
+        _world_ray_from_region_coordinate(context, coordinate),
+    )
+
+
+def _raycast_reference_face_set_at_coordinate(context, coordinate):
+    """Return the configured Reference Face Set hit at *coordinate*."""
     obj = _get_reference_object(context)
     if obj is None:
         return None
@@ -2949,7 +2995,7 @@ def _raycast_reference_face_set(context):
     if face_set_attr is None or face_set_attr.domain != "FACE":
         return None
 
-    ray = _world_ray_from_view_center(context)
+    ray = _world_ray_from_region_coordinate(context, coordinate)
     if ray is None:
         return None
     origin, direction = ray
@@ -2980,6 +3026,17 @@ def _raycast_reference_face_set(context):
         )
     except (AttributeError, RuntimeError, TypeError, ValueError):
         return None
+
+
+def _raycast_reference_face_set(context):
+    """Return the center hit and Face Set ID from the configured reference."""
+    region = getattr(context, "region", None)
+    if region is None:
+        return None
+    return _raycast_reference_face_set_at_coordinate(
+        context,
+        Vector((float(region.width) * 0.5, float(region.height) * 0.5)),
+    )
 
 
 def _set_object_hidden(obj, hidden):
@@ -6786,6 +6843,164 @@ def _start_session(context, state, face_set=False):
         return False
 
 
+def _tool_event_coordinate(context, event):
+    """Resolve a WorkSpaceTool click without ever substituting the center."""
+    # This helper is intentionally shared with the Sculpt click operators.  It
+    # prefers absolute mouse coordinates and rejects sibling regions, which
+    # prevents a toolbar/sidebar click from being interpreted as a viewport
+    # target.
+    return _sculpt_cursor_region_coordinate(context, event)
+
+
+def _start_normal_tool_session(context, coordinate):
+    """Start or stop normal MFO using one explicit region coordinate."""
+    try:
+        area_key = context.area.as_pointer()
+    except (AttributeError, ReferenceError, RuntimeError, TypeError):
+        return False
+    existing = _active_states.get(area_key)
+    if existing is not None and existing.active:
+        if not isinstance(existing, _FaceSetOrbitState):
+            _deactivate_state(existing)
+            return True
+        return False
+    if area_key in _session_cleanup_areas:
+        return False
+
+    _cleanup_orphan_face_set_proxies()
+    hit = _find_mesh_hit_at_coordinate(context, coordinate)
+    if hit is None:
+        return False
+    prefs = _addon_preferences()
+    activation_key = prefs.activation_key if prefs else "RIGHT_SHIFT"
+    state = _TempOrbitState(context, hit[0], hit[1], activation_key)
+    return bool(_start_session(context, state, face_set=False))
+
+
+def _activate_face_set_session(context, coordinate=None):
+    """Start Face Set MFO, optionally using an explicit region coordinate.
+
+    The click tool deliberately calls the public Activation operator below so
+    Blender creates the same single ``UNDO`` boundary as the legacy
+    double-tap/Ctrl path.  This helper owns only the coordinate-aware ON path;
+    OFF remains the existing direct runtime teardown in ``execute``.
+    """
+    try:
+        area_key = context.area.as_pointer()
+    except (AttributeError, ReferenceError, RuntimeError, TypeError):
+        return False
+    if area_key in _session_cleanup_areas:
+        return False
+
+    hit = (
+        _raycast_reference_face_set(context)
+        if coordinate is None
+        else _raycast_reference_face_set_at_coordinate(context, coordinate)
+    )
+    if hit is None:
+        return False
+    reference_object, _face_index, face_set_id, hit_location, hit_distance = hit
+    prefs = _addon_preferences()
+    activation_key = prefs.activation_key if prefs else "RIGHT_SHIFT"
+    state = _FaceSetOrbitState(
+        context,
+        hit_location,
+        hit_distance,
+        activation_key,
+        reference_object,
+        face_set_id,
+    )
+    return bool(_start_session(context, state, face_set=True))
+
+
+class VIEW3D_OT_mesh_focus_orbit_tool(bpy.types.Operator):
+    """Single-click entry point used by the resident Normal MFO tool."""
+
+    bl_idname = TOOL_NORMAL_OPERATOR_ID
+    bl_label = "Mesh Focus Orbit (Click)"
+    bl_description = "Focus the orbit target on the mesh surface under the click"
+    bl_options = {"INTERNAL"}
+
+    @classmethod
+    def poll(cls, context):
+        return (
+            context.area is not None
+            and context.area.type == "VIEW_3D"
+            and context.region is not None
+            and context.region.type == "WINDOW"
+            and context.space_data is not None
+            and context.mode in {"OBJECT", "EDIT_MESH", "SCULPT"}
+        )
+
+    def invoke(self, context, event):
+        if not self.poll(context):
+            return {"CANCELLED"}
+        coordinate = _tool_event_coordinate(context, event)
+        if coordinate is None:
+            self.report({"WARNING"}, "MFO: click is outside the 3D View region")
+            return {"CANCELLED"}
+        if not _start_normal_tool_session(context, coordinate):
+            self.report({"WARNING"}, "MFO: no visible mesh surface under click")
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class VIEW3D_OT_mesh_focus_face_set_tool(bpy.types.Operator):
+    """Single-click strict/Face Set entry point used by the MFO tool."""
+
+    bl_idname = TOOL_FACE_SET_OPERATOR_ID
+    bl_label = "Mesh Focus Orbit (Strict Face Set)"
+    bl_description = "Focus the configured Reference Object Face Set under the click"
+    bl_options = {"INTERNAL"}
+
+    @classmethod
+    def poll(cls, context):
+        return (
+            context.area is not None
+            and context.area.type == "VIEW_3D"
+            and context.region is not None
+            and context.region.type == "WINDOW"
+            and context.space_data is not None
+            and context.mode in {"OBJECT", "EDIT_MESH"}
+        )
+
+    def invoke(self, context, event):
+        if not self.poll(context):
+            return {"CANCELLED"}
+        coordinate = _tool_event_coordinate(context, event)
+        if coordinate is None:
+            self.report({"WARNING"}, "FSMFO: click is outside the 3D View region")
+            return {"CANCELLED"}
+
+        # OFF is a runtime-only teardown and must not create a second Undo
+        # step.  ON is routed through the existing Activation operator below,
+        # whose UNDO flag is the established Face Set contract.
+        try:
+            area_key = context.area.as_pointer()
+        except (AttributeError, ReferenceError, RuntimeError, TypeError):
+            return {"CANCELLED"}
+        existing = _active_states.get(area_key)
+        if existing is not None and existing.active:
+            if isinstance(existing, _FaceSetOrbitState):
+                _deactivate_state(existing)
+                return {"FINISHED"}
+            return {"CANCELLED"}
+
+        result = bpy.ops.view3d.mesh_focus_face_set_activate(
+            "EXEC_DEFAULT",
+            True,
+            mouse_region_x=int(round(coordinate.x)),
+            mouse_region_y=int(round(coordinate.y)),
+            use_click_coordinate=True,
+        )
+        if "FINISHED" not in result:
+            self.report(
+                {"WARNING"},
+                "FSMFO: configured Reference Object has no visible Face Set under click",
+            )
+        return result
+
+
 class VIEW3D_OT_mesh_focus_orbit_recover_face_set_state(bpy.types.Operator):
     """Emergency recovery for an orphaned Face Set MFO scene state."""
 
@@ -6908,6 +7123,13 @@ class VIEW3D_OT_mesh_focus_face_set_activate(bpy.types.Operator):
     bl_label = "Mesh Focus Orbit: Face Set Activation"
     bl_options = {"INTERNAL", "UNDO"}
 
+    # These transient fields are populated only by the resident T-tool.  The
+    # legacy key/double-tap path leaves them at their defaults and therefore
+    # continues to use the viewport-center raycast.
+    mouse_region_x: IntProperty(options={"SKIP_SAVE"}, default=0)
+    mouse_region_y: IntProperty(options={"SKIP_SAVE"}, default=0)
+    use_click_coordinate: BoolProperty(options={"SKIP_SAVE"}, default=False)
+
     @classmethod
     def poll(cls, context):
         return (
@@ -6970,21 +7192,10 @@ class VIEW3D_OT_mesh_focus_face_set_activate(bpy.types.Operator):
                 return {"CANCELLED"}
             return {"CANCELLED"}
 
-        hit = _raycast_reference_face_set(context)
-        if hit is None:
-            return {"CANCELLED"}
-        reference_object, _face_index, face_set_id, hit_location, hit_distance = hit
-        prefs = _addon_preferences()
-        activation_key = prefs.activation_key if prefs else "RIGHT_SHIFT"
-        state = _FaceSetOrbitState(
-            context,
-            hit_location,
-            hit_distance,
-            activation_key,
-            reference_object,
-            face_set_id,
-        )
-        if not _start_session(context, state, face_set=True):
+        coordinate = None
+        if bool(self.use_click_coordinate):
+            coordinate = Vector((float(self.mouse_region_x), float(self.mouse_region_y)))
+        if not _activate_face_set_session(context, coordinate=coordinate):
             return {"CANCELLED"}
         # This operator must end here.  Only the Watcher remains modal.
         return {"FINISHED"}
@@ -7504,8 +7715,13 @@ def _guided_ridge_context_matches(context, state):
     return all(current.get(key) == expected.get(key) for key in stable_keys)
 
 
-def _guided_ridge_prepare_snapshot(obj, seed_face, seed_face_set):
-    """Capture one connected visible Face Set component and a world BVH."""
+def _guided_ridge_prepare_snapshot_sync(obj, seed_face, seed_face_set):
+    """Synchronous reference implementation used by repeat/diagnostics.
+
+    Guided Ridge entry uses the cooperative implementation below.  Keeping
+    this exact implementation available makes it possible to compare the
+    incremental snapshot byte-for-byte before changing the production path.
+    """
     import numpy as np
     safety_reason = _guided_ridge_safety_reason(obj)
     if safety_reason is not None:
@@ -7670,6 +7886,312 @@ def _guided_ridge_prepare_snapshot(obj, seed_face, seed_face_set):
         return None, "could not prepare the Face Set component"
 
 
+def _guided_ridge_prepare_progress(stage, stage_index, done=None, total=None, indeterminate=False):
+    """Return a small, UI-safe progress token for cooperative preparation."""
+    return {
+        "stage": str(stage),
+        "stage_index": int(stage_index),
+        "stage_count": 13,
+        "done": int(done or 0),
+        "total": int(total or 0),
+        "indeterminate": bool(indeterminate or not total),
+    }
+
+
+def _guided_ridge_prepare_snapshot_steps(obj, seed_face, seed_face_set):
+    """Capture one component while yielding bounded UI-event-loop slices.
+
+    The operations and ordering intentionally mirror
+    ``_guided_ridge_prepare_snapshot_sync``.  This generator only inserts
+    cooperative yields; it does not alter component selection, protection,
+    BVH input, signatures, or snapshot values.
+    """
+    import numpy as np
+
+    safety_reason = _guided_ridge_safety_reason(obj)
+    if safety_reason is not None:
+        return None, safety_reason
+    attr = _guided_ridge_face_set_attribute(obj)
+    if attr is None:
+        return None, "active mesh has no .sculpt_face_set attribute"
+    mesh = obj.data
+    try:
+        yield _guided_ridge_prepare_progress("reading Face Set data", 1, indeterminate=True)
+        ids = np.empty(len(attr.data), dtype=np.int32)
+        attr.data.foreach_get("value", ids)
+        yield _guided_ridge_prepare_progress("reading hidden-face data", 1, indeterminate=True)
+        hidden_faces = np.zeros(len(mesh.polygons), dtype=bool)
+        mesh.polygons.foreach_get("hide", hidden_faces)
+        yield _guided_ridge_prepare_progress("reading hidden-vertex data", 1, indeterminate=True)
+        hidden_vertices = np.zeros(len(mesh.vertices), dtype=bool)
+        mesh.vertices.foreach_get("hide", hidden_vertices)
+        sculpt_mask = np.zeros(len(mesh.vertices), dtype=np.float64)
+        mask_attr = mesh.attributes.get(".sculpt_mask")
+        if mask_attr is not None and mask_attr.domain == "POINT" and len(mask_attr.data) == len(sculpt_mask):
+            yield _guided_ridge_prepare_progress("reading sculpt mask", 1, indeterminate=True)
+            mask_attr.data.foreach_get("value", sculpt_mask)
+        sculpt_mask = np.clip(sculpt_mask, 0.0, 1.0)
+        if seed_face < 0 or seed_face >= len(ids) or int(ids[seed_face]) != int(seed_face_set):
+            return None, "ray hit is outside the active Face Set"
+        candidates = np.flatnonzero((ids == int(seed_face_set)) & ~hidden_faces)
+        if len(candidates) > GUIDED_RIDGE_MAX_CANDIDATE_FACES:
+            return None, "Face Set candidate exceeds 50,000 faces"
+
+        edge_faces = {}
+        face_vertices = {}
+        candidate_total = len(candidates)
+        yield _guided_ridge_prepare_progress("building Face Set edge graph", 2, 0, candidate_total)
+        for position, face_index in enumerate(candidates):
+            vertices = tuple(int(v) for v in mesh.polygons[int(face_index)].vertices)
+            if len(vertices) >= 3:
+                face_vertices[int(face_index)] = vertices
+                for offset, first in enumerate(vertices):
+                    second = vertices[(offset + 1) % len(vertices)]
+                    edge = (min(first, second), max(first, second))
+                    edge_faces.setdefault(edge, []).append(int(face_index))
+            if (position & 255) == 255 or position + 1 == candidate_total:
+                yield _guided_ridge_prepare_progress(
+                    "building Face Set edge graph", 2, position + 1, candidate_total
+                )
+        if int(seed_face) not in face_vertices:
+            return None, "ray hit face is hidden or degenerate"
+
+        component = {int(seed_face)}
+        pending = [int(seed_face)]
+        component_total = max(len(candidates), 1)
+        component_pop_count = 0
+        yield _guided_ridge_prepare_progress("finding connected component", 3, 1, component_total)
+        while pending:
+            current = pending.pop()
+            component_pop_count += 1
+            for offset, first in enumerate(face_vertices[current]):
+                second = face_vertices[current][(offset + 1) % len(face_vertices[current])]
+                for other in edge_faces.get((min(first, second), max(first, second)), ()):
+                    if other not in component:
+                        component.add(other)
+                        pending.append(other)
+                        if len(component) > GUIDED_RIDGE_MAX_CANDIDATE_FACES:
+                            return None, "Face Set component exceeds 50,000 faces"
+            if component_pop_count % GUIDED_RIDGE_PREPARE_WORK_CHUNK == 0 or not pending:
+                yield _guided_ridge_prepare_progress(
+                    "finding connected component", 3, component_pop_count, component_total
+                )
+        face_indices = sorted(component)
+        vertex_indices = sorted({v for face in face_indices for v in face_vertices[face]})
+        component_face_set = set(face_indices)
+        component_vertex_set = set(vertex_indices)
+
+        # Preserve the original safety rule: every mesh polygon is checked for
+        # a vertex shared with the captured component, including hidden faces.
+        externally_shared_vertices = set()
+        polygon_total = len(mesh.polygons)
+        yield _guided_ridge_prepare_progress(
+            "checking externally shared vertices", 4, 0, polygon_total
+        )
+        for outside_face_index, polygon in enumerate(mesh.polygons):
+            if int(outside_face_index) not in component_face_set:
+                for vertex in polygon.vertices:
+                    vertex = int(vertex)
+                    if vertex in component_vertex_set:
+                        externally_shared_vertices.add(vertex)
+            if outside_face_index % 4096 == 4095 or outside_face_index + 1 == polygon_total:
+                yield _guided_ridge_prepare_progress(
+                    "checking externally shared vertices", 4, outside_face_index + 1, polygon_total
+                )
+        protected_vertices = sorted(externally_shared_vertices)
+        local_index = {global_index: index for index, global_index in enumerate(vertex_indices)}
+
+        yield _guided_ridge_prepare_progress("capturing component coordinates", 5, 0, len(vertex_indices))
+        coords_local_values = []
+        for position, index in enumerate(vertex_indices):
+            coords_local_values.append(mesh.vertices[index].co[:])
+            if (position & 255) == 255 or position + 1 == len(vertex_indices):
+                yield _guided_ridge_prepare_progress(
+                    "capturing component coordinates", 5, position + 1, len(vertex_indices)
+                )
+        coords_local = np.asarray(coords_local_values, dtype=np.float64)
+        world_matrix = obj.matrix_world.copy()
+        coords_world_values = []
+        for position, co in enumerate(coords_local):
+            coords_world_values.append(world_matrix @ Vector(co))
+            if (position & 255) == 255 or position + 1 == len(coords_local):
+                yield _guided_ridge_prepare_progress(
+                    "transforming component coordinates", 5, position + 1, len(coords_local)
+                )
+        coords_world = np.asarray(coords_world_values, dtype=np.float64)
+
+        triangles = []
+        triangle_face_indices = []
+        yield _guided_ridge_prepare_progress("triangulating component", 5, 0, len(face_indices))
+        for position, face_index in enumerate(face_indices):
+            polygon = face_vertices[face_index]
+            for offset in range(1, len(polygon) - 1):
+                triangles.append((local_index[polygon[0]], local_index[polygon[offset]], local_index[polygon[offset + 1]]))
+                triangle_face_indices.append(int(face_index))
+            if (position & 255) == 255 or position + 1 == len(face_indices):
+                yield _guided_ridge_prepare_progress(
+                    "triangulating component", 5, position + 1, len(face_indices)
+                )
+        if not triangles:
+            return None, "Face Set component has no triangles"
+
+        edge_counts = {}
+        yield _guided_ridge_prepare_progress("building component boundaries", 6, 0, len(face_indices))
+        for position, polygon in enumerate(face_vertices[index] for index in face_indices):
+            for offset, first in enumerate(polygon):
+                second = polygon[(offset + 1) % len(polygon)]
+                edge = (min(first, second), max(first, second))
+                edge_counts[edge] = edge_counts.get(edge, 0) + 1
+            if (position & 255) == 255 or position + 1 == len(face_indices):
+                yield _guided_ridge_prepare_progress(
+                    "building component boundaries", 6, position + 1, len(face_indices)
+                )
+        boundary_vertex_set = set(protected_vertices)
+        for position, (edge, count) in enumerate(edge_counts.items()):
+            if count == 1:
+                boundary_vertex_set.update(edge)
+            if (position & 255) == 255 or position + 1 == len(edge_counts):
+                yield _guided_ridge_prepare_progress(
+                    "building component boundaries", 6, position + 1, len(edge_counts)
+                )
+        boundary_vertices = sorted(boundary_vertex_set)
+        boundary_edges = []
+        for position, ((first, second), count) in enumerate(edge_counts.items()):
+            if count == 1 and first in local_index and second in local_index:
+                boundary_edges.append((local_index[first], local_index[second]))
+            if (position & 255) == 255 or position + 1 == len(edge_counts):
+                yield _guided_ridge_prepare_progress(
+                    "building component boundaries", 6, position + 1, len(edge_counts)
+                )
+
+        adjacency = [[] for _ in vertex_indices]
+        yield _guided_ridge_prepare_progress("building surface adjacency", 7, 0, len(triangles))
+        for position, (first, second, third) in enumerate(triangles):
+            adjacency[first].extend((second, third))
+            adjacency[second].extend((first, third))
+            adjacency[third].extend((first, second))
+            if (position & 255) == 255 or position + 1 == len(triangles):
+                yield _guided_ridge_prepare_progress(
+                    "building surface adjacency", 7, position + 1, len(triangles)
+                )
+        adjacency_result = []
+        for position, neighbors in enumerate(adjacency):
+            adjacency_result.append(tuple(sorted(set(neighbors))))
+            if (position & 255) == 255 or position + 1 == len(adjacency):
+                yield _guided_ridge_prepare_progress(
+                    "deduplicating surface adjacency", 7, position + 1, len(adjacency)
+                )
+        adjacency = adjacency_result
+
+        # BVH construction is one Blender C call and cannot be interrupted.
+        yield _guided_ridge_prepare_progress("building surface BVH", 8, indeterminate=True)
+        try:
+            bvh = BVHTree.FromPolygons(coords_world.tolist(), triangles, all_triangles=True)
+        except TypeError:
+            bvh = BVHTree.FromPolygons(coords_world.tolist(), triangles)
+
+        edge_lengths = []
+        yield _guided_ridge_prepare_progress("measuring component edges", 9, 0, len(edge_counts))
+        for position, (first, second) in enumerate(edge_counts):
+            if first in local_index and second in local_index:
+                edge_lengths.append(float(np.linalg.norm(coords_world[local_index[first]] - coords_world[local_index[second]])))
+            if (position & 255) == 255 or position + 1 == len(edge_counts):
+                yield _guided_ridge_prepare_progress(
+                    "measuring component edges", 9, position + 1, len(edge_counts)
+                )
+
+        normal_matrix = world_matrix.inverted_safe().transposed().to_3x3()
+        normals_world_values = []
+        yield _guided_ridge_prepare_progress("capturing vertex normals", 10, 0, len(vertex_indices))
+        for position, index in enumerate(vertex_indices):
+            normals_world_values.append(tuple((normal_matrix @ mesh.vertices[index].normal).normalized()))
+            if (position & 255) == 255 or position + 1 == len(vertex_indices):
+                yield _guided_ridge_prepare_progress(
+                    "capturing vertex normals", 10, position + 1, len(vertex_indices)
+                )
+        normals_world = np.asarray(normals_world_values, dtype=np.float64)
+
+        yield _guided_ridge_prepare_progress("building component signature", 11, indeterminate=True)
+        face_indices_tuple = tuple(face_indices)
+        face_vertices_tuple = tuple(tuple(face_vertices[index]) for index in face_indices)
+        face_set_hash = _guided_ridge_hash_array(ids[face_indices])
+        yield _guided_ridge_prepare_progress("building component signature", 11, 1, 7)
+        hidden_faces_hash = _guided_ridge_hash_array(hidden_faces[face_indices])
+        yield _guided_ridge_prepare_progress("building component signature", 11, 2, 7)
+        hidden_vertices_hash = _guided_ridge_hash_array(hidden_vertices[vertex_indices])
+        yield _guided_ridge_prepare_progress("building component signature", 11, 3, 7)
+        sculpt_mask_hash = _guided_ridge_hash_array(sculpt_mask[vertex_indices])
+        yield _guided_ridge_prepare_progress("building component signature", 11, 4, 7)
+        protected_vertices_hash = _guided_ridge_hash_array(np.asarray(protected_vertices, dtype=np.int64))
+        yield _guided_ridge_prepare_progress("building component signature", 11, 5, 7)
+        coordinate_hash = _guided_ridge_hash_array(coords_local)
+        yield _guided_ridge_prepare_progress("building component signature", 11, 6, 7)
+        topology_job = _guided_ridge_component_topology_signature_steps(
+            face_indices, [face_vertices[index] for index in face_indices]
+        )
+        while True:
+            try:
+                progress = next(topology_job)
+            except StopIteration as complete:
+                topology_signature = complete.value
+                break
+            yield progress
+        yield _guided_ridge_prepare_progress("building component signature", 11, 7, 7)
+        signature = {
+            "object_pointer": int(obj.as_pointer()),
+            "mesh_pointer": int(mesh.as_pointer()),
+            "counts": (len(mesh.vertices), len(mesh.edges), len(mesh.polygons), len(mesh.loops)),
+            "face_indices": face_indices_tuple,
+            "face_vertices": face_vertices_tuple,
+            "face_set_hash": face_set_hash,
+            "hidden_faces_hash": hidden_faces_hash,
+            "hidden_vertices_hash": hidden_vertices_hash,
+            "sculpt_mask_hash": sculpt_mask_hash,
+            "protected_vertices_hash": protected_vertices_hash,
+            "coordinate_hash": coordinate_hash,
+            "matrix_world": _guided_ridge_matrix_signature(world_matrix),
+            "component_topology_signature": topology_signature,
+        }
+        yield _guided_ridge_prepare_progress("finalizing snapshot", 12, indeterminate=True)
+        snapshot = {
+            "object_pointer": signature["object_pointer"],
+            "mesh_pointer": signature["mesh_pointer"],
+            "counts": signature["counts"],
+            "face_set_id": int(seed_face_set),
+            "face_indices": face_indices,
+            "face_vertices": [face_vertices[index] for index in face_indices],
+            "vertex_indices": vertex_indices,
+            "triangles": triangles,
+            "triangle_face_indices": triangle_face_indices,
+            "boundary_vertices": boundary_vertices,
+            "protected_vertices": protected_vertices,
+            "boundary_edges": boundary_edges,
+            "adjacency": adjacency,
+            "coords_local": coords_local,
+            "coords_world": coords_world,
+            "normals_world": normals_world,
+            "hidden_vertices": np.array(hidden_vertices[vertex_indices], dtype=bool, copy=True),
+            "sculpt_mask": np.array(sculpt_mask[vertex_indices], dtype=np.float64, copy=True),
+            "matrix_world": world_matrix.copy(),
+            "bvh": bvh,
+            "average_edge": float(sum(edge_lengths) / max(len(edge_lengths), 1)),
+            "signature": signature,
+        }
+        return snapshot, None
+    except (AttributeError, IndexError, MemoryError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None, "could not prepare the Face Set component"
+
+
+def _guided_ridge_prepare_snapshot(obj, seed_face, seed_face_set):
+    """Synchronous compatibility wrapper that consumes cooperative slices."""
+    job = _guided_ridge_prepare_snapshot_steps(obj, seed_face, seed_face_set)
+    try:
+        while True:
+            next(job)
+    except StopIteration as complete:
+        return complete.value
+
+
 def _guided_ridge_ray(context, coord):
     origin = view3d_utils.region_2d_to_origin_3d(
         context.region, context.space_data.region_3d, coord
@@ -7685,6 +8207,11 @@ def _guided_ridge_ray(context, coord):
 
 def _guided_ridge_snapshot_hit(context, snapshot, coord):
     ray = _guided_ridge_ray(context, coord)
+    return _guided_ridge_snapshot_hit_ray(snapshot, ray)
+
+
+def _guided_ridge_snapshot_hit_ray(snapshot, ray):
+    """Ray-cast a saved world-space ray without consulting the current view."""
     if ray is None:
         return None
     try:
@@ -7771,26 +8298,39 @@ def _guided_ridge_surface_anchors(snapshot, controls):
     return anchors, None
 
 
-def _guided_ridge_component_topology_signature(face_indices, face_vertices):
-    """Hash only the saved Face Set component's loops and edge membership."""
+def _guided_ridge_component_topology_signature_steps(face_indices, face_vertices):
+    """Yield bounded work while hashing component loops and edge membership."""
     digest = hashlib.sha256()
-    component_faces = tuple(
-        (int(face_index), tuple(int(vertex) for vertex in vertices))
-        for face_index, vertices in zip(face_indices, face_vertices)
-    )
-    for face_index, vertices in component_faces:
+    component_faces = []
+    total = len(face_indices)
+    for position, (face_index, vertices) in enumerate(zip(face_indices, face_vertices)):
+        component_faces.append((int(face_index), tuple(int(vertex) for vertex in vertices)))
+        if (position & 63) == 63 or position + 1 == total:
+            yield _guided_ridge_prepare_progress(
+                "building topology signature", 11, position + 1, total
+            )
+    for position, (face_index, vertices) in enumerate(component_faces):
         digest.update(b"F")
         digest.update(face_index.to_bytes(8, "little", signed=True))
         digest.update(len(vertices).to_bytes(8, "little", signed=False))
         for vertex in vertices:
             digest.update(vertex.to_bytes(8, "little", signed=True))
+        if (position & 63) == 63 or position + 1 == total:
+            yield _guided_ridge_prepare_progress(
+                "hashing topology loops", 11, position + 1, total
+            )
     edge_membership = {}
-    for face_index, vertices in component_faces:
+    for position, (face_index, vertices) in enumerate(component_faces):
         for offset, first in enumerate(vertices):
             second = vertices[(offset + 1) % len(vertices)]
             edge = (min(first, second), max(first, second))
             edge_membership.setdefault(edge, []).append(face_index)
-    for edge in sorted(edge_membership):
+        if (position & 63) == 63 or position + 1 == total:
+            yield _guided_ridge_prepare_progress(
+                "building topology edge membership", 11, position + 1, total
+            )
+    sorted_edges = sorted(edge_membership)
+    for position, edge in enumerate(sorted_edges):
         vertices = tuple(int(vertex) for vertex in edge)
         digest.update(b"E")
         for vertex in vertices:
@@ -7799,7 +8339,21 @@ def _guided_ridge_component_topology_signature(face_indices, face_vertices):
         digest.update(len(members).to_bytes(8, "little", signed=False))
         for face_index in members:
             digest.update(int(face_index).to_bytes(8, "little", signed=True))
+        if (position & 63) == 63 or position + 1 == len(sorted_edges):
+            yield _guided_ridge_prepare_progress(
+                "hashing topology edges", 11, position + 1, len(sorted_edges)
+            )
     return digest.hexdigest()
+
+
+def _guided_ridge_component_topology_signature(face_indices, face_vertices):
+    """Synchronous compatibility wrapper for the cooperative hash."""
+    job = _guided_ridge_component_topology_signature_steps(face_indices, face_vertices)
+    try:
+        while True:
+            next(job)
+    except StopIteration as complete:
+        return complete.value
 
 
 def _guided_ridge_build_last_guide(state, anchors=None):
@@ -7835,6 +8389,7 @@ def _guided_ridge_build_last_guide(state, anchors=None):
         "matrix_world": signature.get("matrix_world"),
         "component_topology_signature": signature.get("component_topology_signature"),
         "anchors": anchors,
+        "half_width": float(state.get("half_width", 0.0) or 0.0),
     }
     return payload, None
 
@@ -8103,7 +8658,18 @@ def _guided_ridge_unit_array(values):
     return values / np.maximum(np.linalg.norm(values, axis=-1, keepdims=True), 1.0e-12)
 
 
-def _guided_ridge_stable_frame(before, faces, guide, controls, control_normals):
+def _guided_ridge_stable_frame_steps(before, faces, guide, controls, control_normals):
+    # Publish the stage before touching the first potentially large array so a
+    # guide edit gets one event-loop turn with visible progress as well as the
+    # initial snapshot preparation.
+    yield {
+        "stage": "building guide frame",
+        "stage_index": 0,
+        "stage_count": 11,
+        "done": 0,
+        "total": 0,
+        "indeterminate": True,
+    }
     import numpy as np
     guide = np.asarray(guide, dtype=np.float64)
     segment = np.diff(guide, axis=0)
@@ -8148,12 +8714,30 @@ def _guided_ridge_stable_frame(before, faces, guide, controls, control_normals):
     base_normal -= np.sum(base_normal * tangent, axis=1, keepdims=True) * tangent
     base_normal = _guided_ridge_unit_array(base_normal)
     base_normal = np.column_stack([_guided_ridge_smooth_array(base_normal[:, axis], 1.4) for axis in range(3)])
-    tri = before[faces]
-    cross = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
     vertex_normals = np.zeros_like(before)
-    np.add.at(vertex_normals, faces[:, 0], cross)
-    np.add.at(vertex_normals, faces[:, 1], cross)
-    np.add.at(vertex_normals, faces[:, 2], cross)
+    yield {
+        "stage": "building guide frame",
+        "stage_index": 0,
+        "stage_count": 11,
+        "done": 0,
+        "total": int(math.ceil(len(faces) / 256.0)),
+    }
+    normal_total = int(math.ceil(len(faces) / 256.0))
+    for normal_index, start in enumerate(range(0, len(faces), 256), 1):
+        stop = min(start + 256, len(faces))
+        tri = before[faces[start:stop]]
+        cross = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+        local_faces = faces[start:stop]
+        np.add.at(vertex_normals, local_faces[:, 0], cross)
+        np.add.at(vertex_normals, local_faces[:, 1], cross)
+        np.add.at(vertex_normals, local_faces[:, 2], cross)
+        yield {
+            "stage": "building guide frame",
+            "stage_index": 0,
+            "stage_count": 11,
+            "done": normal_index,
+            "total": normal_total,
+        }
     vertex_normals = _guided_ridge_unit_array(vertex_normals)
     for index, point in enumerate(guide):
         distances = np.linalg.norm(before - point[None, :], axis=1)
@@ -8162,12 +8746,29 @@ def _guided_ridge_stable_frame(before, faces, guide, controls, control_normals):
         local = np.average(vertex_normals[nearest], axis=0, weights=1.0 / np.maximum(distances[nearest], 1.0e-9))
         if float(np.dot(base_normal[index], local)) < 0.0:
             base_normal[index] *= -1.0
+        yield {
+            "stage": "building guide frame",
+            "stage_index": 0,
+            "stage_count": 11,
+            "done": index + 1,
+            "total": len(guide),
+        }
     base_normal = np.column_stack([_guided_ridge_smooth_array(base_normal[:, axis], 1.8) for axis in range(3)])
     base_normal -= np.sum(base_normal * tangent, axis=1, keepdims=True) * tangent
     normal = _guided_ridge_unit_array(base_normal)
     lateral = _guided_ridge_unit_array(np.cross(tangent, normal))
     normal = _guided_ridge_unit_array(np.cross(lateral, tangent))
     return {"guide": guide, "arc": arc, "tangent": tangent, "normal": normal, "lateral": lateral, "length": float(arc[-1])}
+
+
+def _guided_ridge_stable_frame(before, faces, guide, controls, control_normals):
+    """Synchronous compatibility wrapper around the cooperative frame job."""
+    job = _guided_ridge_stable_frame_steps(before, faces, guide, controls, control_normals)
+    try:
+        while True:
+            next(job)
+    except StopIteration as complete:
+        return complete.value
 
 
 def _guided_ridge_frame_at(frame, station):
@@ -8246,38 +8847,602 @@ def _guided_ridge_bounded_pairwise_chunk_size(primary_count, secondary_count):
     )
 
 
-def _guided_ridge_bounded_boundary_distance(before, boundary_mask):
+def _guided_ridge_boundary_local_data(snapshot, vertex_count):
+    """Convert snapshot-global boundary vertices to component-local indices.
+
+    ``snapshot['triangles']`` and ``boundary_edges`` use component-local
+    indices, while ``boundary_vertices`` is intentionally retained in the
+    mesh-global index space for signatures and write protection.  Keeping the
+    conversion explicit prevents an open section from silently losing its
+    boundary endpoint when the component is a non-contiguous mesh island.
+    """
     import numpy as np
+
+    global_to_local = {
+        int(global_index): int(local_index)
+        for local_index, global_index in enumerate(snapshot.get("vertex_indices", ()))
+    }
+    local_vertices = []
+    for global_index in snapshot.get("boundary_vertices", ()):
+        local_index = global_to_local.get(int(global_index))
+        if local_index is None:
+            raise ValueError("boundary vertex is outside the captured component")
+        local_vertices.append(local_index)
+    local_vertex_set = set(local_vertices)
+    boundary_edges = []
+    for edge in snapshot.get("boundary_edges", ()):
+        if len(edge) != 2:
+            raise ValueError("boundary edge is malformed")
+        first, second = (int(edge[0]), int(edge[1]))
+        if not (0 <= first < int(vertex_count) and 0 <= second < int(vertex_count)):
+            # A future/foreign snapshot may retain global edge indices.  Do
+            # not guess for an in-range pair: only convert an unmistakably
+            # global edge here.
+            mapped_first = global_to_local.get(first)
+            mapped_second = global_to_local.get(second)
+            if mapped_first is None or mapped_second is None:
+                raise ValueError("boundary edge is outside the captured component")
+            first, second = mapped_first, mapped_second
+        boundary_edges.append((first, second))
+    return (
+        np.asarray(sorted(local_vertex_set), dtype=np.int64),
+        np.asarray(boundary_edges, dtype=np.int64).reshape((-1, 2)),
+    )
+
+
+def _guided_ridge_bounded_boundary_distance_steps(before, boundary_mask):
+    """Yield one bounded boundary-distance chunk at a time.
+
+    The synchronous wrapper below consumes the same generator, so the
+    numeric operation and ordering remain identical for Repeat Last and the
+    modal compute path while the latter returns to Blender between chunks.
+    """
+    import numpy as np
+
     boundary_points = np.asarray(before[boundary_mask], dtype=np.float64)
     if len(boundary_points) == 0:
         raise ValueError("component boundary is unavailable")
     result = np.empty(len(before), dtype=np.float64)
-    chunk_size = _guided_ridge_bounded_pairwise_chunk_size(len(before), len(boundary_points))
+    chunk_size = min(
+        _guided_ridge_bounded_pairwise_chunk_size(len(before), len(boundary_points)),
+        1,
+    )
+    boundary_slice = 512
+    vertex_total = int(math.ceil(len(before) / float(max(chunk_size, 1))))
+    boundary_total = int(math.ceil(len(boundary_points) / float(boundary_slice)))
+    total = vertex_total * boundary_total
+    work_index = 0
     for start in range(0, len(before), chunk_size):
         stop = min(start + chunk_size, len(before))
-        delta = before[start:stop, None, :] - boundary_points[None, :, :]
-        result[start:stop] = np.min(np.linalg.norm(delta, axis=2), axis=1)
+        local_minimum = np.full(stop - start, np.inf, dtype=np.float64)
+        for boundary_start in range(0, len(boundary_points), boundary_slice):
+            boundary_stop = min(boundary_start + boundary_slice, len(boundary_points))
+            delta = before[start:stop, None, :] - boundary_points[boundary_start:boundary_stop][None, :, :]
+            local_minimum = np.minimum(
+                local_minimum,
+                np.min(np.linalg.norm(delta, axis=2), axis=1),
+            )
+            work_index += 1
+            yield {
+                "stage": "measuring boundary distances",
+                "stage_index": 4,
+                "stage_count": 5,
+                "done": work_index,
+                "total": total,
+            }
+        result[start:stop] = local_minimum
     return result, chunk_size, len(boundary_points)
 
 
-def _guided_ridge_exact_candidate(snapshot, guide, controls, control_normals):
+def _guided_ridge_bounded_boundary_distance(before, boundary_mask):
+    job = _guided_ridge_bounded_boundary_distance_steps(before, boundary_mask)
+    try:
+        while True:
+            next(job)
+    except StopIteration as complete:
+        return complete.value
+
+
+def _guided_ridge_surface_section_record_job(points, triangles, boundary_edges, boundary_vertices, frame, station, previous_axis=None):
+    """Extract one deterministic surface cross-section around the guide crest.
+
+    The old implementation intersected the station plane with the outer Face
+    Set boundary.  That works only when the guide crosses the component from
+    edge to edge.  A Guided Ridge guide instead follows an interior crest, so
+    the section is built from the component surface triangles and only the
+    crest-side arc is selected for deformation.
+
+    This helper deliberately rejects ambiguous topology (coplanar triangles,
+    branches, multiple equally-close sheets, and concave/ambiguous arcs).  It
+    returns the same q/h anchor fields consumed by the existing profile code.
+    """
+    import numpy as np
+
+    points = np.asarray(points, dtype=np.float64)
+    triangles = np.asarray(triangles, dtype=np.int64)
+    boundary_edges = {tuple(sorted((int(a), int(b)))) for a, b in np.asarray(boundary_edges, dtype=np.int64)}
+    boundary_vertices = {int(value) for value in boundary_vertices}
+    origin, tangent, frame_normal, frame_lateral = _guided_ridge_frame_at(frame, float(station))
+    eps = max(float(frame.get("average_edge", 0.0) or 0.0) * 1.0e-6, 1.0e-9)
+    edge_pairs = ((0, 1), (1, 2), (2, 0))
+    segments = {}
+    point_by_id = {}
+    segment_triangles = {}
+    signed = np.empty((len(triangles), 3), dtype=np.float64)
+    candidate_parts = []
+    signed_chunk = 64
+    signed_total = int(math.ceil(len(triangles) / float(signed_chunk)))
+    for signed_position, signed_start in enumerate(range(0, len(triangles), signed_chunk), 1):
+        signed_stop = min(signed_start + signed_chunk, len(triangles))
+        tri_points = points[triangles[signed_start:signed_stop]]
+        signed[signed_start:signed_stop] = np.sum(
+            (tri_points - origin[None, None, :]) * tangent[None, None, :], axis=2
+        )
+        chunk_values = signed[signed_start:signed_stop]
+        crossing = np.any(chunk_values < -eps, axis=1) & np.any(chunk_values > eps, axis=1)
+        near = np.any(np.abs(chunk_values) <= eps, axis=1)
+        local_candidates = np.flatnonzero(crossing | near)
+        if len(local_candidates):
+            candidate_parts.append(local_candidates + signed_start)
+        yield {
+            "stage": "classifying station triangles",
+            "stage_index": 1,
+            "stage_count": 8,
+            "done": signed_position,
+            "total": signed_total,
+        }
+    candidate_indices = (
+        np.concatenate(candidate_parts).astype(np.int64, copy=False)
+        if candidate_parts else np.empty(0, dtype=np.int64)
+    )
+    candidate_total = len(candidate_indices)
+    for candidate_position, triangle_index in enumerate(candidate_indices, 1):
+        values = signed[int(triangle_index)]
+        if bool(np.all(np.abs(values) <= eps)):
+            return None, "coplanar surface triangle is ambiguous"
+        local_ids = []
+        local_points = {}
+        for first, second in edge_pairs:
+            va, vb = float(values[first]), float(values[second])
+            ia = int(triangles[int(triangle_index), first])
+            ib = int(triangles[int(triangle_index), second])
+            if abs(va) <= eps and abs(vb) <= eps:
+                for vertex_index in (ia, ib):
+                    key = ("v", vertex_index)
+                    local_ids.append(key)
+                    local_points[key] = points[vertex_index]
+            elif abs(va) <= eps:
+                key = ("v", ia)
+                local_ids.append(key)
+                local_points[key] = points[ia]
+            elif abs(vb) <= eps:
+                key = ("v", ib)
+                local_ids.append(key)
+                local_points[key] = points[ib]
+            elif va * vb < -eps * eps:
+                key = ("e", min(ia, ib), max(ia, ib))
+                factor = va / (va - vb)
+                local_ids.append(key)
+                local_points[key] = points[ia] + factor * (points[ib] - points[ia])
+        unique_ids = []
+        for key in local_ids:
+            if key not in unique_ids:
+                unique_ids.append(key)
+                point_by_id.setdefault(key, np.asarray(local_points[key], dtype=np.float64).copy())
+        if len(unique_ids) < 2:
+            continue
+        if len(unique_ids) != 2:
+            return None, "triangle-plane intersection is ambiguous"
+        first, second = unique_ids
+        if first == second or np.linalg.norm(point_by_id[first] - point_by_id[second]) <= 1.0e-10:
+            return None, "zero-length surface section segment"
+        segment_key = tuple(sorted((first, second)))
+        segments[segment_key] = (first, second)
+        segment_triangles.setdefault(segment_key, []).append(int(triangle_index))
+        if candidate_position % 512 == 0 or candidate_position == candidate_total:
+            yield {
+                "stage": "extracting surface section",
+                "stage_index": 1,
+                "stage_count": 8,
+                "done": candidate_position,
+                "total": candidate_total,
+            }
+    if not segments:
+        return None, "station has no surface intersection"
+
+    graph = {}
+    for first, second in segments.values():
+        graph.setdefault(first, set()).add(second)
+        graph.setdefault(second, set()).add(first)
+    if any(len(neighbors) > 2 for neighbors in graph.values()):
+        return None, "surface section has a branch or non-manifold degree"
+
+    components = []
+    unseen = set(graph)
+    while unseen:
+        root = min(unseen, key=repr)
+        stack = [root]
+        component = set()
+        unseen.remove(root)
+        while stack:
+            current = stack.pop()
+            component.add(current)
+            for neighbor in graph[current]:
+                if neighbor in unseen:
+                    unseen.remove(neighbor)
+                    stack.append(neighbor)
+        endpoints = [key for key in component if len(graph[key]) == 1]
+        if len(endpoints) not in (0, 2):
+            return None, "surface section has an invalid open polyline"
+        if any(len(graph[key]) != 2 for key in component) and len(endpoints) != 2:
+            return None, "surface section has an invalid loop degree"
+        if len(component) < 2:
+            continue
+        components.append((component, endpoints))
+    if not components:
+        return None, "station has no usable surface polyline"
+
+    def ordered_component(component, endpoints):
+        if endpoints:
+            start = min(endpoints, key=repr)
+            ordered = [start]
+            previous = None
+            current = start
+            while True:
+                choices = sorted((value for value in graph[current] if value != previous), key=repr)
+                if not choices:
+                    break
+                next_value = choices[0]
+                ordered.append(next_value)
+                previous, current = current, next_value
+                if current in endpoints and current != start:
+                    break
+            return ordered, False
+        start = min(component, key=repr)
+        ordered = [start]
+        previous = None
+        current = start
+        while True:
+            choices = sorted((value for value in graph[current] if value != previous), key=repr)
+            if not choices:
+                break
+            next_value = choices[0]
+            if next_value == start:
+                break
+            ordered.append(next_value)
+            previous, current = current, next_value
+        return ordered, True
+
+    def closest_on_polyline(ordered, closed):
+        best = None
+        count = len(ordered)
+        limit = count if closed else count - 1
+        for index in range(max(limit, 0)):
+            first = np.asarray(point_by_id[ordered[index]], dtype=np.float64)
+            second = np.asarray(point_by_id[ordered[(index + 1) % count]], dtype=np.float64)
+            delta = second - first
+            factor = float(np.dot(origin - first, delta) / max(np.dot(delta, delta), 1.0e-30))
+            factor = min(max(factor, 0.0), 1.0)
+            point = first + factor * delta
+            distance = float(np.linalg.norm(point - origin))
+            if best is None or distance < best[0]:
+                best = (distance, index, factor, point)
+        return best
+
+    candidates = []
+    for component, endpoints in components:
+        ordered, closed = ordered_component(component, endpoints)
+        closest = closest_on_polyline(ordered, closed)
+        if closest is None:
+            continue
+        candidates.append((closest[0], ordered, closed, endpoints, closest))
+    candidates.sort(key=lambda value: value[0])
+    if not candidates:
+        return None, "surface section has no crest candidate"
+    crest_distance, ordered, closed, endpoints, closest = candidates[0]
+    tie_epsilon = max(eps * 32.0, float(frame.get("average_edge", 0.0) or 0.0) * 0.05)
+    if len(candidates) > 1 and candidates[1][0] - crest_distance <= tie_epsilon:
+        return None, "multiple equally-close surface sheets"
+    if crest_distance > max(float(frame.get("average_edge", 0.0) or 0.0) * 8.0, 1.0e-4):
+        return None, "surface section crest is too far from the guide"
+
+    segment_index, segment_factor, crest_point = closest[1], closest[2], closest[3]
+    count = len(ordered)
+    first_id = ordered[segment_index]
+    second_id = ordered[(segment_index + 1) % count]
+    forward = [crest_point]
+    backward = [crest_point]
+    # ``None`` denotes the interpolated crest point.  The remaining keys are
+    # the topological provenance used later to keep the selected surface arc
+    # separate from its complement.
+    forward_keys = [None]
+    backward_keys = [None]
+    if segment_factor < 1.0 - 1.0e-6:
+        forward.append(np.asarray(point_by_id[second_id], dtype=np.float64))
+        forward_keys.append(second_id)
+    if segment_factor > 1.0e-6:
+        backward.append(np.asarray(point_by_id[first_id], dtype=np.float64))
+        backward_keys.append(first_id)
+    if closed:
+        index = (segment_index + 1) % count
+        while True:
+            next_index = (index + 1) % count
+            if next_index == (segment_index + 1) % count:
+                break
+            forward.append(np.asarray(point_by_id[ordered[next_index]], dtype=np.float64))
+            forward_keys.append(ordered[next_index])
+            index = next_index
+        index = segment_index
+        while True:
+            next_index = (index - 1) % count
+            if next_index == segment_index:
+                break
+            backward.append(np.asarray(point_by_id[ordered[next_index]], dtype=np.float64))
+            backward_keys.append(ordered[next_index])
+            index = next_index
+    else:
+        # Open polylines have real endpoints.  Do not use modulo arithmetic:
+        # wrapping here would join the crest to the opposite endpoint and
+        # accidentally turn a boundary strip into a closed loop.
+        for next_index in range(segment_index + 2, count):
+            forward.append(np.asarray(point_by_id[ordered[next_index]], dtype=np.float64))
+            forward_keys.append(ordered[next_index])
+        for next_index in range(segment_index - 1, -1, -1):
+            backward.append(np.asarray(point_by_id[ordered[next_index]], dtype=np.float64))
+            backward_keys.append(ordered[next_index])
+
+    axis = np.asarray(frame_lateral, dtype=np.float64)
+    if previous_axis is not None:
+        previous_axis = np.asarray(previous_axis, dtype=np.float64)
+        previous_axis -= np.dot(previous_axis, tangent) * tangent
+        if np.linalg.norm(previous_axis) > 1.0e-8:
+            axis = _guided_ridge_unit_array(previous_axis).reshape(3)
+    axis = _guided_ridge_unit_array(axis - np.dot(axis, tangent) * tangent).reshape(3)
+    height_axis = _guided_ridge_unit_array(np.cross(tangent, axis)).reshape(3)
+    if np.dot(height_axis, frame_normal) < 0.0:
+        height_axis *= -1.0
+
+    def branch_values(branch):
+        values = np.asarray([(point - origin) @ axis for point in branch], dtype=np.float64)
+        heights = np.asarray([(point - origin) @ height_axis for point in branch], dtype=np.float64)
+        return values, heights
+
+    forward_q, forward_h = branch_values(forward)
+    backward_q, backward_h = branch_values(backward)
+    # A closed loop has two arcs from the crest.  Each arc must stop at the
+    # first opposite-side crossing (normally the far-side point); otherwise a
+    # full loop would incorrectly make both branches contain both signs.
+    side_epsilon = max(eps * 16.0, 1.0e-7)
+    def trim_at_opposite_side(branch, keys, values, heights):
+        nonzero = np.flatnonzero(np.abs(values) > side_epsilon)
+        if len(nonzero) == 0:
+            return branch, keys, values, heights
+        expected = 1.0 if values[int(nonzero[0])] > 0.0 else -1.0
+        for index in range(int(nonzero[0]) + 1, len(values)):
+            if expected * values[index] < -side_epsilon:
+                stop = max(index, 2)
+                return branch[:stop], keys[:stop], values[:stop], heights[:stop]
+        return branch, keys, values, heights
+    forward, forward_keys, forward_q, forward_h = trim_at_opposite_side(
+        forward, forward_keys, forward_q, forward_h
+    )
+    backward, backward_keys, backward_q, backward_h = trim_at_opposite_side(
+        backward, backward_keys, backward_q, backward_h
+    )
+    branch_data = (("forward", forward_q, forward_h), ("backward", backward_q, backward_h))
+    negative = [item for item in branch_data if np.min(item[1]) < -side_epsilon]
+    positive = [item for item in branch_data if np.max(item[1]) > side_epsilon]
+    if len(negative) != 1 or len(positive) != 1 or negative[0][0] == positive[0][0]:
+        return None, "crest-side arc has competing, folded, or ambiguous branches"
+    if np.any(negative[0][1] > side_epsilon) or np.any(positive[0][1] < -side_epsilon):
+        return None, "surface arc is concave or self-intersecting"
+    left_q, left_h = negative[0][1], negative[0][2]
+    right_q, right_h = positive[0][1], positive[0][2]
+    qlo = float(np.min(left_q))
+    qhi = float(np.max(right_q))
+    hlo = float(left_h[int(np.argmin(left_q))])
+    hhi = float(right_h[int(np.argmax(right_q))])
+    if not (qlo < -side_epsilon < 0.0 < side_epsilon < qhi):
+        return None, "surface crest section has insufficient lateral width"
+    chord_at_crest = (hlo * qhi - hhi * qlo) / (qhi - qlo)
+    crest_side = -1.0 if chord_at_crest > 0.0 else 1.0
+    if abs(chord_at_crest) <= side_epsilon:
+        return None, "crest-side arc is indistinguishable from its anchor chord"
+
+    def endpoint_is_boundary(key):
+        if key[0] == "v":
+            return int(key[1]) in boundary_vertices
+        return (int(key[1]), int(key[2])) in boundary_edges
+    if not closed:
+        if not endpoint_is_boundary(ordered[0]) or not endpoint_is_boundary(ordered[-1]):
+            return None, "open surface section does not terminate at component boundaries"
+
+    branch_by_name = {
+        "forward": (forward, forward_keys, forward_q),
+        "backward": (backward, backward_keys, backward_q),
+    }
+    selected_arc_keys = []
+    selected_arc_triangles = set()
+    selected_arc_vertices = set()
+    selected_anchor_vertices = set()
+    selected_segments = set()
+
+    def add_key_vertices(key, target):
+        if key is None:
+            return
+        if key[0] == "v":
+            target.add(int(key[1]))
+        elif key[0] == "e":
+            target.update((int(key[1]), int(key[2])))
+
+    def collect_branch(name, q_values):
+        branch, keys, _branch_q = branch_by_name[name]
+        selected_arc_keys.extend(key for key in keys if key is not None)
+        for key in keys:
+            add_key_vertices(key, selected_arc_vertices)
+        for first_key, second_key in zip(keys, keys[1:]):
+            if first_key is None or second_key is None:
+                segment_key = tuple(sorted((first_id, second_id)))
+            else:
+                segment_key = tuple(sorted((first_key, second_key)))
+            selected_segments.add(segment_key)
+            selected_arc_triangles.update(segment_triangles.get(segment_key, ()))
+        if len(q_values):
+            add_key_vertices(keys[int(np.argmin(q_values))], selected_anchor_vertices)
+
+    collect_branch(negative[0][0], left_q)
+    collect_branch(positive[0][0], right_q)
+    source_triangle = segment_triangles.get(tuple(sorted((first_id, second_id))), ())
+    return {
+        "station": float(station),
+        "axis": axis,
+        "height_axis": height_axis,
+        "qlo": qlo,
+        "qhi": qhi,
+        "hlo": hlo,
+        "hhi": hhi,
+        "crest_side": float(crest_side),
+        "crest_point": np.asarray(crest_point, dtype=np.float64),
+        "source_triangle": int(source_triangle[0]) if source_triangle else -1,
+        "arc_vertex_ids": tuple(sorted(selected_arc_vertices)),
+        "arc_keys": tuple(repr(key) for key in selected_arc_keys),
+        "arc_triangle_indices": tuple(sorted(int(value) for value in selected_arc_triangles)),
+        "arc_segments": tuple(sorted(selected_segments, key=repr)),
+        "anchor_vertex_ids": tuple(sorted(selected_anchor_vertices)),
+        "closed": bool(closed),
+    }, None
+
+
+def _guided_ridge_surface_section_record(points, triangles, boundary_edges, boundary_vertices, frame, station, previous_axis=None):
+    """Synchronous compatibility wrapper for one surface section."""
+    job = _guided_ridge_surface_section_record_job(
+        points, triangles, boundary_edges, boundary_vertices, frame, station, previous_axis
+    )
+    try:
+        while True:
+            next(job)
+    except StopIteration as complete:
+        return complete.value
+
+
+def _guided_ridge_arc_candidate_steps_legacy(snapshot, guide, controls, control_normals):
+    """Yield bounded cross-section work for the modal computing phase."""
     import numpy as np
     before = np.asarray(snapshot["coords_world"], dtype=np.float64)
     faces = np.asarray(snapshot["triangles"], dtype=np.int64)
-    frame = _guided_ridge_stable_frame(before, faces, guide, controls, control_normals)
-    boundary_edges = np.asarray(snapshot["boundary_edges"], dtype=np.int64)
+    frame_job = _guided_ridge_stable_frame_steps(before, faces, guide, controls, control_normals)
+    try:
+        while True:
+            yield next(frame_job)
+    except StopIteration as complete:
+        frame = complete.value
+    frame["average_edge"] = float(snapshot.get("average_edge", 0.0) or 0.0)
+    boundary_vertices, boundary_edges = _guided_ridge_boundary_local_data(snapshot, len(before))
+    boundary_mask = np.zeros(len(before), dtype=bool)
+    boundary_mask[boundary_vertices] = True
     stations = np.linspace(0.001, frame["length"] - 0.001, 64)
     records = []
     previous_axis = None
-    for station in stations:
-        record = _guided_ridge_boundary_record(before, faces, boundary_edges, frame, float(station), previous_axis)
+    invalid_reasons = {}
+    yield {"stage": "extracting surface sections", "stage_index": 1, "stage_count": 5, "done": 0, "total": len(stations)}
+    for index, station in enumerate(stations):
+        section_job = _guided_ridge_surface_section_record_job(
+            before, faces, boundary_edges, boundary_vertices, frame, float(station), previous_axis
+        )
+        try:
+            while True:
+                section_progress = next(section_job)
+                section_progress["station_index"] = index
+                yield section_progress
+        except StopIteration as complete:
+            record, reason = complete.value
         if record is not None:
             records.append(record)
             previous_axis = record["axis"]
+        else:
+            invalid_reasons[reason or "invalid section"] = invalid_reasons.get(reason or "invalid section", 0) + 1
+        yield {
+            "stage": "extracting surface sections",
+            "stage_index": 1,
+            "stage_count": 5,
+            "done": index + 1,
+            "total": len(stations),
+        }
+    boundary_job = _guided_ridge_bounded_boundary_distance_steps(before, boundary_mask)
+    boundary_distance = None
+    try:
+        while True:
+            progress = next(boundary_job)
+            yield progress
+    except StopIteration as complete:
+        boundary_distance = complete.value
+    yield {"stage": "building crest-side profile", "stage_index": 3, "stage_count": 5, "done": 0, "total": 1}
+    candidate_job = _guided_ridge_arc_candidate_job_legacy(
+        snapshot,
+        guide,
+        controls,
+        control_normals,
+        prepared_sections=(frame, stations, records, invalid_reasons, boundary_distance),
+    )
+    try:
+        while True:
+            progress = next(candidate_job)
+            yield progress
+    except StopIteration as complete:
+        return complete.value
+
+
+def _guided_ridge_arc_candidate_job_legacy(snapshot, guide, controls, control_normals, prepared_sections=None):
+    import numpy as np
+    before = np.asarray(snapshot["coords_world"], dtype=np.float64)
+    faces = np.asarray(snapshot["triangles"], dtype=np.int64)
+    prepared_boundary = []
+    if prepared_sections is None:
+        frame = _guided_ridge_stable_frame(before, faces, guide, controls, control_normals)
+        frame["average_edge"] = float(snapshot.get("average_edge", 0.0) or 0.0)
+        boundary_vertices, boundary_edges = _guided_ridge_boundary_local_data(snapshot, len(before))
+        stations = np.linspace(0.001, frame["length"] - 0.001, 64)
+        records = []
+        previous_axis = None
+        invalid_reasons = {}
+        for station in stations:
+            record, reason = _guided_ridge_surface_section_record(
+                before, faces, boundary_edges, boundary_vertices, frame, float(station), previous_axis
+            )
+            if record is not None:
+                records.append(record)
+                previous_axis = record["axis"]
+            else:
+                invalid_reasons[reason or "invalid section"] = invalid_reasons.get(reason or "invalid section", 0) + 1
+    else:
+        prepared_frame, prepared_stations, records, invalid_reasons, *prepared_boundary = prepared_sections
+        frame = prepared_frame
+        stations = np.asarray(prepared_stations, dtype=np.float64)
+        boundary_vertices, boundary_edges = _guided_ridge_boundary_local_data(snapshot, len(before))
     if len(records) < 8:
-        raise ValueError("too few valid boundary sections")
+        reason = max(invalid_reasons, key=invalid_reasons.get) if invalid_reasons else "unknown section failure"
+        raise ValueError(f"too few valid surface sections ({reason})")
+    valid_indices = np.asarray([int(np.argmin(np.abs(stations - record["station"]))) for record in records], dtype=np.int64)
+    if int(valid_indices[0]) > 12 or int(valid_indices[-1]) < len(stations) - 13:
+        raise ValueError("surface sections do not cover the guide length")
+    gaps = np.diff(valid_indices)
+    # A dense, irregular surface can legitimately reject a short run of
+    # folded stations.  Keep the missing run bounded without requiring every
+    # plane to be usable; a gap of 24/64 still rejects endpoint-only samples.
+    if len(gaps) and int(np.max(gaps)) > 24:
+        raise ValueError("surface sections have an excessive missing run")
+    for left, right in zip(records, records[1:]):
+        if float(np.dot(left["axis"], right["axis"])) <= 0.0:
+            raise ValueError("surface section orientation is discontinuous")
+        if float(np.linalg.norm(left["crest_point"] - right["crest_point"])) > max(
+            frame["average_edge"] * 12.0, 1.0e-4
+        ):
+            raise ValueError("surface section crest is discontinuous")
     valid = np.asarray([record["station"] for record in records], dtype=float)
-    arrays = {key: np.asarray([record[key] for record in records], dtype=float) for key in ("axis", "height_axis", "qlo", "qhi", "hlo", "hhi")}
+    arrays = {
+        key: np.asarray([record[key] for record in records], dtype=float)
+        for key in ("axis", "height_axis", "qlo", "qhi", "hlo", "hhi", "crest_side")
+    }
     anchors = {}
     for key, values in arrays.items():
         if values.ndim == 2:
@@ -8290,7 +9455,11 @@ def _guided_ridge_exact_candidate(snapshot, guide, controls, control_normals):
         raise ValueError("guide contains a degenerate segment")
     seg_index = np.empty(len(before), dtype=np.int32)
     t = np.empty(len(before), dtype=np.float64)
-    chunk_size = _guided_ridge_bounded_pairwise_chunk_size(len(before), len(segment))
+    chunk_size = min(
+        _guided_ridge_bounded_pairwise_chunk_size(len(before), len(segment)),
+        128,
+    )
+    guide_chunk_total = int(math.ceil(len(before) / float(max(chunk_size, 1))))
     for start in range(0, len(before), chunk_size):
         stop = min(start + chunk_size, len(before))
         block = before[start:stop, None, :] - frame["guide"][:-1][None, :, :]
@@ -8298,6 +9467,13 @@ def _guided_ridge_exact_candidate(snapshot, guide, controls, control_normals):
         distance2 = np.sum((block - parameter[:, :, None] * segment[None, :, :]) ** 2, axis=2)
         seg_index[start:stop] = np.argmin(distance2, axis=1)
         t[start:stop] = parameter[np.arange(stop - start), seg_index[start:stop]]
+        yield {
+            "stage": "projecting vertices to guide",
+            "stage_index": 4,
+            "stage_count": 8,
+            "done": int(stop // max(chunk_size, 1)),
+            "total": guide_chunk_total,
+        }
     origin = frame["guide"][seg_index] + t[:, None] * segment[seg_index]
     station = frame["arc"][seg_index] + t * (frame["arc"][seg_index + 1] - frame["arc"][seg_index])
     tangent = _guided_ridge_unit_array((1.0 - t)[:, None] * frame["tangent"][seg_index] + t[:, None] * frame["tangent"][seg_index + 1])
@@ -8319,8 +9495,54 @@ def _guided_ridge_exact_candidate(snapshot, guide, controls, control_normals):
     hlo = (1.0 - ft) * anchors["hlo"][i0] + ft * anchors["hlo"][i1]
     hhi = (1.0 - ft) * anchors["hhi"][i0] + ft * anchors["hhi"][i1]
     target = np.where(q <= 0.0, (q / np.minimum(qlo, -1.0e-8)) * hlo, (q / np.maximum(qhi, 1.0e-8)) * hhi)
+    crest_side = np.interp(station, valid, arrays["crest_side"])
+    chord_height = np.where(
+        q <= 0.0,
+        hlo + (hhi - hlo) * np.clip((q - qlo) / np.maximum(qhi - qlo, 1.0e-12), 0.0, 1.0),
+        hlo + (hhi - hlo) * np.clip((q - qlo) / np.maximum(qhi - qlo, 1.0e-12), 0.0, 1.0),
+    )
+    # A q/chord half-space is only a geometric guard.  The authoritative
+    # membership comes from the selected section arc provenance; this keeps a
+    # backside loop or a second sheet in the same half-space immutable.
+    selected_arc_mask = np.zeros(len(before), dtype=bool)
+    selected_section_anchor_mask = np.zeros(len(before), dtype=bool)
+    selected_surface_triangle_mask = np.zeros(len(before), dtype=bool)
+    for record in records:
+        for local_index in record.get("arc_vertex_ids", ()):
+            if 0 <= int(local_index) < len(before):
+                selected_arc_mask[int(local_index)] = True
+        for local_index in record.get("anchor_vertex_ids", ()):
+            if 0 <= int(local_index) < len(before):
+                selected_section_anchor_mask[int(local_index)] = True
+        for triangle_index in record.get("arc_triangle_indices", ()):
+            if 0 <= int(triangle_index) < len(faces):
+                selected_surface_triangle_mask[faces[int(triangle_index)]] = True
+    selected_arc_mask |= selected_surface_triangle_mask
+    crest_side_mask = (
+        (q >= qlo)
+        & (q <= qhi)
+        & (crest_side * (h - chord_height) >= -max(frame["average_edge"] * 0.25, 1.0e-7))
+        & selected_arc_mask
+    )
+    surface_normals = np.asarray(snapshot.get("normals_world", ()), dtype=np.float64)
+    if surface_normals.shape != before.shape:
+        raise ValueError("surface normals are unavailable for planing direction")
+    outward_component = np.sum(height_axis * surface_normals, axis=1)
+    outward_component[np.abs(outward_component) <= 1.0e-6] = 0.0
+    anchor_mask = selected_section_anchor_mask.copy()
+    guide_anchor_mask = np.zeros(len(before), dtype=bool)
+    anchors, anchor_reason = _guided_ridge_surface_anchors(snapshot, controls)
+    if anchors is None:
+        raise ValueError(anchor_reason or "guide anchors are unavailable")
+    local_lookup = {int(value): index for index, value in enumerate(snapshot["vertex_indices"])}
+    for anchor in anchors:
+        for global_index in anchor["vertex_indices"]:
+            local_index = local_lookup.get(int(global_index))
+            if local_index is not None:
+                guide_anchor_mask[local_index] = True
+    anchor_mask |= guide_anchor_mask
     boundary_mask = np.zeros(len(before), dtype=bool)
-    boundary_mask[[snapshot["vertex_indices"].index(index) for index in snapshot["boundary_vertices"]]] = True
+    boundary_mask[boundary_vertices] = True
     hidden_vertices = np.asarray(
         snapshot.get("hidden_vertices", np.zeros(len(before), dtype=bool)), dtype=bool
     )
@@ -8335,28 +9557,152 @@ def _guided_ridge_exact_candidate(snapshot, guide, controls, control_normals):
     old_tip_fade = max(0.010 / 0.07595313195548941 * frame["length"], 1.0e-9)
     new_tip_fade = max(0.003 / 0.07595313195548941 * frame["length"], 1.0e-9)
     boundary_width = max(0.00070 / 0.07595313195548941 * frame["length"], 1.0e-9)
-    root_guard = np.asarray([_guided_ridge_smoothstep((value - root_start) / root_fade) for value in station])
-    old_tip_guard = np.asarray([_guided_ridge_smoothstep((frame["length"] - old_tip_fade - value) / old_tip_fade) for value in station])
-    new_tip_guard = np.asarray([_guided_ridge_smoothstep((frame["length"] - new_tip_fade - value) / new_tip_fade) for value in station])
-    boundary_distance, boundary_distance_chunk_size, boundary_count = _guided_ridge_bounded_boundary_distance(before, boundary_mask)
-    boundary_guard = np.asarray([_guided_ridge_smoothstep(value / boundary_width) for value in boundary_distance])
+    guard_chunk = 128
+    guard_total = int(math.ceil(len(station) / float(guard_chunk)))
+    root_guard = np.empty(len(station), dtype=np.float64)
+    old_tip_guard = np.empty(len(station), dtype=np.float64)
+    new_tip_guard = np.empty(len(station), dtype=np.float64)
+    for guard_start in range(0, len(station), guard_chunk):
+        guard_stop = min(guard_start + guard_chunk, len(station))
+        root_guard[guard_start:guard_stop] = [
+            _guided_ridge_smoothstep((value - root_start) / root_fade)
+            for value in station[guard_start:guard_stop]
+        ]
+        old_tip_guard[guard_start:guard_stop] = [
+            _guided_ridge_smoothstep((frame["length"] - old_tip_fade - value) / old_tip_fade)
+            for value in station[guard_start:guard_stop]
+        ]
+        new_tip_guard[guard_start:guard_stop] = [
+            _guided_ridge_smoothstep((frame["length"] - new_tip_fade - value) / new_tip_fade)
+            for value in station[guard_start:guard_stop]
+        ]
+        yield {
+            "stage": "building profile guards",
+            "stage_index": 5,
+            "stage_count": 11,
+            "done": int(guard_stop // max(guard_chunk, 1)),
+            "total": guard_total,
+        }
+    if prepared_boundary and prepared_boundary[0] is not None:
+        boundary_distance, boundary_distance_chunk_size, boundary_count = prepared_boundary[0]
+    else:
+        boundary_distance, boundary_distance_chunk_size, boundary_count = _guided_ridge_bounded_boundary_distance(
+            before, boundary_mask
+        )
+    boundary_guard = np.empty(len(boundary_distance), dtype=np.float64)
+    smooth_chunk = 64
+    smooth_total = int(math.ceil(len(boundary_distance) / float(smooth_chunk)))
+    for smooth_index, start in enumerate(range(0, len(boundary_distance), smooth_chunk), 1):
+        stop = min(start + smooth_chunk, len(boundary_distance))
+        boundary_guard[start:stop] = [
+            _guided_ridge_smoothstep(value / boundary_width)
+            for value in boundary_distance[start:stop]
+        ]
+        yield {
+            "stage": "building boundary falloff",
+            "stage_index": 5,
+            "stage_count": 8,
+            "done": smooth_index,
+            "total": smooth_total,
+        }
     # Protected vertices are applied to their own final displacement below.
     # Keeping them out of the smoothing loop prevents a local mask/hidden
     # value from changing the candidate at neighboring unmasked vertices.
-    anchored = boundary_mask | (station <= 0.0)
+    anchored = boundary_mask | (station <= 0.0) | ~crest_side_mask | anchor_mask
+    planing_delta = target - h
+    planing_delta[(planing_delta * outward_component) > 0.0] = 0.0
+    planing_delta[outward_component == 0.0] = 0.0
+    # Only vertices that were already above (outside) their target plane are
+    # eligible.  Smoothing may not turn a depression, a plane-level vertex, or
+    # a backside vertex into a new material-adding displacement.
+    protrusion_mask = crest_side_mask & (planing_delta * outward_component < -1.0e-12)
+    planing_delta[~protrusion_mask] = 0.0
+    safe_low = np.minimum(planing_delta, 0.0)
+    # Build the flattened adjacency arrays cooperatively.  The previous
+    # repeat/concatenate pair ran before the first falloff yield and could
+    # create an opaque native pause on dense components.  Chunking this
+    # mechanical preparation preserves list order and values while returning
+    # to the modal timer between bounded pieces.
+    adjacency_source_parts = []
+    adjacency_target_parts = []
+    adjacency_counts = np.asarray(
+        [len(neighbors) for neighbors in snapshot["adjacency"]], dtype=np.float64
+    )
+    adjacency_prepare_chunk = 256
+    adjacency_prepare_total = int(
+        math.ceil(len(snapshot["adjacency"]) / float(adjacency_prepare_chunk))
+    )
+    for adjacency_start in range(0, len(snapshot["adjacency"]), adjacency_prepare_chunk):
+        adjacency_stop = min(adjacency_start + adjacency_prepare_chunk, len(snapshot["adjacency"]))
+        local_neighbors = snapshot["adjacency"][adjacency_start:adjacency_stop]
+        local_targets = [
+            np.asarray(neighbors, dtype=np.int64) for neighbors in local_neighbors if neighbors
+        ]
+        if local_targets:
+            adjacency_target_parts.append(np.concatenate(local_targets))
+            adjacency_source_parts.append(
+                np.repeat(
+                    np.arange(adjacency_start, adjacency_stop, dtype=np.int64),
+                    np.asarray([len(neighbors) for neighbors in local_neighbors], dtype=np.int64),
+                )
+            )
+        yield {
+            "stage": "preparing adjacency smoothing",
+            "stage_index": 5,
+            "stage_count": 11,
+            "done": int(adjacency_stop // max(adjacency_prepare_chunk, 1)),
+            "total": adjacency_prepare_total,
+        }
+    # Avoid one final full-size concatenate: on the live Hair component it
+    # was the longest opaque allocation in the first falloff slice.  Group a
+    # few already bounded pieces at a time and consume those groups directly
+    # in ``apply`` below.
+    grouped_sources = []
+    grouped_targets = []
+    adjacency_group_size = 8
+    adjacency_group_total = int(
+        math.ceil(len(adjacency_source_parts) / float(adjacency_group_size))
+    )
+    for group_start in range(0, len(adjacency_source_parts), adjacency_group_size):
+        group_stop = min(group_start + adjacency_group_size, len(adjacency_source_parts))
+        grouped_sources.append(np.concatenate(adjacency_source_parts[group_start:group_stop]))
+        grouped_targets.append(np.concatenate(adjacency_target_parts[group_start:group_stop]))
+        yield {
+            "stage": "preparing adjacency smoothing",
+            "stage_index": 5,
+            "stage_count": 11,
+            "done": len(grouped_sources),
+            "total": adjacency_group_total,
+        }
+    adjacency_source_parts = grouped_sources
+    adjacency_target_parts = grouped_targets
+    adjacency_count = adjacency_counts
     def apply(weight, delta_source=None):
-        delta = (target - h) * (0.82 * weight if delta_source is None else delta_source)
+        delta = planing_delta * (0.82 * weight if delta_source is None else delta_source)
+        delta[~protrusion_mask] = 0.0
         for _ in range(2):
             relaxed = delta.copy()
-            for index, neighbors in enumerate(snapshot["adjacency"]):
-                if anchored[index] or not neighbors:
-                    continue
-                relaxed[index] = 0.72 * delta[index] + 0.28 * float(np.mean(delta[list(neighbors)]))
+            neighbor_sum = np.zeros(len(delta), dtype=np.float64)
+            for source_part, target_part in zip(adjacency_source_parts, adjacency_target_parts):
+                np.add.at(neighbor_sum, source_part, delta[target_part])
+            movable = (adjacency_count > 0.0) & ~anchored
+            relaxed[movable] = (
+                0.72 * delta[movable]
+                + 0.28 * neighbor_sum[movable] / adjacency_count[movable]
+            )
+            relaxed[~protrusion_mask] = 0.0
+            relaxed = np.clip(relaxed, safe_low, 0.0)
             relaxed[anchored] = 0.0
             delta = relaxed
+        delta[(delta * outward_component) > 0.0] = 0.0
+        delta[outward_component == 0.0] = 0.0
+        delta[~protrusion_mask] = 0.0
+        delta = np.clip(delta, safe_low, 0.0)
         return delta
+    yield {"stage": "building planing delta", "stage_index": 6, "stage_count": 10, "done": 0, "total": 4}
     delta_current = apply(root_guard * old_tip_guard * boundary_guard)
     current = before + delta_current[:, None] * height_axis
+    yield {"stage": "building planing delta", "stage_index": 6, "stage_count": 10, "done": 1, "total": 4}
     active = (0.82 * root_guard * old_tip_guard * boundary_guard) > 0.05
     bins = np.linspace(0.0, frame["length"], 32 + 1)
     raw = np.full(32, np.nan, dtype=float)
@@ -8374,7 +9720,9 @@ def _guided_ridge_exact_candidate(snapshot, guide, controls, control_normals):
     scale[~active] = 1.0
     variant_a = before + (delta_current * scale)[:, None] * height_axis
     current_new = before + apply(root_guard * new_tip_guard * boundary_guard)[:, None] * height_axis
+    yield {"stage": "building planing delta", "stage_index": 6, "stage_count": 10, "done": 2, "total": 4}
     candidate = variant_a + 0.25 * (current_new - current) * scale[:, None]
+    yield {"stage": "applying masks and planing clamp", "stage_index": 7, "stage_count": 10, "done": 0, "total": 2}
     protected_weight = np.clip(1.0 - sculpt_mask, 0.0, 1.0)
     protected_weight[hidden_vertices] = 0.0
     protected_weight[boundary_mask] = 0.0
@@ -8383,7 +9731,7 @@ def _guided_ridge_exact_candidate(snapshot, guide, controls, control_normals):
     # masked, hidden, or a boundary anchor.
     candidate_delta = candidate - before
     candidate_delta *= protected_weight[:, None]
-    affected = (sculpt_mask > 1.0e-12) | hidden_vertices | boundary_mask
+    affected = (sculpt_mask > 1.0e-12) | hidden_vertices | boundary_mask | ~protrusion_mask
     if np.any(affected):
         final_delta_h = np.sum(candidate_delta * height_axis, axis=1)
         final_bound = np.abs(target - h) * 0.82 * root_guard * new_tip_guard * boundary_guard * protected_weight
@@ -8391,17 +9739,1479 @@ def _guided_ridge_exact_candidate(snapshot, guide, controls, control_normals):
             final_delta_h[affected], -final_bound[affected], final_bound[affected]
         )
         candidate_delta[affected] = final_delta_h[affected, None] * height_axis[affected]
+    final_delta_h = np.sum(candidate_delta * height_axis, axis=1)
+    final_delta_h[~protrusion_mask] = 0.0
+    final_delta_h = np.clip(final_delta_h, safe_low, 0.0)
+    final_delta_h[(final_delta_h * outward_component) > 0.0] = 0.0
+    candidate_delta = final_delta_h[:, None] * height_axis
     candidate = before + candidate_delta
+    yield {"stage": "applying masks and planing clamp", "stage_index": 7, "stage_count": 10, "done": 1, "total": 2}
+    # Keep the established no-flip integrity contract while allowing a
+    # valid surface section to produce a smaller, safe planing cut on dense
+    # or sharply triangulated components.  Scaling only the already selected
+    # crest-side, inward-only delta cannot move the guide, anchors, boundary,
+    # or backside and does not introduce material.
+    selected_scale = None
+    integrity_scales = (1.0, 0.75, 0.5, 0.25, 0.125, 0.0625, 0.03125)
+    for scale_index, scale_factor in enumerate(integrity_scales, 1):
+        trial = before + candidate_delta * scale_factor
+        integrity = _guided_ridge_mesh_integrity(snapshot, before, trial)
+        if integrity["finite"] and not integrity["normal_pair_flips"] and not integrity["new_degenerate_faces"]:
+            candidate = trial
+            selected_scale = float(scale_factor)
+            break
+        yield {
+            "stage": "checking planing integrity",
+            "stage_index": 8,
+            "stage_count": 10,
+            "done": scale_index,
+            "total": len(integrity_scales),
+        }
+    if selected_scale is None:
+        raise ValueError("surface planing candidate fails mesh integrity")
     return candidate, {
         "length": frame["length"],
         "station": station,
         "boundary_mask": boundary_mask,
+        "crest_side_mask": crest_side_mask,
+        "protrusion_mask": protrusion_mask,
+        "anchor_mask": anchor_mask,
+        "section_anchor_mask": selected_section_anchor_mask,
+        "guide_anchor_mask": guide_anchor_mask,
+        "selected_arc_mask": selected_arc_mask,
+        "outward_component": outward_component,
+        "section_invalid_reasons": invalid_reasons,
         "weight": 0.82 * root_guard * new_tip_guard * boundary_guard * protected_weight,
         "delta_h": np.sum((candidate - before) * height_axis, axis=1),
+        "integrity_scale": selected_scale,
         "boundary_distance_chunk_size": int(boundary_distance_chunk_size),
         "boundary_count": int(boundary_count),
         "vertex_guide_chunk_size": int(chunk_size),
     }
+
+
+def _guided_ridge_arc_candidate_legacy(snapshot, guide, controls, control_normals, prepared_sections=None):
+    """Synchronous compatibility wrapper for Repeat Last and tests."""
+    job = _guided_ridge_arc_candidate_job_legacy(
+        snapshot, guide, controls, control_normals, prepared_sections=prepared_sections
+    )
+    try:
+        while True:
+            next(job)
+    except StopIteration as complete:
+        return complete.value
+
+
+def _guided_ridge_width_limits(snapshot):
+    """Return density-aware, component-safe initial/min/max half widths."""
+    import numpy as np
+
+    points = np.asarray(snapshot.get("coords_world", ()), dtype=np.float64)
+    average_edge = max(float(snapshot.get("average_edge", 0.0) or 0.0), 1.0e-7)
+    if len(points):
+        extent = float(np.linalg.norm(np.ptp(points, axis=0)))
+    else:
+        extent = average_edge
+    minimum = max(average_edge * GUIDED_RIDGE_WIDTH_MIN_EDGE_MULTIPLIER, 1.0e-7)
+    maximum = max(minimum, extent * GUIDED_RIDGE_WIDTH_MAX_EXTENT_FRACTION)
+    initial = min(max(average_edge * GUIDED_RIDGE_WIDTH_EDGE_MULTIPLIER, minimum), maximum)
+    return float(initial), float(minimum), float(maximum), float(average_edge)
+
+
+def _guided_ridge_align_frame_to_controls(frame, controls, control_normals):
+    """Use the clicked outward normals to orient the planing hemisphere."""
+    import numpy as np
+
+    controls_array = np.asarray(controls, dtype=np.float64)
+    normals_array = _guided_ridge_unit_array(np.asarray(control_normals, dtype=np.float64))
+    if len(controls_array) == 0 or len(normals_array) == 0:
+        return frame
+    for index, point in enumerate(frame["guide"]):
+        control_index = int(np.argmin(np.linalg.norm(controls_array - point[None, :], axis=1)))
+        if float(np.dot(frame["normal"][index], normals_array[control_index])) < 0.0:
+            frame["normal"][index] *= -1.0
+    frame["normal"] = _guided_ridge_unit_array(frame["normal"])
+    frame["lateral"] = _guided_ridge_unit_array(np.cross(frame["tangent"], frame["normal"]))
+    frame["normal"] = _guided_ridge_unit_array(np.cross(frame["lateral"], frame["tangent"]))
+    return frame
+
+
+def _guided_ridge_finalize_width_frame(snapshot, frame, controls, control_normals):
+    """Align a generated frame once before any layer/provenance work."""
+    if frame is None:
+        raise ValueError("guide frame is unavailable")
+    frame = _guided_ridge_align_frame_to_controls(frame, controls, control_normals)
+    frame["average_edge"] = float(snapshot.get("average_edge", 0.0) or 0.0)
+    return frame
+
+
+def _guided_ridge_width_frame(snapshot, guide, controls, control_normals):
+    """Build the stable guide frame used by both width rails and candidate."""
+    import numpy as np
+
+    before = np.asarray(snapshot["coords_world"], dtype=np.float64)
+    faces = np.asarray(snapshot["triangles"], dtype=np.int64)
+    frame = _guided_ridge_stable_frame(before, faces, guide, controls, control_normals)
+    return _guided_ridge_finalize_width_frame(
+        snapshot, frame, controls, control_normals
+    )
+
+
+def _guided_ridge_width_cache_key(guide, controls, control_normals):
+    """Stable-frame identity; half-width is deliberately not part of it."""
+    import numpy as np
+
+    def flatten(values):
+        array = np.asarray(values, dtype=np.float64)
+        return tuple(float(value) for value in array.reshape(-1))
+
+    return (flatten(guide), flatten(controls), flatten(control_normals))
+
+
+def _guided_ridge_surface_layer_steps(snapshot, frame):
+    """Build station/side surface provenance once per guide-frame rebuild.
+
+    This cache is intentionally independent of the requested width.  Wheel
+    events can then query only the already selected local layer and never
+    rebuild adjacency/BVH data or fall back to the component-global BVH.
+    """
+    import numpy as np
+
+    points = np.asarray(snapshot.get("coords_world", ()), dtype=np.float64)
+    triangles = np.asarray(snapshot.get("triangles", ()), dtype=np.int64)
+    adjacency = snapshot.get("adjacency")
+    normals_world = np.asarray(snapshot.get("normals_world", ()), dtype=np.float64)
+    average_edge = max(float(snapshot.get("average_edge", 0.0) or 0.0), 1.0e-7)
+    station_count = len(frame.get("guide", ()))
+    empty = {"left": [None] * station_count, "right": [None] * station_count}
+    reasons = {"left": [None] * station_count, "right": [None] * station_count}
+    yield {"stage": "building width surface layers", "stage_index": 10, "stage_count": 12, "done": 0, "total": station_count * 2}
+    if not adjacency or len(adjacency) != len(points):
+        return {"entries": empty, "reasons": reasons, "available": False, "reason": "surface adjacency is unavailable"}
+    try:
+        from mathutils.bvhtree import BVHTree
+    except (ImportError, RuntimeError):
+        return {"entries": empty, "reasons": reasons, "available": False, "reason": "surface BVH is unavailable"}
+    entries = {"left": [], "right": []}
+    processed = 0
+    station_radius = average_edge * 5.0
+    for side, sign in (("left", -1.0), ("right", 1.0)):
+        for station_index, (origin, tangent, lateral, normal) in enumerate(
+            zip(frame["guide"], frame["tangent"], frame["lateral"], frame["normal"])
+        ):
+            offset = points - np.asarray(origin, dtype=np.float64)[None, :]
+            along = np.dot(offset, np.asarray(tangent, dtype=np.float64))
+            q_values = np.dot(offset, np.asarray(lateral, dtype=np.float64))
+            h_values = np.dot(offset, np.asarray(normal, dtype=np.float64))
+            if normals_world.shape == points.shape:
+                alignment = np.dot(normals_world, np.asarray(normal, dtype=np.float64))
+            else:
+                alignment = np.ones(len(points), dtype=np.float64)
+            local_mask = (
+                np.isfinite(along) & np.isfinite(q_values) & np.isfinite(h_values)
+                & (np.abs(along) <= station_radius)
+                & (sign * q_values > max(average_edge * 0.05, 1.0e-7))
+                & (alignment > -0.25)
+            )
+            local_indices = np.flatnonzero(local_mask)
+            entry = None
+            if len(local_indices) >= 3:
+                local_set = set(int(index) for index in local_indices)
+                components = []
+                unseen = set(local_set)
+                while unseen:
+                    seed = unseen.pop()
+                    component = {seed}
+                    queue = [seed]
+                    pop_count = 0
+                    while queue:
+                        current = queue.pop()
+                        pop_count += 1
+                        if pop_count % 256 == 0:
+                            yield {
+                                "stage": "building width surface layers",
+                                "stage_index": 10,
+                                "stage_count": 12,
+                                "done": processed,
+                                "total": station_count * 2,
+                                "indeterminate": True,
+                            }
+                        try:
+                            neighbors = adjacency[current]
+                        except (IndexError, TypeError):
+                            neighbors = ()
+                        for neighbor in neighbors:
+                            neighbor = int(neighbor)
+                            if neighbor in unseen:
+                                unseen.remove(neighbor)
+                                component.add(neighbor)
+                                queue.append(neighbor)
+                    if len(component) >= 3:
+                        values = np.asarray(sorted(component), dtype=np.int64)
+                        radial = np.sqrt(q_values[values] ** 2 + (0.5 * h_values[values]) ** 2)
+                        components.append((float(np.min(radial)), component))
+                if components:
+                    components.sort(key=lambda item: item[0])
+                    if not (
+                        len(components) > 1
+                        and abs(components[1][0] - components[0][0]) <= max(average_edge * 0.25, 1.0e-7)
+                    ):
+                        chosen = set(components[0][1])
+                        bridge_epsilon = max(average_edge * 0.25, 1.0e-7)
+                        for index in range(len(points)):
+                            if abs(float(q_values[index])) > bridge_epsilon:
+                                continue
+                            try:
+                                if any(int(neighbor) in chosen for neighbor in adjacency[index]):
+                                    chosen.add(int(index))
+                            except (IndexError, TypeError):
+                                continue
+                        layer_vertex_list = list(sorted(chosen))
+                        local_vertex_map = {value: index for index, value in enumerate(layer_vertex_list)}
+                        layer_triangle_map = []
+                        local_triangles = []
+                        for triangle_index, triangle in enumerate(triangles):
+                            triangle_values = tuple(int(value) for value in triangle)
+                            if all(value in local_vertex_map for value in triangle_values):
+                                local_triangles.append(tuple(local_vertex_map[value] for value in triangle_values))
+                                layer_triangle_map.append(int(triangle_index))
+                            if triangle_index % 256 == 255:
+                                yield {
+                                    "stage": "building width surface layers",
+                                    "stage_index": 10,
+                                    "stage_count": 12,
+                                    "done": processed,
+                                    "total": station_count * 2,
+                                    "indeterminate": True,
+                                }
+                        if local_triangles:
+                            try:
+                                layer_bvh = BVHTree.FromPolygons(
+                                    points[np.asarray(layer_vertex_list, dtype=np.int64)].tolist(),
+                                    local_triangles,
+                                )
+                                entry = {
+                                    "vertices": frozenset(layer_vertex_list),
+                                    "bvh": layer_bvh,
+                                    "triangle_map": tuple(layer_triangle_map),
+                                }
+                            except (AttributeError, IndexError, MemoryError, RuntimeError, TypeError, ValueError):
+                                entry = None
+                    elif len(components) > 1:
+                        reasons[side][station_index] = "ambiguous local surface layer"
+                elif len(local_indices) >= 3:
+                    reasons[side][station_index] = "local surface layer is unavailable"
+            else:
+                reasons[side][station_index] = "local surface layer is unavailable"
+            entries[side].append(entry)
+            processed += 1
+            yield {
+                "stage": "building width surface layers",
+                "stage_index": 10,
+                "stage_count": 12,
+                "done": processed,
+                "total": station_count * 2,
+            }
+    return {"entries": entries, "reasons": reasons, "available": True, "reason": None}
+
+
+def _guided_ridge_width_prepare_steps(
+    snapshot, frame_job, controls=(), control_normals=()
+):
+    """Cooperatively finish a frame and build its width-independent layers."""
+    try:
+        while True:
+            yield next(frame_job)
+    except StopIteration as complete:
+        frame = complete.value
+    frame = _guided_ridge_finalize_width_frame(
+        snapshot, frame, controls, control_normals
+    )
+    layer_job = _guided_ridge_surface_layer_steps(snapshot, frame)
+    try:
+        while True:
+            yield next(layer_job)
+    except StopIteration as complete:
+        return frame, complete.value
+
+
+def _guided_ridge_width_rails(snapshot, frame, half_width, layer_result=None):
+    """Project both width rails to the captured surface; gaps remain explicit."""
+    import numpy as np
+
+    rails = {"left": [], "right": []}
+    # Keep the complete hit provenance beside the display points.  The
+    # candidate and the preview must share the same projected triangle/edge,
+    # rather than independently choosing a nearest vertex later.
+    rail_hits = {"left": [], "right": []}
+    layer_bvh_cache = {}
+    layer_entries = (layer_result or {}).get("entries", {}) if isinstance(layer_result, dict) else None
+    bvh = snapshot.get("bvh")
+    points = np.asarray(snapshot.get("coords_world", ()), dtype=np.float64)
+    triangles = np.asarray(snapshot.get("triangles", ()), dtype=np.int64)
+    average_edge = max(float(snapshot.get("average_edge", 0.0) or 0.0), 1.0e-7)
+    max_projection_distance = max(average_edge * 8.0, float(half_width) * 0.5)
+
+    def _local_layer_vertices(origin, tangent, lateral, normal, sign):
+        """Choose the locally reachable surface layer for one station/side.
+
+        The captured Face Set can contain nearby sheets that only connect
+        somewhere far away.  Restrict the adjacency walk to a short station
+        neighborhood and select the component closest to the guide; the
+        global BVH is used only after this local topological filter.
+        """
+        adjacency = snapshot.get("adjacency")
+        if not adjacency or len(adjacency) != len(points):
+            return None
+        offset = points - np.asarray(origin, dtype=np.float64)[None, :]
+        along = np.dot(offset, np.asarray(tangent, dtype=np.float64))
+        q_values = np.dot(offset, np.asarray(lateral, dtype=np.float64))
+        h_values = np.dot(offset, np.asarray(normal, dtype=np.float64))
+        normals_world = np.asarray(snapshot.get("normals_world", ()), dtype=np.float64)
+        if normals_world.shape == points.shape:
+            alignment = np.dot(normals_world, np.asarray(normal, dtype=np.float64))
+        else:
+            alignment = np.ones(len(points), dtype=np.float64)
+        station_radius = average_edge * 5.0
+        local_mask = (
+            np.isfinite(along) & np.isfinite(q_values) & np.isfinite(h_values)
+            & (np.abs(along) <= station_radius)
+            & (sign * q_values > max(average_edge * 0.05, 1.0e-7))
+            & (alignment > -0.25)
+        )
+        local_indices = np.flatnonzero(local_mask)
+        if len(local_indices) < 3:
+            return None
+        local_set = set(int(index) for index in local_indices)
+        components = []
+        unseen = set(local_set)
+        while unseen:
+            seed = unseen.pop()
+            component = {seed}
+            queue = [seed]
+            while queue:
+                current = queue.pop()
+                try:
+                    neighbors = adjacency[current]
+                except (IndexError, TypeError):
+                    neighbors = ()
+                for neighbor in neighbors:
+                    neighbor = int(neighbor)
+                    if neighbor in unseen:
+                        unseen.remove(neighbor)
+                        component.add(neighbor)
+                        queue.append(neighbor)
+            if len(component) >= 3:
+                values = np.asarray(sorted(component), dtype=np.int64)
+                radial = np.sqrt(q_values[values] ** 2 + (0.5 * h_values[values]) ** 2)
+                components.append((float(np.min(radial)), component))
+        if not components:
+            return None
+        components.sort(key=lambda item: item[0])
+        if len(components) > 1 and abs(components[1][0] - components[0][0]) <= max(average_edge * 0.25, 1.0e-7):
+            # Two equally close local layers are ambiguous; never choose a
+            # nominal-width hit merely because the other sheet is nearby.
+            return None
+        chosen = set(components[0][1])
+        # Surface triangles at the crest can contain one q≈0 connector
+        # vertex.  Admit only connectors directly adjacent to the selected
+        # side, never an unrelated nearby sheet's crest vertex.
+        bridge_epsilon = max(average_edge * 0.25, 1.0e-7)
+        for index in range(len(points)):
+            index = int(index)
+            if abs(float(q_values[index])) > bridge_epsilon:
+                continue
+            try:
+                if any(int(neighbor) in chosen for neighbor in adjacency[index]):
+                    chosen.add(index)
+            except (IndexError, TypeError):
+                continue
+        return chosen
+
+    def _nearest_surface_rail(origin, tangent, lateral, normal, sign, precomputed_layer=None):
+        """Find the closest same-side rail, tapering when the surface ends."""
+        if bvh is None:
+            return None, None, None, None
+        if precomputed_layer is not None:
+            layer_vertices = precomputed_layer.get("vertices")
+            query_bvh = precomputed_layer.get("bvh")
+            query_triangle_map = precomputed_layer.get("triangle_map")
+            if not layer_vertices or query_bvh is None:
+                return None, None, None, None
+        else:
+            layer_vertices = _local_layer_vertices(origin, tangent, lateral, normal, sign)
+            # A real BVH must never fall back to a global nearest hit when the
+            # local layer is unavailable or ambiguous.  Keep this station as a
+            # visible gap; coverage checks decide whether the candidate can apply.
+            if layer_vertices is None:
+                return None, None, None, None
+            query_bvh = None
+            query_triangle_map = None
+            # Do not ask the component-global BVH for a nominal-width hit and
+            # discard it afterwards: that can hide the valid local layer when
+            # a nearby sheet is closer.  Build a compact BVH from only the
+            # locally connected layer and retain a map back to source faces.
+            layer_key = tuple(sorted(int(value) for value in layer_vertices))
+            cached_layer = layer_bvh_cache.get(layer_key)
+            if cached_layer is None:
+                layer_vertex_list = list(layer_key)
+                local_vertex_map = {value: index for index, value in enumerate(layer_vertex_list)}
+                layer_triangle_map = []
+                local_triangles = []
+                for triangle_index, triangle in enumerate(triangles):
+                    triangle_values = tuple(int(value) for value in triangle)
+                    if all(value in local_vertex_map for value in triangle_values):
+                        local_triangles.append(tuple(local_vertex_map[value] for value in triangle_values))
+                        layer_triangle_map.append(int(triangle_index))
+                if local_triangles:
+                    try:
+                        from mathutils.bvhtree import BVHTree
+                        query_bvh = BVHTree.FromPolygons(
+                            points[np.asarray(layer_vertex_list, dtype=np.int64)].tolist(),
+                            local_triangles,
+                        )
+                    except (AttributeError, IndexError, MemoryError, RuntimeError, TypeError, ValueError):
+                        query_bvh = None
+                else:
+                    query_bvh = None
+                cached_layer = (query_bvh, tuple(layer_triangle_map))
+                layer_bvh_cache[layer_key] = cached_layer
+            query_bvh, query_triangle_map = cached_layer
+            if query_bvh is None:
+                return None, None, None, None
+        best = None
+        # Query the requested maximum first, then move toward the crest.  A
+        # tip that is narrower than the requested width therefore keeps its
+        # actual support surface instead of jumping across the gap to a
+        # nearby sheet.  The score prefers the widest valid same-side hit.
+        for scale in (1.0, 0.92, 0.84, 0.76, 0.68, 0.60, 0.52, 0.44, 0.36, 0.28, 0.20, 0.12):
+            requested = float(half_width) * float(scale)
+            target = Vector(tuple(origin + sign * requested * lateral))
+            try:
+                nearest = query_bvh.find_nearest(target)
+                if not nearest or nearest[0] is None or nearest[3] is None:
+                    continue
+                distance = float(nearest[3])
+                if not math.isfinite(distance) or distance > max_projection_distance:
+                    continue
+                triangle_index = int(nearest[2]) if nearest[2] is not None else -1
+                if query_triangle_map is not None:
+                    if triangle_index < 0 or triangle_index >= len(query_triangle_map):
+                        continue
+                    triangle_index = int(query_triangle_map[triangle_index])
+                location = np.asarray(nearest[0], dtype=np.float64)
+                actual_q = float(np.dot(location - np.asarray(origin, dtype=np.float64), lateral))
+                if not math.isfinite(actual_q) or sign * actual_q <= max(average_edge * 0.05, 1.0e-7):
+                    continue
+                # Overshooting the requested maximum is strongly penalized;
+                # otherwise choose the widest available support on this side.
+                overshoot = max(0.0, sign * actual_q - float(half_width))
+                undershoot = max(0.0, float(half_width) - sign * actual_q)
+                score = overshoot * 1000.0 + undershoot + distance * 0.01
+                candidate = (score, nearest, target, actual_q, triangle_index)
+                if best is None or candidate[0] < best[0]:
+                    best = candidate
+            except (AttributeError, IndexError, RuntimeError, TypeError, ValueError):
+                continue
+        if best is None:
+            return None, None, None, None
+        return best[1], best[2], best[3], best[4]
+
+    for side, sign in (("left", -1.0), ("right", 1.0)):
+        for station_index, (origin, lateral) in enumerate(zip(frame["guide"], frame["lateral"])):
+            target = Vector(tuple(origin + sign * float(half_width) * lateral))
+            try:
+                precomputed_layer = None
+                if layer_entries is not None:
+                    side_entries = layer_entries.get(side, ())
+                    precomputed_layer = side_entries[station_index] if station_index < len(side_entries) else None
+                if layer_entries is not None and precomputed_layer is None:
+                    # ``None`` in a prepared layer table is an explicit local
+                    # gap/invalid station.  Do not reinterpret it as a cold
+                    # cache and rebuild BFS/triangles/BVH during Wheel.
+                    nearest, projected_target, _actual_q, source_triangle_index = (
+                        None, None, None, None
+                    )
+                else:
+                    nearest, projected_target, _actual_q, source_triangle_index = _nearest_surface_rail(
+                        origin,
+                        frame["tangent"][station_index],
+                        lateral,
+                        frame["normal"][station_index],
+                        sign,
+                        precomputed_layer=precomputed_layer if layer_entries is not None else None,
+                    )
+                if projected_target is not None:
+                    target = projected_target
+                if nearest and nearest[0] is not None and float(nearest[3] or 0.0) <= max_projection_distance:
+                    location = Vector(nearest[0])
+                    rails[side].append(location)
+                    triangle_index = int(source_triangle_index) if source_triangle_index is not None else -1
+                    triangle_vertices = ()
+                    barycentric = ()
+                    support_vertices = ()
+                    edge_support_vertices = ()
+                    edge_index = None
+                    if 0 <= triangle_index < len(triangles):
+                        triangle_vertices = tuple(int(value) for value in triangles[triangle_index])
+                        tri_points = points[np.asarray(triangle_vertices, dtype=np.int64)]
+                        edge_a = tri_points[1] - tri_points[0]
+                        edge_b = tri_points[2] - tri_points[0]
+                        offset = np.asarray(location, dtype=np.float64) - tri_points[0]
+                        d00 = float(np.dot(edge_a, edge_a))
+                        d01 = float(np.dot(edge_a, edge_b))
+                        d11 = float(np.dot(edge_b, edge_b))
+                        d20 = float(np.dot(offset, edge_a))
+                        d21 = float(np.dot(offset, edge_b))
+                        denominator = d00 * d11 - d01 * d01
+                        if denominator > 1.0e-20:
+                            bary = (d11 * d20 - d01 * d21) / denominator
+                            bary_c = (d00 * d21 - d01 * d20) / denominator
+                            bary_a = 1.0 - bary - bary_c
+                            barycentric = tuple(float(value) for value in (bary_a, bary, bary_c))
+                            weight_epsilon = 1.0e-6
+                            support_vertices = tuple(
+                                triangle_vertices[index]
+                                for index, value in enumerate(barycentric)
+                                if value > weight_epsilon
+                            )
+                            if len(support_vertices) >= 2:
+                                edge_support_vertices = support_vertices
+                            elif support_vertices:
+                                edge_support_vertices = support_vertices
+                            zero_weights = [
+                                index for index, value in enumerate(barycentric)
+                                if abs(value) <= weight_epsilon
+                            ]
+                            if len(zero_weights) == 1:
+                                edge_index = int(zero_weights[0])
+                    rail_hits[side].append(
+                        {
+                            "location": location.copy(),
+                            "triangle_index": triangle_index,
+                            "triangle_vertices": triangle_vertices,
+                            "barycentric_weights": barycentric,
+                            "edge_index": edge_index,
+                            "support_vertex_indices": support_vertices,
+                            "edge_support_vertex_indices": edge_support_vertices,
+                        }
+                    )
+                elif bvh is None and len(points):
+                    distance = np.linalg.norm(points - np.asarray(target, dtype=np.float64)[None, :], axis=1)
+                    index = int(np.argmin(distance))
+                    if float(distance[index]) <= max_projection_distance:
+                        location = Vector(tuple(points[index]))
+                        rails[side].append(location)
+                        rail_hits[side].append(
+                            {
+                                "location": location.copy(),
+                                "triangle_index": -1,
+                                "triangle_vertices": (int(index),),
+                                "barycentric_weights": (1.0,),
+                                "edge_index": None,
+                                "support_vertex_indices": (int(index),),
+                                "edge_support_vertex_indices": (int(index),),
+                            }
+                        )
+                    else:
+                        rails[side].append(None)
+                        rail_hits[side].append(None)
+                else:
+                    rails[side].append(None)
+                    rail_hits[side].append(None)
+            except (AttributeError, IndexError, RuntimeError, TypeError, ValueError):
+                rails[side].append(None)
+                rail_hits[side].append(None)
+    rails["hits"] = rail_hits
+    return rails
+
+
+def _guided_ridge_width_anchor_data(snapshot, frame, width, rails):
+    """Derive anchor heights/support vertices once from the shared rails."""
+    import numpy as np
+
+    points = np.asarray(snapshot.get("coords_world", ()), dtype=np.float64)
+    triangles = np.asarray(snapshot.get("triangles", ()), dtype=np.int64)
+    average_edge = max(float(snapshot.get("average_edge", 0.0) or 0.0), 1.0e-7)
+    support_indices = {"left": [], "right": []}
+    support_vertex_indices = {"left": [], "right": []}
+    anchor_heights = {
+        "left": np.full(len(frame["guide"]), np.nan, dtype=np.float64),
+        "right": np.full(len(frame["guide"]), np.nan, dtype=np.float64),
+    }
+    anchor_lateral = {
+        "left": np.full(len(frame["guide"]), np.nan, dtype=np.float64),
+        "right": np.full(len(frame["guide"]), np.nan, dtype=np.float64),
+    }
+    support_mask = np.zeros(len(points), dtype=bool)
+    rail_hits = rails.get("hits", {}) if isinstance(rails, dict) else {}
+    rail_hit_ok = True
+    for side in ("left", "right"):
+        for index, point in enumerate(rails.get(side, ())):
+            if point is None:
+                support_indices[side].append(None)
+                support_vertex_indices[side].append(())
+                continue
+            point_array = np.asarray(point, dtype=np.float64)
+            hit = rail_hits.get(side, ())[index] if index < len(rail_hits.get(side, ())) else None
+            if snapshot.get("bvh") is not None and (
+                not hit
+                or int((hit or {}).get("triangle_index", -1)) < 0
+                or not (hit or {}).get("barycentric_weights")
+                or not (hit or {}).get("support_vertex_indices")
+            ):
+                rail_hit_ok = False
+            support_values = tuple(int(value) for value in (hit or {}).get("support_vertex_indices", ()))
+            support_vertex_indices[side].append(support_values)
+            for support_index in support_values:
+                if 0 <= support_index < len(support_mask):
+                    support_mask[support_index] = True
+            # Preserve the old one-index summary for compatibility, while the
+            # actual fixed mask uses every triangle/edge support vertex above.
+            support_indices[side].append(support_values[0] if support_values else None)
+            origin = np.asarray(frame["guide"][index], dtype=np.float64)
+            normal = np.asarray(frame["normal"][index], dtype=np.float64)
+            lateral = np.asarray(frame["lateral"][index], dtype=np.float64)
+            anchor_heights[side][index] = float(np.dot(point_array - origin, normal))
+            anchor_lateral[side][index] = float(np.dot(point_array - origin, lateral))
+    projection_ok = all(
+        point is not None and math.isfinite(float(anchor_heights[side][index]))
+        for side in ("left", "right")
+        for index, point in enumerate(rails.get(side, ()))
+    )
+    if not projection_ok:
+        for side in ("left", "right"):
+            values = anchor_heights[side]
+            valid = np.flatnonzero(np.isfinite(values))
+            if len(valid) >= 2:
+                values[:] = np.interp(np.arange(len(values)), valid, values[valid])
+    return {
+        "rail_supports": support_indices,
+        "rail_support_vertex_indices": support_vertex_indices,
+        "rail_hits": rail_hits,
+        "rail_anchor_height": anchor_heights,
+        "rail_anchor_lateral": anchor_lateral,
+        "anchor_vertex_indices": np.flatnonzero(support_mask).astype(np.int64),
+        "anchor_projection_ok": bool(projection_ok),
+        "rail_hit_ok": bool(rail_hit_ok),
+    }
+
+
+def _guided_ridge_width_frame_result(
+    snapshot, guide, controls, control_normals, half_width, frame=None, layer_result=None
+):
+    """Shared frame/width/rail result used by preview, apply and Repeat Last."""
+    initial, minimum, maximum, _average_edge = _guided_ridge_width_limits(snapshot)
+    width = initial if half_width is None else float(half_width)
+    if not math.isfinite(width):
+        raise ValueError("planing width is not finite")
+    width = min(max(width, minimum), maximum)
+    if frame is None:
+        frame = _guided_ridge_width_frame(snapshot, guide, controls, control_normals)
+    if layer_result is None and snapshot.get("bvh") is not None:
+        layer_job = _guided_ridge_surface_layer_steps(snapshot, frame)
+        try:
+            while True:
+                next(layer_job)
+        except StopIteration as complete:
+            layer_result = complete.value
+    rails = _guided_ridge_width_rails(snapshot, frame, width, layer_result=layer_result)
+    anchor_data = _guided_ridge_width_anchor_data(snapshot, frame, width, rails)
+    bvh = snapshot.get("bvh")
+    projection_required = bvh is not None
+    projection_ok = (
+        not projection_required
+        or all(point is not None for side in ("left", "right") for point in rails[side])
+    )
+    return {
+        "frame": frame,
+        "width": float(width),
+        "width_min": float(minimum),
+        "width_max": float(maximum),
+        "rails": rails,
+        "layer_result": layer_result,
+        "projection_required": bool(projection_required),
+        "projection_ok": bool(projection_ok),
+        "anchor_projection_ok": bool(anchor_data["anchor_projection_ok"]),
+        "rail_hit_ok": bool(anchor_data["rail_hit_ok"]),
+        "rail_supports": anchor_data["rail_supports"],
+        "rail_support_vertex_indices": anchor_data["rail_support_vertex_indices"],
+        "rail_hits": anchor_data["rail_hits"],
+        "rail_anchor_height": anchor_data["rail_anchor_height"],
+        "rail_anchor_lateral": anchor_data["rail_anchor_lateral"],
+        "anchor_vertex_indices": anchor_data["anchor_vertex_indices"],
+        "anchor_band": min(
+            max(width * GUIDED_RIDGE_WIDTH_ANCHOR_BAND_FRACTION, _average_edge * 0.5),
+            max(width - min(max(width * GUIDED_RIDGE_WIDTH_GUIDE_BAND_FRACTION, _average_edge * 0.25), width * 0.22) - width * 0.05, width * 0.05),
+        ),
+        "guide_band": min(
+            max(width * GUIDED_RIDGE_WIDTH_GUIDE_BAND_FRACTION, _average_edge * 0.25),
+            width * 0.22,
+        ),
+        "cache_key": _guided_ridge_width_cache_key(guide, controls, control_normals),
+    }
+
+
+def _guided_ridge_interpolate_vertex_frame(frame, seg_index, seg_t):
+    """Interpolate frame vectors on the captured guide segment parameter."""
+    import numpy as np
+
+    i0 = np.asarray(seg_index, dtype=np.int64)
+    i1 = np.minimum(i0 + 1, len(frame["arc"]) - 1)
+    blend = np.asarray(seg_t, dtype=np.float64)
+    tangent = _guided_ridge_unit_array(
+        (1.0 - blend)[:, None] * frame["tangent"][i0]
+        + blend[:, None] * frame["tangent"][i1]
+    )
+    lateral = _guided_ridge_unit_array(
+        (1.0 - blend)[:, None] * frame["lateral"][i0]
+        + blend[:, None] * frame["lateral"][i1]
+    )
+    height_axis = _guided_ridge_unit_array(
+        (1.0 - blend)[:, None] * frame["normal"][i0]
+        + blend[:, None] * frame["normal"][i1]
+    )
+    lateral -= np.sum(lateral * tangent, axis=1, keepdims=True) * tangent
+    lateral = _guided_ridge_unit_array(lateral)
+    height_axis -= np.sum(height_axis * tangent, axis=1, keepdims=True) * tangent
+    height_axis = _guided_ridge_unit_array(height_axis)
+    return tangent, lateral, height_axis
+
+
+def _guided_ridge_update_width_preview(state):
+    """Refresh width limits and projected rails without touching mesh data."""
+    snapshot = state.get("snapshot") if state else None
+    guide = state.get("guide") if state else None
+    if snapshot is None or "coords_world" not in snapshot or "triangles" not in snapshot:
+        return False
+    initial, minimum, maximum, _average_edge = _guided_ridge_width_limits(snapshot)
+    width = float(state.get("half_width", initial) or initial)
+    state["width_min"] = minimum
+    state["width_max"] = maximum
+    state["half_width"] = min(max(width, minimum), maximum)
+    if not guide or len(guide) < 2:
+        state["width_frame"] = None
+        state["width_rails"] = {"left": [], "right": []}
+        state["width_frame_result"] = None
+        return True
+    controls = state.get("controls", ())
+    control_normals = state.get("control_normals", ())
+    cache_key = _guided_ridge_width_cache_key(guide, controls, control_normals)
+    result = state.get("width_frame_result")
+    if result is None or result.get("cache_key") != cache_key:
+        result = _guided_ridge_width_frame_result(
+            snapshot, guide, controls, control_normals, state["half_width"]
+        )
+    else:
+        result = dict(result)
+        result["width"] = float(state["half_width"])
+        if result.get("layer_result") is None and snapshot.get("bvh") is not None:
+            layer_job = _guided_ridge_surface_layer_steps(snapshot, result["frame"])
+            try:
+                while True:
+                    next(layer_job)
+            except StopIteration as complete:
+                result["layer_result"] = complete.value
+        result["rails"] = _guided_ridge_width_rails(
+            snapshot,
+            result["frame"],
+            result["width"],
+            layer_result=result.get("layer_result"),
+        )
+        result.update(
+            _guided_ridge_width_anchor_data(
+                snapshot, result["frame"], result["width"], result["rails"]
+            )
+        )
+        bvh = snapshot.get("bvh")
+        result["projection_ok"] = (
+            bvh is None
+            or all(point is not None for side in ("left", "right") for point in result["rails"][side])
+        )
+    state["half_width"] = result["width"]
+    state["width_frame_result"] = result
+    state["width_frame"] = result["frame"]
+    state["width_rails"] = result["rails"]
+    state["width_cache_serial"] = int(state.get("width_cache_serial", 0)) + 1
+    return True
+
+
+def _guided_ridge_begin_width_frame_rebuild(context, state):
+    """Start a cooperative frame rebuild after a guide edit.
+
+    Width-only edits intentionally stay on the cached frame path above.  A
+    changed guide, however, invalidates every frame vector and must not spend
+    an unbounded synchronous interval inside the LMB handler.
+    """
+    if state is None or state.get("phase") != "ready":
+        return False
+    snapshot = state.get("snapshot") or {}
+    guide = state.get("guide") or ()
+    if len(guide) < 2:
+        return _guided_ridge_update_width_preview(state)
+    try:
+        import numpy as np
+
+        before = np.asarray(snapshot["coords_world"], dtype=np.float64)
+        faces = np.asarray(snapshot["triangles"], dtype=np.int64)
+        state["phase"] = "width_prepare"
+        stable_frame_job = _guided_ridge_stable_frame_steps(
+            before, faces, guide, state.get("controls", ()), state.get("control_normals", ())
+        )
+        state["width_frame_job"] = _guided_ridge_width_prepare_steps(
+            snapshot,
+            stable_frame_job,
+            state.get("controls", ()),
+            state.get("control_normals", ()),
+        )
+        state["width_frame_stage"] = "queued"
+        state["width_frame_stage_index"] = 0
+        state["width_frame_stage_count"] = 12
+        state["width_frame_stage_done"] = 0
+        state["width_frame_stage_total"] = 0
+        state["width_frame_progress_fraction"] = None
+        state["width_frame_progress_indeterminate"] = True
+        state["width_frame_elapsed_seconds"] = 0.0
+        state["width_frame_last_slice_seconds"] = 0.0
+        state["width_frame_max_slice_seconds"] = 0.0
+        state["width_frame_result"] = None
+        state["width_frame"] = None
+        state["width_rails"] = {"left": [], "right": []}
+        if state.get("timer") is None:
+            state["timer"] = context.window_manager.event_timer_add(
+                0.01, window=context.window
+            )
+        _guided_ridge_overlay_tag(state)
+        return True
+    except (AttributeError, IndexError, KeyError, MemoryError, RuntimeError, TypeError, ValueError):
+        state["phase"] = "ready"
+        state["width_frame_job"] = None
+        return False
+
+
+def _guided_ridge_process_width_frame_timer(context, state):
+    """Advance one bounded frame rebuild slice and return to Ready."""
+    if state is None or not state.get("active") or state.get("phase") != "width_prepare":
+        return False
+    operator = state.get("operator")
+    if not _guided_ridge_context_matches(context, state):
+        if operator is not None:
+            operator.report({"WARNING"}, "Guided Ridge: guide-frame context changed; no changes applied")
+        _guided_ridge_cancel(state, "width-frame-context-changed")
+        return False
+    started = time.perf_counter()
+    try:
+        progress = None
+        deadline = started + 0.008
+        while True:
+            progress = next(state["width_frame_job"])
+            if isinstance(progress, dict):
+                stage = str(progress.get("stage", "building guide frame"))
+                if stage != state.get("width_frame_stage"):
+                    break
+            if time.perf_counter() >= deadline:
+                break
+    except StopIteration as complete:
+        try:
+            prepared = complete.value
+            if not prepared or len(prepared) != 2:
+                raise ValueError("guide frame is unavailable")
+            frame, layer_result = prepared
+            result = _guided_ridge_width_frame_result(
+                state["snapshot"],
+                state["guide"],
+                state.get("controls", ()),
+                state.get("control_normals", ()),
+                state.get("half_width"),
+                frame=frame,
+                layer_result=layer_result,
+            )
+            state["width_frame_job"] = None
+            state["width_frame_result"] = result
+            state["width_frame"] = result["frame"]
+            state["width_rails"] = result["rails"]
+            state["half_width"] = result["width"]
+            state["width_min"] = result["width_min"]
+            state["width_max"] = result["width_max"]
+            state["phase"] = "ready"
+            state["width_frame_stage"] = "ready"
+            state["width_frame_stage_done"] = 1
+            state["width_frame_stage_total"] = 1
+            state["width_frame_progress_fraction"] = 1.0
+            state["width_frame_progress_indeterminate"] = False
+            timer = state.get("timer")
+            if timer is not None:
+                try:
+                    state["window_manager"].event_timer_remove(timer)
+                except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+                    pass
+                state["timer"] = None
+            _guided_ridge_overlay_tag(state)
+        except (AttributeError, IndexError, MemoryError, RuntimeError, TypeError, ValueError) as error:
+            if operator is not None:
+                operator.report({"WARNING"}, f"Guided Ridge: guide frame failed ({error})")
+            _guided_ridge_cancel(state, "width-frame-failed")
+            return False
+    except (AttributeError, IndexError, MemoryError, RuntimeError, TypeError, ValueError) as error:
+        if operator is not None:
+            operator.report({"WARNING"}, f"Guided Ridge: guide frame failed ({error})")
+        _guided_ridge_cancel(state, "width-frame-exception")
+        return False
+    else:
+        if isinstance(progress, dict):
+            stage = str(progress.get("stage", "building guide frame"))
+            state["width_frame_stage"] = stage
+            state["width_frame_stage_index"] = int(progress.get("stage_index", 0))
+            state["width_frame_stage_count"] = int(progress.get("stage_count", 11))
+            state["width_frame_stage_done"] = int(progress.get("done", 0))
+            state["width_frame_stage_total"] = int(progress.get("total", 0))
+            state["width_frame_progress_indeterminate"] = bool(progress.get("indeterminate", False))
+            total = int(progress.get("total", 0))
+            done = int(progress.get("done", 0))
+            state["width_frame_progress_fraction"] = (
+                min(max(done / float(total), 0.0), 1.0) if total > 0 else None
+            )
+            _guided_ridge_overlay_tag(state)
+    finally:
+        elapsed = time.perf_counter() - started
+        state["width_frame_last_slice_seconds"] = float(elapsed)
+        state["width_frame_max_slice_seconds"] = max(
+            float(state.get("width_frame_max_slice_seconds", 0.0)), float(elapsed)
+        )
+        state["width_frame_elapsed_seconds"] = float(
+            state.get("width_frame_elapsed_seconds", 0.0)
+        ) + float(elapsed)
+    return True
+
+
+def _guided_ridge_width_adjacency_steps(snapshot):
+    """Build adjacency chunks without an unbounded native concatenate."""
+    import numpy as np
+
+    adjacency = snapshot.get("adjacency", ())
+    source_parts = []
+    target_parts = []
+    # Four source vertices keeps each concatenate/reduction bounded on the
+    # large Hair component; the extra yields are preferable to a >16 ms UI
+    # stall from one broad adjacency batch.
+    chunk = 4
+    total = int(math.ceil(len(adjacency) / float(chunk))) if adjacency else 0
+    for start in range(0, len(adjacency), chunk):
+        stop = min(start + chunk, len(adjacency))
+        local = adjacency[start:stop]
+        targets = [np.asarray(values, dtype=np.int64) for values in local if values]
+        if targets:
+            target_parts.append(np.concatenate(targets))
+            source_parts.append(
+                np.repeat(
+                    np.arange(start, stop, dtype=np.int64),
+                    np.asarray([len(values) for values in local], dtype=np.int64),
+                )
+            )
+        yield {
+            "stage": "preparing width smoothing",
+            "stage_index": 7,
+            "stage_count": 10,
+            "done": int(stop // max(chunk, 1)),
+            "total": total,
+        }
+    return source_parts, target_parts, np.asarray([len(values) for values in adjacency], dtype=np.float64)
+
+
+def _guided_ridge_width_candidate_steps(
+    snapshot, guide, controls, control_normals, half_width=None, width_result=None
+):
+    """Cooperatively compute a fixed-width, crest-side planing candidate."""
+    yield {
+        "stage": "queueing width candidate",
+        "stage_index": 0,
+        "stage_count": 10,
+        "done": 0,
+        "total": 0,
+        "indeterminate": True,
+    }
+    import numpy as np
+
+    before = np.asarray(snapshot["coords_world"], dtype=np.float64)
+    faces = np.asarray(snapshot["triangles"], dtype=np.int64)
+    if width_result is None:
+        frame_job = _guided_ridge_stable_frame_steps(before, faces, guide, controls, control_normals)
+        try:
+            while True:
+                yield next(frame_job)
+        except StopIteration as complete:
+            frame = complete.value
+        frame = _guided_ridge_align_frame_to_controls(frame, controls, control_normals)
+        frame["average_edge"] = float(snapshot.get("average_edge", 0.0) or 0.0)
+        width_result = _guided_ridge_width_frame_result(
+            snapshot, guide, controls, control_normals, half_width, frame=frame
+        )
+    frame = width_result["frame"]
+    width = float(width_result["width"])
+    minimum_width = float(width_result["width_min"])
+    maximum_width = float(width_result["width_max"])
+    average_edge = float(snapshot.get("average_edge", 0.0) or 0.0)
+    if width_result.get("projection_required") and not width_result.get("projection_ok"):
+        layer_result = width_result.get("layer_result") or {}
+        reasons = layer_result.get("reasons", {}) if isinstance(layer_result, dict) else {}
+        reason_values = [
+            str(reason)
+            for values in reasons.values()
+            for reason in (values or ())
+            if reason
+        ]
+        detail = reason_values[0] if reason_values else "local surface gap"
+        raise ValueError(f"planing width rail projection is incomplete ({detail})")
+    if not width_result.get("anchor_projection_ok", True):
+        raise ValueError("planing width rail anchor support is incomplete")
+    if not width_result.get("rail_hit_ok", True):
+        raise ValueError("planing width rail triangle support is unavailable")
+    boundary_vertices, _boundary_edges = _guided_ridge_boundary_local_data(snapshot, len(before))
+    boundary_mask = np.zeros(len(before), dtype=bool)
+    boundary_mask[boundary_vertices] = True
+    segment = np.diff(frame["guide"], axis=0)
+    length2 = np.sum(segment * segment, axis=1)
+    if not np.all(np.isfinite(length2)) or np.any(length2 <= 1.0e-16):
+        raise ValueError("guide contains a degenerate segment")
+    segment_length = np.sqrt(length2)
+    guide_arc = np.r_[0.0, np.cumsum(segment_length)]
+    length = float(guide_arc[-1])
+    if length <= 1.0e-9:
+        raise ValueError("guide length is unavailable")
+    seg_index = np.empty(len(before), dtype=np.int32)
+    seg_t = np.empty(len(before), dtype=np.float64)
+    project_chunk = 128
+    project_total = int(math.ceil(len(before) / float(project_chunk)))
+    for start in range(0, len(before), project_chunk):
+        stop = min(start + project_chunk, len(before))
+        block = before[start:stop, None, :] - frame["guide"][:-1][None, :, :]
+        parameter = np.clip(np.sum(block * segment[None, :, :], axis=2) / length2[None, :], 0.0, 1.0)
+        distance2 = np.sum((block - parameter[:, :, None] * segment[None, :, :]) ** 2, axis=2)
+        seg_index[start:stop] = np.argmin(distance2, axis=1)
+        seg_t[start:stop] = parameter[np.arange(stop - start), seg_index[start:stop]]
+        yield {
+            "stage": "projecting vertices to width frame",
+            "stage_index": 2,
+            "stage_count": 10,
+            "done": int(stop // max(project_chunk, 1)),
+            "total": project_total,
+        }
+    origin = frame["guide"][seg_index] + seg_t[:, None] * segment[seg_index]
+    station = guide_arc[seg_index] + seg_t * (guide_arc[seg_index + 1] - guide_arc[seg_index])
+    # ``seg_index``/``seg_t`` are already measured on the non-uniform guide
+    # segments.  Do not remap station through a uniform sample index: that
+    # changes the frame on curved guides whose points are unevenly spaced.
+    tangent, lateral, height_axis = _guided_ridge_interpolate_vertex_frame(
+        frame, seg_index, seg_t
+    )
+    surface_normals = np.asarray(snapshot.get("normals_world", ()), dtype=np.float64)
+    if surface_normals.shape != before.shape:
+        raise ValueError("surface normals are unavailable for planing direction")
+    normal_alignment = np.sum(surface_normals * height_axis, axis=1)
+    normal_epsilon = 0.05
+    q = np.sum((before - origin) * lateral, axis=1)
+    h = np.sum((before - origin) * height_axis, axis=1)
+    rail_anchor_lateral = width_result.get("rail_anchor_lateral") or {}
+    left_rail_q_values = np.asarray(rail_anchor_lateral.get("left", ()), dtype=np.float64)
+    right_rail_q_values = np.asarray(rail_anchor_lateral.get("right", ()), dtype=np.float64)
+    if len(left_rail_q_values) != len(frame["arc"]) or len(right_rail_q_values) != len(frame["arc"]):
+        raise ValueError("planing width rail lateral supports are unavailable")
+    if not np.all(np.isfinite(left_rail_q_values)) or not np.all(np.isfinite(right_rail_q_values)):
+        raise ValueError("planing width rail lateral supports are non-finite")
+    left_rail_q = np.interp(station, frame["arc"], left_rail_q_values)
+    right_rail_q = np.interp(station, frame["arc"], right_rail_q_values)
+    rail_q_epsilon = max(average_edge * 0.05, width * 0.001, 1.0e-7)
+    if (
+        np.any(left_rail_q >= -rail_q_epsilon)
+        or np.any(right_rail_q <= rail_q_epsilon)
+        or np.any(left_rail_q >= right_rail_q - rail_q_epsilon)
+    ):
+        raise ValueError("planing width rail lateral supports are degenerate")
+    hidden_vertices = np.asarray(snapshot.get("hidden_vertices", np.zeros(len(before), dtype=bool)), dtype=bool)
+    sculpt_mask = np.clip(
+        np.asarray(snapshot.get("sculpt_mask", np.zeros(len(before), dtype=np.float64)), dtype=np.float64),
+        0.0,
+        1.0,
+    )
+    if len(hidden_vertices) != len(before) or len(sculpt_mask) != len(before):
+        raise ValueError("protected Sculpt state does not match the component")
+    normal_extent = np.abs(q[normal_alignment > normal_epsilon])
+    if len(normal_extent) == 0 or float(np.max(normal_extent)) <= 1.0e-8:
+        raise ValueError("planing width has no stable lateral surface extent")
+    q_epsilon = max(average_edge * 0.35, width * 0.01, 1.0e-7)
+    eligible = (
+        np.isfinite(q)
+        & np.isfinite(h)
+        & (q >= left_rail_q - q_epsilon)
+        & (q <= right_rail_q + q_epsilon)
+        & (normal_alignment > normal_epsilon)
+        & (station >= 0.0)
+        & (station <= length)
+        & ~hidden_vertices
+    )
+    if int(np.count_nonzero(eligible)) < 8:
+        raise ValueError("planing width has too few eligible surface samples")
+    # Keep enough longitudinal bins to distinguish a curved/anisotropic guide
+    # from a broad first bin.  The previous edge-size-only lower bound merged
+    # most of the Hair component into one station and made legitimate anchor
+    # heights look like an ambiguous sheet.
+    station_bins = min(64, max(16, int(math.ceil(length / max(average_edge * 4.0, 1.0e-7)))))
+    station_bins = min(station_bins, max(16, len(before)))
+    bin_index = np.clip((station / length * station_bins).astype(np.int64), 0, station_bins - 1)
+    # A width/normal test alone can select two nearby, similarly oriented
+    # sheets.  Group samples by station and a narrow lateral bin, then reject
+    # a resolvable height split instead of averaging the layers together.
+    lateral_bin_width = max(width / 8.0, average_edge * 2.0, 1.0e-8)
+    lateral_bin = np.floor((q + width) / lateral_bin_width).astype(np.int64)
+    competing_keys = np.stack((bin_index[eligible], lateral_bin[eligible]), axis=1)
+    competing_values = h[eligible]
+    competing_indices = np.flatnonzero(eligible)
+    if len(competing_values):
+        order = np.lexsort((competing_keys[:, 1], competing_keys[:, 0]))
+        sorted_keys = competing_keys[order]
+        sorted_values = competing_values[order]
+        sorted_indices = competing_indices[order]
+        run_start = 0
+        while run_start < len(sorted_values):
+            run_end = run_start + 1
+            while run_end < len(sorted_values) and np.array_equal(sorted_keys[run_end], sorted_keys[run_start]):
+                run_end += 1
+            run_values = sorted_values[run_start:run_end]
+            run_indices = sorted_indices[run_start:run_end]
+            height_order = np.argsort(run_values, kind="stable")
+            values = run_values[height_order]
+            paired_indices = run_indices[height_order]
+            if len(values) >= 2:
+                gaps = np.diff(values)
+                split = int(np.argmax(gaps))
+                gap = float(gaps[split]) if len(gaps) else 0.0
+                layer_gap_epsilon = max(average_edge * 2.0, width * 0.08, 1.0e-8)
+                if gap > layer_gap_epsilon and gap <= width * 1.25:
+                    low = set(int(value) for value in paired_indices[: split + 1])
+                    high = set(int(value) for value in paired_indices[split + 1:])
+                    adjacency = snapshot.get("adjacency", ())
+                    station_key, lateral_key = (int(value) for value in sorted_keys[run_start])
+                    local_candidates = np.flatnonzero(
+                        eligible
+                        & (np.abs(bin_index - station_key) <= 1)
+                        & (np.abs(lateral_bin - lateral_key) <= 1)
+                    )
+                    local_set = set(int(value) for value in local_candidates)
+                    frontier = list(low & local_set)
+                    visited = set(frontier)
+                    while frontier:
+                        index = frontier.pop()
+                        if index in high:
+                            break
+                        if 0 <= index < len(adjacency):
+                            for neighbor in adjacency[index]:
+                                neighbor = int(neighbor)
+                                if neighbor in local_set and neighbor not in visited:
+                                    visited.add(neighbor)
+                                    frontier.append(neighbor)
+                    connected = bool(visited & high)
+                    if not connected:
+                        raise ValueError(
+                            f"planing width has competing surface layers at the same station "
+                            f"(gap={gap:.6g}, samples={len(values)})"
+                        )
+            run_start = run_end
+    bin_centers = (np.arange(station_bins, dtype=np.float64) + 0.5) * length / station_bins
+    anchor_band = float(width_result.get("anchor_band", width * GUIDED_RIDGE_WIDTH_ANCHOR_BAND_FRACTION))
+    guide_band = float(width_result.get("guide_band", width * GUIDED_RIDGE_WIDTH_GUIDE_BAND_FRACTION))
+    anchor_masks = [
+        eligible & (np.abs(q - left_rail_q) <= anchor_band),
+        eligible & (np.abs(q - right_rail_q) <= anchor_band),
+    ]
+    anchor_mask = anchor_masks[0] | anchor_masks[1]
+    # Rebuild this mask from the immutable rail provenance as well as the
+    # compatibility summary.  The latter can be stale after a cached width
+    # refresh; every barycentric triangle/edge support vertex must remain
+    # fixed through smoothing, partial-mask falloff, and the final write.
+    support_mask = _guided_ridge_width_support_mask(width_result, len(before))
+    for support_index in np.asarray(width_result.get("anchor_vertex_indices", ()), dtype=np.int64):
+        if 0 <= int(support_index) < len(support_mask):
+            support_mask[int(support_index)] = True
+    anchor_mask |= support_mask
+    rail_anchor_height = width_result.get("rail_anchor_height") or {}
+    left_anchor_values = np.asarray(rail_anchor_height.get("left", ()), dtype=np.float64)
+    right_anchor_values = np.asarray(rail_anchor_height.get("right", ()), dtype=np.float64)
+    if len(left_anchor_values) != len(frame["arc"]) or len(right_anchor_values) != len(frame["arc"]):
+        raise ValueError("planing width rail anchor heights are unavailable")
+    left_h = np.interp(station, frame["arc"], left_anchor_values)
+    right_h = np.interp(station, frame["arc"], right_anchor_values)
+    # Use the actual projected rail q values as the plane endpoints.  The
+    # nominal UI width is only the request used to find the rail; it is not a
+    # valid denominator when the surface projection lands short or long.
+    target_h = np.where(
+        q <= 0.0,
+        (q / left_rail_q) * left_h,
+        (q / right_rail_q) * right_h,
+    )
+    guide_anchor_mask = np.abs(q) <= guide_band
+    crest_side_mask = eligible
+    yield {"stage": "preparing width smoothing", "stage_index": 7, "stage_count": 10, "done": 0, "total": 4}
+    boundary_distance_job = _guided_ridge_bounded_boundary_distance_steps(before, boundary_mask)
+    try:
+        while True:
+            yield next(boundary_distance_job)
+    except StopIteration as complete:
+        boundary_distance, boundary_chunk_size, boundary_count = complete.value
+    boundary_width = max(width * 0.12, average_edge * 2.0, 1.0e-7)
+    boundary_guard = np.empty(len(boundary_distance), dtype=np.float64)
+    falloff_chunk = 128
+    falloff_total = int(math.ceil(len(boundary_distance) / float(falloff_chunk)))
+    for start in range(0, len(boundary_distance), falloff_chunk):
+        stop = min(start + falloff_chunk, len(boundary_distance))
+        boundary_guard[start:stop] = [
+            _guided_ridge_smoothstep(value / boundary_width)
+            for value in boundary_distance[start:stop]
+        ]
+        yield {
+            "stage": "building width boundary falloff",
+            "stage_index": 5,
+            "stage_count": 10,
+            "done": int(stop // max(falloff_chunk, 1)),
+            "total": falloff_total,
+        }
+    # Give the UI a turn before the final vectorized classification and
+    # smoothing setup, which is larger than the subsequent per-chunk yields
+    # on dense components.
+    yield {"stage": "preparing width smoothing", "stage_index": 7, "stage_count": 10, "done": 0, "total": 2}
+    root_fade = max(0.13 * length, 1.0e-7)
+    root_guard = np.asarray([_guided_ridge_smoothstep(value / root_fade) for value in station], dtype=np.float64)
+    tip_fade = max(0.003 / 0.07595313195548941 * length, 1.0e-9)
+    tip_guard = np.asarray([
+        _guided_ridge_smoothstep((length - tip_fade - value) / tip_fade) for value in station
+    ], dtype=np.float64)
+    protected_weight = np.clip(1.0 - sculpt_mask, 0.0, 1.0)
+    protected_weight[hidden_vertices] = 0.0
+    protected_weight[boundary_mask] = 0.0
+    anchored = boundary_mask | guide_anchor_mask | anchor_mask
+    yield {"stage": "preparing width smoothing", "stage_index": 7, "stage_count": 10, "done": 0, "total": 3}
+    yield {"stage": "preparing width smoothing", "stage_index": 7, "stage_count": 10, "done": 1, "total": 4}
+    planing_delta = target_h - h
+    planing_delta[(planing_delta * normal_alignment) > 0.0] = 0.0
+    planing_delta[normal_alignment <= normal_epsilon] = 0.0
+    protrusion_mask = crest_side_mask & (planing_delta * normal_alignment < -1.0e-12)
+    planing_delta[~protrusion_mask] = 0.0
+    safe_low = np.minimum(planing_delta, 0.0)
+    yield {"stage": "preparing width smoothing", "stage_index": 7, "stage_count": 10, "done": 0, "total": 1}
+    adjacency_job = _guided_ridge_width_adjacency_steps(snapshot)
+    try:
+        while True:
+            yield next(adjacency_job)
+    except StopIteration as complete:
+        adjacency_source_parts, adjacency_target_parts, adjacency_count = complete.value
+    def apply_steps(weight):
+        delta = planing_delta * (0.82 * weight)
+        delta[~protrusion_mask] = 0.0
+        yield {
+            "stage": "building width planing delta",
+            "stage_index": 8,
+            "done": 0,
+            "total": 4,
+        }
+        for iteration in range(2):
+            relaxed = delta.copy()
+            neighbor_sum = np.zeros(len(delta), dtype=np.float64)
+            for part_index, (source_part, target_part) in enumerate(
+                zip(adjacency_source_parts, adjacency_target_parts), 1
+            ):
+                np.add.at(neighbor_sum, source_part, delta[target_part])
+                if part_index % 256 == 0:
+                    yield {
+                        "stage": "building width planing delta",
+                        "stage_index": 8,
+                        "done": 1 + iteration,
+                        "total": 4,
+                    }
+            movable = (adjacency_count > 0.0) & ~anchored & protrusion_mask
+            relaxed[movable] = 0.72 * delta[movable] + 0.28 * neighbor_sum[movable] / adjacency_count[movable]
+            relaxed[~protrusion_mask] = 0.0
+            relaxed[anchored] = 0.0
+            relaxed = np.clip(relaxed, safe_low, 0.0)
+            delta = relaxed
+        delta[(delta * normal_alignment) > 0.0] = 0.0
+        delta[~protrusion_mask] = 0.0
+        return np.clip(delta, safe_low, 0.0)
+    yield {"stage": "building width planing delta", "stage_index": 8, "stage_count": 10, "done": 0, "total": 2}
+    apply_job = apply_steps(root_guard * tip_guard * boundary_guard)
+    try:
+        while True:
+            yield next(apply_job)
+    except StopIteration as complete:
+        delta_h = complete.value
+    yield {"stage": "building width planing delta", "stage_index": 8, "stage_count": 10, "done": 3, "total": 4}
+    candidate_delta = delta_h[:, None] * height_axis * protected_weight[:, None]
+    candidate_delta[anchored] = 0.0
+    candidate_delta[support_mask] = 0.0
+    candidate_delta[~protrusion_mask] = 0.0
+    final_delta_h = np.sum(candidate_delta * height_axis, axis=1)
+    final_delta_h[~protrusion_mask] = 0.0
+    final_delta_h[support_mask] = 0.0
+    final_delta_h = np.clip(final_delta_h, safe_low, 0.0)
+    final_delta_h[(final_delta_h * normal_alignment) > 0.0] = 0.0
+    candidate = before + final_delta_h[:, None] * height_axis
+    yield {"stage": "building width planing delta", "stage_index": 8, "stage_count": 10, "done": 1, "total": 2}
+    integrity_scales = (1.0, 0.75, 0.5, 0.25, 0.125, 0.0625, 0.03125)
+    selected_scale = None
+    for scale_index, scale_factor in enumerate(integrity_scales, 1):
+        yield {
+            "stage": "checking width planing integrity",
+            "stage_index": 9,
+            "stage_count": 10,
+            "done": scale_index - 1,
+            "total": len(integrity_scales),
+        }
+        trial = before + (candidate - before) * scale_factor
+        integrity_job = _guided_ridge_mesh_integrity_steps(snapshot, before, trial)
+        try:
+            while True:
+                yield next(integrity_job)
+        except StopIteration as complete:
+            integrity = complete.value
+        if integrity["finite"] and not integrity["normal_pair_flips"] and not integrity["new_degenerate_faces"]:
+            candidate = trial
+            selected_scale = float(scale_factor)
+            break
+        yield {
+            "stage": "checking width planing integrity",
+            "stage_index": 9,
+            "stage_count": 10,
+            "done": scale_index,
+            "total": len(integrity_scales),
+        }
+    if selected_scale is None:
+        raise ValueError("width planing candidate fails mesh integrity")
+    return candidate, {
+        "length": length,
+        "station": station,
+        "q": q,
+        "left_rail_q": left_rail_q,
+        "right_rail_q": right_rail_q,
+        "h": h,
+        "target_h": target_h,
+        "width": width,
+        "width_min": minimum_width,
+        "width_max": maximum_width,
+        "boundary_mask": boundary_mask,
+        "crest_side_mask": crest_side_mask,
+        "eligible_mask": eligible,
+        "protrusion_mask": protrusion_mask,
+        "anchor_mask": anchored,
+        "width_anchor_mask": anchor_mask,
+        "guide_anchor_mask": guide_anchor_mask,
+        "selected_arc_mask": crest_side_mask,
+        "outward_component": normal_alignment,
+        "delta_h": np.sum((candidate - before) * height_axis, axis=1),
+        "integrity_scale": selected_scale,
+        "boundary_distance_chunk_size": int(boundary_chunk_size),
+        "boundary_count": int(boundary_count),
+        "vertex_guide_chunk_size": int(project_chunk),
+        "frame_tangent": tangent,
+        "frame_lateral": lateral,
+        "frame_height_axis": height_axis,
+        "rail_hits": width_result.get("rail_hits", {}),
+        "rail_support_vertex_indices": width_result.get("rail_support_vertex_indices", {}),
+        "rail_support_mask": support_mask,
+    }
+
+
+def _guided_ridge_exact_candidate_steps(
+    snapshot, guide, controls, control_normals, half_width=None, width_result=None
+):
+    """Active width-based cooperative candidate path."""
+    job = _guided_ridge_width_candidate_steps(
+        snapshot, guide, controls, control_normals, half_width, width_result=width_result
+    )
+    try:
+        while True:
+            yield next(job)
+    except StopIteration as complete:
+        return complete.value
+
+
+def _guided_ridge_exact_candidate(
+    snapshot, guide, controls, control_normals, half_width=None, width_result=None
+):
+    """Synchronous compatibility wrapper for the active width candidate."""
+    job = _guided_ridge_exact_candidate_steps(
+        snapshot, guide, controls, control_normals, half_width, width_result=width_result
+    )
+    try:
+        while True:
+            next(job)
+    except StopIteration as complete:
+        return complete.value
+
+
+def _guided_ridge_width_support_mask(width_result, vertex_count):
+    """Return all fixed vertices supporting the shared projected rails."""
+    import numpy as np
+
+    mask = np.zeros(int(vertex_count), dtype=bool)
+    if not isinstance(width_result, dict):
+        return mask
+    groups = width_result.get("rail_support_vertex_indices", {}) or {}
+    for values in groups.values() if isinstance(groups, dict) else ():
+        for support in values or ():
+            for index in support or ():
+                try:
+                    index = int(index)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= index < len(mask):
+                    mask[index] = True
+    hits = width_result.get("rail_hits", {}) or {}
+    for values in hits.values() if isinstance(hits, dict) else ():
+        for hit in values or ():
+            if not isinstance(hit, dict):
+                continue
+            # Include the complete hit triangle as a conservative support set:
+            # BVH barycentric coordinates can carry a tiny non-zero weight on
+            # the third vertex even when the hit is numerically on an edge.
+            # Fixing it prevents the reconstructed rail point from drifting
+            # across Blender's float32 mesh write/read round-trip.
+            for key in ("support_vertex_indices", "edge_support_vertex_indices", "triangle_vertices"):
+                for index in hit.get(key, ()) or ():
+                    try:
+                        index = int(index)
+                    except (TypeError, ValueError):
+                        continue
+                    if 0 <= index < len(mask):
+                        mask[index] = True
+    return mask
+
+
+def _guided_ridge_rail_support_unchanged(snapshot, before, after, rail_hits, tolerance=1.0e-9):
+    """Check projected rail points through their stored barycentric support."""
+    import numpy as np
+
+    if not rail_hits:
+        return True
+    before = np.asarray(before, dtype=np.float64)
+    after = np.asarray(after, dtype=np.float64)
+    for side in ("left", "right"):
+        for hit in rail_hits.get(side, ()):
+            if not hit:
+                continue
+            vertices = tuple(int(value) for value in hit.get("triangle_vertices", ()))
+            weights = np.asarray(hit.get("barycentric_weights", ()), dtype=np.float64)
+            if not vertices or len(vertices) != len(weights):
+                return False
+            if any(value < 0 or value >= len(before) for value in vertices):
+                return False
+            if not np.all(np.isfinite(weights)) or abs(float(np.sum(weights)) - 1.0) > 1.0e-6:
+                return False
+            pre = np.sum(before[np.asarray(vertices, dtype=np.int64)] * weights[:, None], axis=0)
+            post = np.sum(after[np.asarray(vertices, dtype=np.int64)] * weights[:, None], axis=0)
+            location = np.asarray(tuple(hit.get("location", ())), dtype=np.float64)
+            if len(location) == 3 and float(np.linalg.norm(pre - location)) > 1.0e-7:
+                return False
+            if float(np.linalg.norm(post - pre)) > tolerance:
+                return False
+    return True
 
 
 def _guided_ridge_mesh_integrity(snapshot, before, after):
@@ -8424,9 +11234,347 @@ def _guided_ridge_mesh_integrity(snapshot, before, after):
     }
 
 
+def _guided_ridge_mesh_integrity_steps(snapshot, before, after, chunk_size=8):
+    """Yield bounded integrity checks for the modal candidate phase.
+
+    The synchronous helper above remains the public/reference check.  The
+    modal path uses this mechanically equivalent chunked form so a dense
+    component never spends a full frame in one vectorized triangle batch.
+    """
+    yield {
+        "stage": "checking width planing integrity",
+        "stage_index": 9,
+        "stage_count": 10,
+        "done": 0,
+        "total": 0,
+    }
+    import numpy as np
+
+    faces = np.asarray(snapshot["triangles"], dtype=np.int64)
+    total = int(math.ceil(len(faces) / float(max(int(chunk_size), 1))))
+    normal_flips = 0
+    dot_min = 1.0
+    new_degenerate = 0
+    finite = bool(np.all(np.isfinite(after)))
+    for index, start in enumerate(range(0, len(faces), max(int(chunk_size), 1)), 1):
+        stop = min(start + max(int(chunk_size), 1), len(faces))
+        local_faces = faces[start:stop]
+        before_tri = before[local_faces]
+        after_tri = after[local_faces]
+        cross_before = np.cross(
+            before_tri[:, 1] - before_tri[:, 0],
+            before_tri[:, 2] - before_tri[:, 0],
+        )
+        cross_after = np.cross(
+            after_tri[:, 1] - after_tri[:, 0],
+            after_tri[:, 2] - after_tri[:, 0],
+        )
+        area_before = np.linalg.norm(cross_before, axis=1) * 0.5
+        area_after = np.linalg.norm(cross_after, axis=1) * 0.5
+        dot = np.sum(cross_before * cross_after, axis=1) / np.maximum(
+            np.linalg.norm(cross_before, axis=1)
+            * np.linalg.norm(cross_after, axis=1),
+            1.0e-30,
+        )
+        normal_flips += int(np.count_nonzero(dot < 0.0))
+        if len(dot):
+            dot_min = min(dot_min, float(np.min(dot)))
+        new_degenerate += int(
+            np.count_nonzero((area_after <= 1.0e-12) & (area_before > 1.0e-12))
+        )
+        yield {
+            "stage": "checking width planing integrity",
+            "stage_index": 9,
+            "stage_count": 10,
+            "done": index,
+            "total": total,
+        }
+    return {
+        "finite": finite,
+        "normal_pair_flips": normal_flips,
+        "normal_pair_dot_min": dot_min,
+        "new_degenerate_faces": new_degenerate,
+    }
+
+
 def _guided_ridge_overlay_tag(state):
     if state is not None:
         _tag_redraw(state.get("area"))
+
+
+def _guided_ridge_preview_only_finish(operator, state, reason="confirm"):
+    """Finish the Phase 1 UI session without entering the write path."""
+    if operator is not None:
+        operator.report({"INFO"}, "Guided Ridge UI Prototype: Preview Only: no geometry changes")
+    if state is not None:
+        state["preview_only_finished"] = True
+        state["modal_result"] = "FINISHED"
+    _guided_ridge_cancel(state, reason)
+    return True
+
+
+def _guided_ridge_prepare_context_matches(context, state):
+    """Check the stable context identity while preparation is yielding."""
+    expected = (state or {}).get("context_signature")
+    if expected is None:
+        return False
+    try:
+        if context.active_object is not state.get("obj") or context.mode != "SCULPT":
+            return False
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return False
+    current = _guided_ridge_context_signature(context)
+    if current is None:
+        return False
+    stable_keys = (
+        "area_pointer",
+        "region_pointer",
+        "window_pointer",
+        "space_pointer",
+        "scene_pointer",
+        "active_object_pointer",
+        "mesh_pointer",
+        "mode",
+        "space_type",
+    )
+    return all(current.get(key) == expected.get(key) for key in stable_keys)
+
+
+def _guided_ridge_process_prepare_timer(context, state):
+    """Advance one bounded snapshot slice and transition to guide-ready."""
+    if state is None or not state.get("active") or state.get("phase") != "prepare":
+        return False
+    operator = state.get("operator")
+    if not _guided_ridge_prepare_context_matches(context, state):
+        if operator is not None:
+            operator.report({"WARNING"}, "Guided Ridge: preparation context changed; no changes applied")
+        _guided_ridge_cancel(state, "prepare-context-changed")
+        return False
+    started = time.perf_counter()
+    state["prepare_slices"] = int(state.get("prepare_slices", 0)) + 1
+    try:
+        progress = None
+        deadline = started + 0.008
+        while True:
+            progress = next(state["prepare_job"])
+            # Publish a newly entered stage for one complete UI tick before
+            # advancing into the stage's first expensive operation.  This
+            # returns to the event loop and gives the overlay a redraw
+            # opportunity before the first indivisible foreach_get/BVH call.
+            if isinstance(progress, dict):
+                progress_stage = str(progress.get("stage", "preparing"))
+                if progress_stage != state.get("prepare_stage"):
+                    break
+            if time.perf_counter() >= deadline:
+                break
+    except StopIteration as complete:
+        snapshot, reason = complete.value or (None, "could not prepare the Face Set component")
+        state["prepare_job"] = None
+        if snapshot is None:
+            if operator is not None:
+                operator.report({"WARNING"}, f"Guided Ridge: {reason or 'preparation failed'}")
+            _guided_ridge_cancel(state, "prepare-failed")
+            return False
+        try:
+            start_hit = _guided_ridge_snapshot_hit_ray(snapshot, state.get("start_ray"))
+            if start_hit is None:
+                if operator is not None:
+                    operator.report({"WARNING"}, "Guided Ridge: saved start ray no longer hits the prepared Face Set component")
+                _guided_ridge_cancel(state, "start-point-failed")
+                return False
+            context_signature = _guided_ridge_context_signature(context)
+            if context_signature is None:
+                if operator is not None:
+                    operator.report({"WARNING"}, "Guided Ridge: viewport context is unavailable")
+                _guided_ridge_cancel(state, "context-unavailable")
+                return False
+            snapshot["context_signature"] = context_signature
+            state["snapshot"] = snapshot
+            initial_width, minimum_width, maximum_width, _average_edge = _guided_ridge_width_limits(snapshot)
+            state["half_width"] = min(
+                max(float(state.get("half_width", initial_width) or initial_width), minimum_width),
+                maximum_width,
+            )
+            state["width_min"] = minimum_width
+            state["width_max"] = maximum_width
+            state["width_frame"] = None
+            state["width_frame_result"] = None
+            state["width_rails"] = {"left": [], "right": []}
+            state["controls"] = [start_hit[0]]
+            state["control_normals"] = [start_hit[1]]
+            state["guide"] = [start_hit[0]]
+            state["last_cursor"] = start_hit[0]
+            state["phase"] = "ready"
+            state["prepare_stage"] = "ready"
+            state["prepare_stage_index"] = int(state.get("prepare_stage_count", 13))
+            state["prepare_stage_done"] = 1
+            state["prepare_stage_total"] = 1
+            state["prepare_progress_fraction"] = 1.0
+            state["prepare_progress_indeterminate"] = False
+            _guided_ridge_update_width_preview(state)
+            timer = state.get("timer")
+            if timer is not None:
+                window_manager = state.get("window_manager")
+                if window_manager is None:
+                    window_manager = bpy.context.window_manager
+                try:
+                    window_manager.event_timer_remove(timer)
+                except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+                    pass
+                state["timer"] = None
+            _guided_ridge_overlay_tag(state)
+        except (AttributeError, IndexError, MemoryError, ReferenceError, RuntimeError, TypeError, ValueError) as error:
+            if operator is not None:
+                operator.report({"WARNING"}, f"Guided Ridge: preparation failed ({error})")
+            _guided_ridge_cancel(state, "prepare-finalize-failed")
+            return False
+    except (AttributeError, IndexError, MemoryError, ReferenceError, RuntimeError, TypeError, ValueError) as error:
+        if operator is not None:
+            operator.report({"WARNING"}, f"Guided Ridge: preparation failed ({error})")
+        _guided_ridge_cancel(state, "prepare-exception")
+        return False
+    else:
+        if isinstance(progress, dict):
+            stage = str(progress.get("stage", "preparing"))
+            if stage != state.get("prepare_stage"):
+                state["prepare_stage_index"] = max(
+                    int(state.get("prepare_stage_index", 0)),
+                    int(progress.get("stage_index", 0)),
+                )
+            state["prepare_stage"] = stage
+            state["prepare_stage_count"] = int(progress.get("stage_count", 13))
+            state["prepare_stage_done"] = int(progress.get("done", 0))
+            state["prepare_stage_total"] = int(progress.get("total", 0))
+            state["prepare_progress_indeterminate"] = bool(progress.get("indeterminate", False))
+            total = int(progress.get("total", 0))
+            done = int(progress.get("done", 0))
+            state["prepare_progress_fraction"] = (
+                min(max(done / float(total), 0.0), 1.0) if total > 0 else None
+            )
+            _guided_ridge_overlay_tag(state)
+    finally:
+        elapsed = time.perf_counter() - started
+        state["prepare_last_slice_seconds"] = float(elapsed)
+        state["prepare_max_slice_seconds"] = max(
+            float(state.get("prepare_max_slice_seconds", 0.0)), float(elapsed)
+        )
+        state["prepare_elapsed_seconds"] = float(state.get("prepare_elapsed_seconds", 0.0)) + float(elapsed)
+    return True
+
+
+def _guided_ridge_begin_compute(context, state):
+    """Enter the modal, cancellable candidate-computation phase."""
+    if state is None or state.get("phase") != "ready":
+        return False
+    try:
+        state["phase"] = "compute"
+        state["compute_job"] = _guided_ridge_exact_candidate_steps(
+            state["snapshot"],
+            state["guide"],
+            state["controls"],
+            state["control_normals"],
+            state.get("half_width"),
+            width_result=state.get("width_frame_result"),
+        )
+        state["compute_stage"] = "queued"
+        state["compute_stage_index"] = 0
+        state["compute_stage_count"] = 4
+        state["compute_stage_done"] = 0
+        state["compute_stage_total"] = 0
+        state["compute_progress_fraction"] = None
+        state["compute_progress_indeterminate"] = True
+        if state.get("timer") is None:
+            state["timer"] = context.window_manager.event_timer_add(0.01, window=context.window)
+        _guided_ridge_overlay_tag(state)
+        return True
+    except (AttributeError, MemoryError, RuntimeError, TypeError, ValueError):
+        _guided_ridge_cancel(state, "compute-start-failed")
+        return False
+
+
+def _guided_ridge_finish_compute(context, state, result):
+    """Consume a completed candidate through the established write/Undo path."""
+    if state is None or not state.get("active"):
+        return False
+    candidate, info = result
+    timer = state.get("timer")
+    if timer is not None:
+        try:
+            state["window_manager"].event_timer_remove(timer)
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            pass
+        state["timer"] = None
+    state["compute_job"] = None
+    state["phase"] = "ready"
+    operator = state.get("operator")
+    if operator is None:
+        _guided_ridge_cancel(state, "compute-no-operator")
+        return False
+    committed = bool(operator._commit(context, state, _compute_sync=True, _candidate_override=(candidate, info)))
+    # _commit tears down the modal state on success.  Preserve the modal
+    # operator result separately so Blender receives FINISHED rather than
+    # mistaking the intentional cleanup (active=False) for cancellation.
+    state["modal_result"] = "FINISHED" if committed and state.get("committed") else "CANCELLED"
+    return committed
+
+
+def _guided_ridge_process_compute_timer(context, state):
+    """Advance candidate extraction for one bounded UI-event-loop slice."""
+    if state is None or not state.get("active") or state.get("phase") != "compute":
+        return False
+    operator = state.get("operator")
+    if not _guided_ridge_context_matches(context, state):
+        if operator is not None:
+            operator.report({"WARNING"}, "Guided Ridge: computation context changed; no changes applied")
+        _guided_ridge_cancel(state, "compute-context-changed")
+        return False
+    started = time.perf_counter()
+    try:
+        deadline = started + 0.008
+        progress = None
+        while True:
+            progress = next(state["compute_job"])
+            if isinstance(progress, dict):
+                stage = str(progress.get("stage", "computing"))
+                if stage != state.get("compute_stage"):
+                    break
+            if time.perf_counter() >= deadline:
+                break
+    except StopIteration as complete:
+        try:
+            return _guided_ridge_finish_compute(context, state, complete.value)
+        except (AttributeError, IndexError, MemoryError, ReferenceError, RuntimeError, TypeError, ValueError) as error:
+            if operator is not None:
+                operator.report({"WARNING"}, f"Guided Ridge: computation failed ({error})")
+            _guided_ridge_cancel(state, "compute-failed")
+            return False
+    except (AttributeError, IndexError, MemoryError, ReferenceError, RuntimeError, TypeError, ValueError) as error:
+        if operator is not None:
+            operator.report({"WARNING"}, f"Guided Ridge: computation failed ({error})")
+        _guided_ridge_cancel(state, "compute-failed")
+        return False
+    else:
+        if isinstance(progress, dict):
+            stage = str(progress.get("stage", "computing"))
+            if stage != state.get("compute_stage"):
+                state["compute_stage_index"] = max(
+                    int(state.get("compute_stage_index", 0)), int(progress.get("stage_index", 0))
+                )
+            state["compute_stage"] = stage
+            state["compute_stage_count"] = int(progress.get("stage_count", 4))
+            state["compute_stage_done"] = int(progress.get("done", 0))
+            state["compute_stage_total"] = int(progress.get("total", 0))
+            total = int(progress.get("total", 0))
+            done = int(progress.get("done", 0))
+            state["compute_progress_indeterminate"] = bool(progress.get("indeterminate", False))
+            state["compute_progress_fraction"] = min(max(done / float(total), 0.0), 1.0) if total > 0 else None
+            _guided_ridge_overlay_tag(state)
+    finally:
+        elapsed = time.perf_counter() - started
+        state["compute_last_slice_seconds"] = float(elapsed)
+        state["compute_max_slice_seconds"] = max(float(state.get("compute_max_slice_seconds", 0.0)), float(elapsed))
+        state["compute_elapsed_seconds"] = float(state.get("compute_elapsed_seconds", 0.0)) + float(elapsed)
+    return True
 
 
 def _guided_ridge_stop_draw():
@@ -8453,6 +11601,19 @@ def _guided_ridge_cancel(state=None, reason="cancel"):
     if current is None:
         return
     current["active"] = False
+    timer = current.get("timer")
+    if timer is not None:
+        window_manager = current.get("window_manager")
+        if window_manager is None:
+            window_manager = bpy.context.window_manager
+        try:
+            window_manager.event_timer_remove(timer)
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            pass
+        current["timer"] = None
+    current["prepare_job"] = None
+    current["compute_job"] = None
+    current["width_frame_job"] = None
     _guided_ridge_stop_draw()
     _guided_ridge_state = None
     _guided_ridge_overlay_tag(current)
@@ -8479,6 +11640,23 @@ def _guided_ridge_draw():
             shader.bind()
             shader.uniform_float("color", (0.12, 0.82, 1.0, 0.95))
             batch.draw(shader)
+        rail_colors = (
+            ("left", (0.28, 0.70, 1.0, 0.72)),
+            ("right", (0.28, 0.70, 1.0, 0.72)),
+        )
+        for side, color in rail_colors:
+            rail = state.get("width_rails", {}).get(side, ())
+            segment = []
+            for point in list(rail) + [None]:
+                if point is None:
+                    if len(segment) >= 2:
+                        rail_batch = batch_for_shader(shader, "LINE_STRIP", {"pos": segment})
+                        shader.bind()
+                        shader.uniform_float("color", color)
+                        rail_batch.draw(shader)
+                    segment = []
+                else:
+                    segment.append(tuple(point))
         points = batch_for_shader(shader, "POINTS", {"pos": coords})
         shader.bind()
         shader.uniform_float("color", (1.0, 0.35, 0.08, 1.0))
@@ -8507,10 +11685,57 @@ def _guided_ridge_draw_text():
         height = int(getattr(state.get("region"), "height", 0))
         font_id = 0
         blf.size(font_id, 13)
-        lines = [
-            "Guided Ridge",
-            "LMB: 点追加  Backspace: 戻す  Enter: 適用  Esc/RMB: 取消",
-        ]
+        if state.get("phase") == "prepare":
+            stage = str(state.get("prepare_stage", "preparing"))
+            done = int(state.get("prepare_stage_done", 0))
+            total = int(state.get("prepare_stage_total", 0))
+            fraction = state.get("prepare_progress_fraction")
+            if state.get("prepare_progress_indeterminate") or fraction is None:
+                progress_text = "processing..."
+            else:
+                progress_text = f"{done}/{max(total, 1)}"
+            lines = [
+                "Guided Ridge: preparing",
+                f"{stage}  {progress_text}",
+                "Esc: cancel",
+            ]
+        elif state.get("phase") == "width_prepare":
+            stage = str(state.get("width_frame_stage", "building guide frame"))
+            done = int(state.get("width_frame_stage_done", 0))
+            total = int(state.get("width_frame_stage_total", 0))
+            fraction = state.get("width_frame_progress_fraction")
+            if state.get("width_frame_progress_indeterminate") or fraction is None:
+                progress_text = "processing..."
+            else:
+                progress_text = f"{done}/{max(total, 1)}"
+            lines = [
+                "Guided Ridge: rebuilding guide frame",
+                f"{stage}  {progress_text}",
+                "Esc: cancel",
+            ]
+        elif state.get("phase") == "compute":
+            stage = str(state.get("compute_stage", "computing"))
+            done = int(state.get("compute_stage_done", 0))
+            total = int(state.get("compute_stage_total", 0))
+            fraction = state.get("compute_progress_fraction")
+            if state.get("compute_progress_indeterminate") or fraction is None:
+                progress_text = "processing..."
+            else:
+                progress_text = f"{done}/{max(total, 1)}"
+            lines = [
+                "Guided Ridge: computing",
+                f"{stage}  {progress_text}",
+                "Esc: cancel",
+            ]
+        else:
+            width_value = float(state.get("half_width", 0.0) or 0.0)
+            width_min = float(state.get("width_min", 0.0) or 0.0)
+            width_max = float(state.get("width_max", 0.0) or 0.0)
+            lines = [
+                "Guided Ridge: ready",
+                f"幅 ±{width_value:.5g} (edge {width_value / max(float(state.get('snapshot', {}).get('average_edge', 1.0) or 1.0), 1.0e-12):.2f}x; {width_min:.3g}..{width_max:.3g})",
+                "Wheel/Shift+Wheel: 幅調整  LMB: 点追加  Enter: 適用  Esc/RMB: 取消",
+            ]
         x, y = max(18, width - 620), max(100, height - 54)
         for index, line in enumerate(lines):
             blf.position(font_id, x, y - index * 18, 0)
@@ -8546,6 +11771,86 @@ def _guided_ridge_event_in_rect(event, rect):
     return x0 <= x <= x1 and y0 <= y <= y1
 
 
+def _guided_ridge_navigation_gizmo_rect(context, state=None):
+    """Return a conservative top-right Navigation Gizmo hit zone.
+
+    Blender reports mouse coordinates in region pixels while the visible
+    gizmo scales with the UI scale.  The zone is intentionally limited to the
+    upper-right corner so a normal guide click remains owned by this modal.
+    """
+    try:
+        region = (state or {}).get("region") or context.region
+        width = float(getattr(region, "width", 0) or 0)
+        height = float(getattr(region, "height", 0) or 0)
+        space = getattr(context, "space_data", None)
+        if state is not None and state.get("space") is not None:
+            space = state.get("space")
+        # A top-right rectangle must never claim guide clicks when either the
+        # general gizmo or its navigation subset is hidden.  Blender 5.2
+        # exposes both properties on SpaceView3D; missing properties are a
+        # conservative no-zone result for fake/older contexts.
+        if space is None or not bool(getattr(space, "show_gizmo", False)):
+            return None
+        if not bool(getattr(space, "show_gizmo_navigate", False)):
+            return None
+        preferences = getattr(context, "preferences", None)
+        system = getattr(preferences, "system", None)
+        ui_scale = float(getattr(system, "ui_scale", 1.0) or 1.0)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+    if width <= 0.0 or height <= 0.0:
+        return None
+    size = min(max(96.0 * ui_scale, 64.0), width * 0.26, height * 0.38)
+    if size < 48.0:
+        return None
+    inset = max(4.0, 8.0 * ui_scale)
+    return (max(0.0, width - size - inset), max(0.0, height - size - inset), width - inset, height - inset)
+
+
+def _guided_ridge_navigation_passthrough(context, event, state):
+    """Recognize viewport navigation before guide point/confirm handling.
+
+    The modal remains the owner of Wheel width changes.  Middle mouse, NDOF,
+    numpad view events, and the Navigation Gizmo are handed back to Blender
+    so orbit/pan/zoom can update the view while the captured world-space
+    snapshot and guide remain intact.
+    """
+    if state is None:
+        return False
+    event_type = str(getattr(event, "type", "") or "")
+    event_value = getattr(event, "value", None)
+    gizmo_rect = _guided_ridge_navigation_gizmo_rect(context, state)
+    in_gizmo = gizmo_rect is not None and _guided_ridge_event_in_rect(event, gizmo_rect)
+    gizmo_active = bool(state.get("navigation_gizmo_active"))
+    mmb_active = bool(state.get("navigation_mmb_active"))
+    if gizmo_active:
+        if event_type == "LEFTMOUSE" and event_value == "RELEASE":
+            state["navigation_gizmo_active"] = False
+        if event_type in {"LEFTMOUSE", "MOUSEMOVE"}:
+            return True
+    if event_type == "LEFTMOUSE" and event_value == "PRESS" and in_gizmo:
+        state["navigation_gizmo_active"] = True
+        return True
+    if event_type == "MOUSEMOVE" and in_gizmo:
+        return True
+    if event_type == "MIDDLEMOUSE":
+        state["navigation_mmb_active"] = event_value != "RELEASE"
+        return True
+    if mmb_active and event_type == "MOUSEMOVE":
+        return True
+    if event_type.startswith("NDOF_"):
+        return True
+    if event_type in {
+        "NUMPAD_0", "NUMPAD_1", "NUMPAD_2", "NUMPAD_3", "NUMPAD_4",
+        "NUMPAD_5", "NUMPAD_6", "NUMPAD_7", "NUMPAD_8", "NUMPAD_9",
+        "NUMPAD_PERIOD", "NUMPAD_SLASH", "NUMPAD_ASTERIX",
+    }:
+        return True
+    if event_type in {"HOME", "END", "PAGEUP", "PAGEDOWN"}:
+        return True
+    return False
+
+
 def _guided_ridge_conflict_reason(context):
     if _guided_ridge_state is not None and _guided_ridge_state.get("active"):
         return "Guided Ridge is already active"
@@ -8557,6 +11862,12 @@ def _guided_ridge_conflict_reason(context):
         area_key = int(context.area.as_pointer())
         existing = _active_states.get(area_key)
         if existing is not None and getattr(existing, "active", False):
+            # MFO's orbit/focus state is deliberately independent from the
+            # Guided Ridge modal.  Keep its camera, visibility proxy, and
+            # teardown ownership untouched while the active Sculpt object is
+            # used by Guided Ridge.  Other modal tools still remain exclusive.
+            if isinstance(existing, (_TempOrbitState, _FaceSetOrbitState)):
+                return None
             return "another MFO modal session is active"
     except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
         return "MFO viewport state is unavailable"
@@ -8564,12 +11875,12 @@ def _guided_ridge_conflict_reason(context):
 
 
 class VIEW3D_OT_mesh_focus_guided_ridge(bpy.types.Operator):
-    """Place a surface guide and apply one bounded C-like ridge."""
+    """Place a surface guide and apply one bounded Guided Ridge planing."""
 
     bl_idname = GUIDED_RIDGE_OPERATOR_ID
     bl_label = "Guided Ridge"
-    bl_description = "Place a smooth surface guide and form a broad ridge on one connected Face Set"
-    bl_options = {"REGISTER", "UNDO"}
+    bl_description = "Place a guide and plane protrusions inward between the shared width rails"
+    bl_options = {"REGISTER"} if GUIDED_RIDGE_UI_PROTOTYPE else {"REGISTER", "UNDO"}
 
     @classmethod
     def poll(cls, context):
@@ -8593,9 +11904,19 @@ class VIEW3D_OT_mesh_focus_guided_ridge(bpy.types.Operator):
             and attr is not None
         )
 
-    def _commit(self, context, state):
+    def _commit(self, context, state, _compute_sync=False, _candidate_override=None):
         import numpy as np
         global _guided_ridge_last_guide
+        # Phase 1 is intentionally a UI-only build.  Keep this guard ahead of
+        # candidate construction, integrity checks, and all mesh assignments so
+        # neither Enter nor any legacy/internal commit route can reach the
+        # deformation engine.
+        if GUIDED_RIDGE_UI_PROTOTYPE:
+            return _guided_ridge_preview_only_finish(self, state, "preview-only-confirm")
+        if state.get("phase") == "ready" and not _compute_sync and _candidate_override is None and not state.get("repeat"):
+            return _guided_ridge_begin_compute(context, state) and False
+        if state.get("phase") == "compute" and not _compute_sync:
+            return False
         if len(state.get("controls", ())) < 2:
             self.report({"WARNING"}, "Guided Ridge: at least two guide points are required")
             return False
@@ -8632,30 +11953,73 @@ class VIEW3D_OT_mesh_focus_guided_ridge(bpy.types.Operator):
             self.report({"WARNING"}, "Guided Ridge: source mesh, Face Set, or coordinates changed")
             return False
         try:
-            projected, reason = _guided_ridge_project_curve(state["snapshot"], state["controls"])
-            if projected is None:
-                self.report({"WARNING"}, f"Guided Ridge: {reason}")
-                return False
-            candidate, info = _guided_ridge_exact_candidate(
-                state["snapshot"], projected, state["controls"], state["control_normals"]
-            )
+            if _candidate_override is None:
+                projected, reason = _guided_ridge_project_curve(state["snapshot"], state["controls"])
+                if projected is None:
+                    self.report({"WARNING"}, f"Guided Ridge: {reason}")
+                    return False
+                candidate, info = _guided_ridge_exact_candidate(
+                    state["snapshot"],
+                    projected,
+                    state["controls"],
+                    state["control_normals"],
+                    state.get("half_width"),
+                    width_result=state.get("width_frame_result"),
+                )
+            else:
+                projected = state.get("guide")
+                candidate, info = _candidate_override
             integrity = _guided_ridge_mesh_integrity(state["snapshot"], state["snapshot"]["coords_world"], candidate)
             if not integrity["finite"] or integrity["normal_pair_flips"] or integrity["new_degenerate_faces"]:
                 self.report({"WARNING"}, "Guided Ridge: unsafe geometry candidate; no changes applied")
                 return False
+            delta = np.asarray(candidate, dtype=np.float64) - np.asarray(state["snapshot"]["coords_world"], dtype=np.float64)
+            outward_component = np.asarray(info.get("outward_component", np.zeros(len(delta))), dtype=np.float64)
+            if "delta_h" in info and np.any(np.asarray(info["delta_h"]) * outward_component > 1.0e-10):
+                self.report({"WARNING"}, "Guided Ridge: planing direction is unsafe; no changes applied")
+                return False
+            anchor_mask = np.asarray(info.get("anchor_mask", np.zeros(len(delta), dtype=bool)), dtype=bool)
+            crest_mask = np.asarray(info.get("crest_side_mask", np.ones(len(delta), dtype=bool)), dtype=bool)
+            if np.any(np.linalg.norm(delta[anchor_mask], axis=1) > 1.0e-9) or np.any(np.linalg.norm(delta[~crest_mask], axis=1) > 1.0e-9):
+                self.report({"WARNING"}, "Guided Ridge: fixed crest or backside moved; no changes applied")
+                return False
+            rail_support_mask = np.asarray(
+                info.get("rail_support_mask", np.zeros(len(delta), dtype=bool)), dtype=bool
+            )
+            if len(rail_support_mask) != len(delta) or np.any(
+                np.linalg.norm(delta[rail_support_mask], axis=1) > 1.0e-9
+            ):
+                self.report({"WARNING"}, "Guided Ridge: projected rail support moved; no changes applied")
+                return False
+            if not _guided_ridge_rail_support_unchanged(
+                state["snapshot"],
+                state["snapshot"]["coords_world"],
+                candidate,
+                info.get("rail_hits", {}),
+            ):
+                self.report({"WARNING"}, "Guided Ridge: projected rail support moved; no changes applied")
+                return False
             obj = state["obj"]
             inverse = obj.matrix_world.inverted_safe()
-            coords_local = np.asarray([tuple(inverse @ Vector(point)) for point in candidate], dtype=np.float64)
-            if not np.all(np.isfinite(coords_local)):
+            candidate_world = np.asarray(candidate, dtype=np.float64)
+            snapshot_world = np.asarray(state["snapshot"]["coords_world"], dtype=np.float64)
+            changed_mask = np.linalg.norm(candidate_world - snapshot_world, axis=1) > 1.0e-12
+            changed_indices = np.flatnonzero(changed_mask).astype(np.int64)
+            changed_local = {
+                int(local_index): tuple(inverse @ Vector(candidate_world[int(local_index)]))
+                for local_index in changed_indices
+            }
+            if changed_local and not np.all(np.isfinite(np.asarray(tuple(changed_local.values()), dtype=np.float64))):
                 self.report({"WARNING"}, "Guided Ridge: non-finite local coordinates")
                 return False
             before_local = np.asarray(current, dtype=np.float64).copy()
             mesh = obj.data
             try:
-                for local_index, vertex_index in enumerate(state["snapshot"]["vertex_indices"]):
-                    mesh.vertices[int(vertex_index)].co = coords_local[local_index]
+                for write_index, local_index in enumerate(changed_indices):
+                    vertex_index = state["snapshot"]["vertex_indices"][int(local_index)]
+                    mesh.vertices[int(vertex_index)].co = changed_local[int(local_index)]
                     failure_after = state.get("_test_failure_after")
-                    if failure_after is not None and local_index >= int(failure_after):
+                    if failure_after is not None and write_index >= int(failure_after):
                         raise RuntimeError("injected Guided Ridge write failure")
                 mesh.update()
                 obj.update_tag(refresh={"DATA"})
@@ -8682,6 +12046,9 @@ class VIEW3D_OT_mesh_focus_guided_ridge(bpy.types.Operator):
     def _execute_repeat(self, context, last_guide):
         """Rebuild a current component snapshot and route Repeat Last through _commit."""
         global _guided_ridge_state, _guided_ridge_last_guide
+        if GUIDED_RIDGE_UI_PROTOTYPE:
+            self.report({"INFO"}, "Guided Ridge UI Prototype: Repeat Last preview only; no geometry changes")
+            return True
         def reject(message):
             global _guided_ridge_last_guide
             if _guided_ridge_last_guide is last_guide:
@@ -8727,10 +12094,16 @@ class VIEW3D_OT_mesh_focus_guided_ridge(bpy.types.Operator):
             "controls": controls,
             "control_normals": control_normals,
             "guide": list(controls),
+            "half_width": float(last_guide.get("half_width", 0.0) or 0.0),
+            "width_frame": None,
+            "width_frame_result": None,
+            "width_frame_job": None,
+            "width_rails": {"left": [], "right": []},
             "last_cursor": controls[-1],
             "area": context.area,
             "area_key": int(context.area.as_pointer()),
             "region": context.region,
+            "space": getattr(context, "space_data", None),
             "window_manager": context.window_manager,
             "window_key": int(context.window.as_pointer()) if context.window else 0,
             "draw_handler": None,
@@ -8765,7 +12138,18 @@ class VIEW3D_OT_mesh_focus_guided_ridge(bpy.types.Operator):
         except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
             self.report({"WARNING"}, "Guided Ridge: EXEC_DEFAULT context is unavailable")
             return {"CANCELLED"}
-        return {"FINISHED"} if self._commit(context, state) else {"CANCELLED"}
+        # A WorkSpaceTool keymap may dispatch an additional EXEC_DEFAULT while
+        # the preparation timer is still active.  Never let that direct path
+        # reach _commit (or Repeat Last); the modal timer owns preparation and
+        # subsequent point/confirm events.
+        if state.get("phase") == "prepare":
+            return {"CANCELLED"}
+        if state.get("phase") == "compute":
+            return {"CANCELLED"}
+        started = self._commit(context, state)
+        if state.get("phase") == "compute":
+            return {"FINISHED"}
+        return {"FINISHED"} if started else {"CANCELLED"}
 
     def invoke(self, context, event):
         global _guided_ridge_state
@@ -8789,30 +12173,65 @@ class VIEW3D_OT_mesh_focus_guided_ridge(bpy.types.Operator):
         if safety_reason is not None:
             self.report({"WARNING"}, f"Guided Ridge: {safety_reason}; no changes applied")
             return {"CANCELLED"}
-        snapshot, reason = _guided_ridge_prepare_snapshot(obj, face_index, face_set_id)
-        if snapshot is None:
-            self.report({"WARNING"}, f"Guided Ridge: {reason}")
-            return {"CANCELLED"}
-        start_hit = _guided_ridge_snapshot_hit(context, snapshot, coord)
-        if start_hit is None:
-            self.report({"WARNING"}, "Guided Ridge: start point could not be projected")
-            return {"CANCELLED"}
         context_signature = _guided_ridge_context_signature(context)
         if context_signature is None:
             self.report({"WARNING"}, "Guided Ridge: viewport context is unavailable")
             return {"CANCELLED"}
-        snapshot["context_signature"] = context_signature
+        start_ray = _guided_ridge_ray(context, coord)
+        if start_ray is None:
+            self.report({"WARNING"}, "Guided Ridge: click ray is unavailable")
+            return {"CANCELLED"}
         width = int(getattr(context.region, "width", 0))
         height = int(getattr(context.region, "height", 0))
         _guided_ridge_state = {
             "active": True,
             "operator": self,
             "obj": obj,
-            "snapshot": snapshot,
-            "controls": [start_hit[0]],
-            "control_normals": [start_hit[1]],
-            "guide": [start_hit[0]],
-            "last_cursor": start_hit[0],
+            "snapshot": None,
+            "controls": [],
+            "control_normals": [],
+            "guide": [],
+            "half_width": 0.0,
+            "width_min": 0.0,
+            "width_max": 0.0,
+            "width_frame": None,
+            "width_frame_result": None,
+            "width_frame_job": None,
+            "width_rails": {"left": [], "right": []},
+            "width_cache_serial": 0,
+            "last_cursor": None,
+            "phase": "prepare",
+            "start_coordinate": coord.copy(),
+            "start_ray": (start_ray[0].copy(), start_ray[1].copy()),
+            "start_key": str(getattr(event, "type", "LEFTMOUSE") or "LEFTMOUSE"),
+            "start_key_released": False,
+            "start_guard_active": True,
+            "context_signature": context_signature,
+            "prepare_job": _guided_ridge_prepare_snapshot_steps(obj, face_index, face_set_id),
+            "prepare_stage": "queued",
+            "prepare_stage_index": 0,
+            "prepare_stage_count": 13,
+            "prepare_stage_done": 0,
+            "prepare_stage_total": 0,
+            "prepare_progress_fraction": None,
+            "prepare_progress_indeterminate": True,
+            "prepare_slices": 0,
+            "prepare_elapsed_seconds": 0.0,
+            "prepare_last_slice_seconds": 0.0,
+            "prepare_max_slice_seconds": 0.0,
+            "compute_job": None,
+            "compute_stage": "idle",
+            "compute_stage_index": 0,
+            "compute_stage_count": 4,
+            "compute_stage_done": 0,
+            "compute_stage_total": 0,
+            "compute_progress_fraction": None,
+            "compute_progress_indeterminate": True,
+            "compute_elapsed_seconds": 0.0,
+            "compute_last_slice_seconds": 0.0,
+            "compute_max_slice_seconds": 0.0,
+            "modal_result": None,
+            "timer": None,
             "area": context.area,
             "area_key": int(context.area.as_pointer()),
             "region": context.region,
@@ -8820,6 +12239,8 @@ class VIEW3D_OT_mesh_focus_guided_ridge(bpy.types.Operator):
             "window_key": int(context.window.as_pointer()) if context.window else 0,
             "draw_handler": None,
             "text_draw_handler": None,
+            "navigation_gizmo_active": False,
+            "navigation_mmb_active": False,
             "apply_rect": (max(18, width - 230), 22, max(19, width - 140), 54),
             "cancel_rect": (max(24, width - 130), 22, max(25, width - 40), 54),
             "committed": False,
@@ -8828,6 +12249,7 @@ class VIEW3D_OT_mesh_focus_guided_ridge(bpy.types.Operator):
         try:
             state["draw_handler"] = bpy.types.SpaceView3D.draw_handler_add(_guided_ridge_draw, (), "WINDOW", "POST_VIEW")
             state["text_draw_handler"] = bpy.types.SpaceView3D.draw_handler_add(_guided_ridge_draw_text, (), "WINDOW", "POST_PIXEL")
+            state["timer"] = context.window_manager.event_timer_add(0.01, window=context.window)
             context.window_manager.modal_handler_add(self)
             _guided_ridge_overlay_tag(state)
         except (AttributeError, RuntimeError, TypeError, ValueError):
@@ -8844,6 +12266,71 @@ class VIEW3D_OT_mesh_focus_guided_ridge(bpy.types.Operator):
         if event_type in {"ESC", "RIGHTMOUSE"} and event_value in {None, "PRESS"}:
             _guided_ridge_cancel(state, "cancel")
             return {"CANCELLED"}
+        if state.get("start_guard_active") and event_type == state.get("start_key"):
+            if event_value == "RELEASE":
+                state["start_key_released"] = True
+                state["start_guard_active"] = False
+            # The initial PRESS/RELEASE pair is never a guide point or a
+            # confirmation event.  This is especially important for the
+            # LEFTMOUSE WorkSpaceTool entry.
+            return {"RUNNING_MODAL"}
+        if event_type == "TIMER":
+            expected_timer = state.get("timer")
+            actual_timer = getattr(event, "timer", None)
+            if actual_timer is not None and expected_timer is not None and actual_timer is not expected_timer:
+                return {"RUNNING_MODAL"}
+            if state.get("phase") == "prepare":
+                _guided_ridge_process_prepare_timer(context, state)
+                return {"CANCELLED" if not state.get("active") else "RUNNING_MODAL"}
+            if state.get("phase") == "width_prepare":
+                _guided_ridge_process_width_frame_timer(context, state)
+                return {"CANCELLED" if not state.get("active") else "RUNNING_MODAL"}
+            if state.get("phase") == "compute":
+                _guided_ridge_process_compute_timer(context, state)
+                if state.get("modal_result") == "FINISHED":
+                    return {"FINISHED"}
+                return {"CANCELLED" if not state.get("active") else "RUNNING_MODAL"}
+            return {"RUNNING_MODAL"}
+        # Navigation must be checked before any phase-specific guide or
+        # confirm branch.  In particular a gizmo LMB is not a guide point.
+        if _guided_ridge_navigation_passthrough(context, event, state):
+            return {"PASS_THROUGH"}
+        if state.get("phase") == "prepare":
+            # Preparation owns no point/confirm input.  Keep viewport
+            # navigation pass-through compatible with the established modal.
+            if event_type in {"MIDDLEMOUSE", "WHEELUPMOUSE", "WHEELDOWNMOUSE"}:
+                return {"PASS_THROUGH"}
+            return {"RUNNING_MODAL"}
+        if state.get("phase") == "width_prepare":
+            # A guide edit owns the frame rebuild until its cached rails and
+            # width result are complete.  Do not let another LMB or Enter
+            # commit against a half-built frame.
+            if event_type in {"MIDDLEMOUSE", "WHEELUPMOUSE", "WHEELDOWNMOUSE"}:
+                return {"PASS_THROUGH"}
+            return {"RUNNING_MODAL"}
+        if state.get("phase") == "compute":
+            # The computing timer owns all point/confirm input.  Esc/RMB was
+            # handled above and cancels the generator immediately.
+            if event_type in {"MIDDLEMOUSE", "WHEELUPMOUSE", "WHEELDOWNMOUSE"}:
+                return {"PASS_THROUGH"}
+            return {"RUNNING_MODAL"}
+        if event_type in {"WHEELUPMOUSE", "WHEELDOWNMOUSE"} and event_value in {None, "PRESS"}:
+            current_width = float(state.get("half_width", state.get("width_min", 0.0)) or 0.0)
+            factor = GUIDED_RIDGE_WIDTH_STEP_FACTOR
+            if bool(getattr(event, "shift", False)):
+                factor = math.sqrt(factor)
+            if event_type == "WHEELDOWNMOUSE":
+                factor = 1.0 / factor
+            minimum = float(state.get("width_min", 0.0) or 0.0)
+            maximum = float(state.get("width_max", 0.0) or 0.0)
+            state["half_width"] = min(max(current_width * factor, minimum), maximum)
+            try:
+                _guided_ridge_update_width_preview(state)
+            except (AttributeError, IndexError, MemoryError, ReferenceError, RuntimeError, TypeError, ValueError) as error:
+                self.report({"WARNING"}, f"Guided Ridge: width preview unavailable ({error})")
+                state["width_rails"] = {"left": [], "right": []}
+            _guided_ridge_overlay_tag(state)
+            return {"RUNNING_MODAL"}
         if event_type == "BACK_SPACE" and event_value in {None, "PRESS"}:
             if len(state["controls"]) > 1:
                 state["controls"].pop()
@@ -8851,15 +12338,28 @@ class VIEW3D_OT_mesh_focus_guided_ridge(bpy.types.Operator):
                 state["guide"], _reason = _guided_ridge_project_curve(state["snapshot"], state["controls"])
                 if state["guide"] is None:
                     state["guide"] = list(state["controls"])
+                try:
+                    if not _guided_ridge_begin_width_frame_rebuild(context, state):
+                        raise ValueError("guide frame rebuild could not start")
+                except (AttributeError, IndexError, MemoryError, ReferenceError, RuntimeError, TypeError, ValueError):
+                    state["width_rails"] = {"left": [], "right": []}
                 _guided_ridge_overlay_tag(state)
             return {"RUNNING_MODAL"}
         if event_type in {"RET", "NUMPAD_ENTER", "ENTER"} and event_value in {None, "PRESS"}:
             self._commit(context, state)
-            return {"FINISHED" if state.get("committed") else "RUNNING_MODAL"}
+            return {
+                "FINISHED"
+                if state.get("committed") or state.get("modal_result") == "FINISHED"
+                else "RUNNING_MODAL"
+            }
         if event_type == "LEFTMOUSE" and event_value == "PRESS":
             if _guided_ridge_event_in_rect(event, state["apply_rect"]):
                 self._commit(context, state)
-                return {"FINISHED" if state.get("committed") else "RUNNING_MODAL"}
+                return {
+                    "FINISHED"
+                    if state.get("committed") or state.get("modal_result") == "FINISHED"
+                    else "RUNNING_MODAL"
+                }
             if _guided_ridge_event_in_rect(event, state["cancel_rect"]):
                 _guided_ridge_cancel(state, "cancel-button")
                 return {"CANCELLED"}
@@ -8884,6 +12384,12 @@ class VIEW3D_OT_mesh_focus_guided_ridge(bpy.types.Operator):
             state["controls"] = candidate_controls
             state["control_normals"] = state["control_normals"] + [hit[1]]
             state["guide"] = projected
+            try:
+                if not _guided_ridge_begin_width_frame_rebuild(context, state):
+                    raise ValueError("guide frame rebuild could not start")
+            except (AttributeError, IndexError, MemoryError, ReferenceError, RuntimeError, TypeError, ValueError) as error:
+                self.report({"WARNING"}, f"Guided Ridge: width rail projection unavailable ({error})")
+                state["width_rails"] = {"left": [], "right": []}
             _guided_ridge_overlay_tag(state)
             return {"RUNNING_MODAL"}
         if event_type == "MOUSEMOVE":
@@ -26373,6 +29879,251 @@ class VIEW3D_PT_mesh_focus_guided_ridge(bpy.types.Panel):
         layout.label(text="LMB: 点追加 / Enter: 適用 / Esc: 取消")
 
 
+class VIEW3D_PT_mesh_focus_orbit_tools(bpy.types.Panel):
+    """Daily MFO settings kept beside the resident T-toolbar tools."""
+
+    bl_idname = "VIEW3D_PT_mesh_focus_orbit_tools"
+    bl_label = "Mesh Focus Orbit"
+    bl_category = TOPOLOGY_COLOR_PANEL_CATEGORY
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+
+    @classmethod
+    def poll(cls, context):
+        return (
+            context.area is not None
+            and context.area.type == "VIEW_3D"
+            and context.mode in {"OBJECT", "EDIT_MESH", "SCULPT"}
+        )
+
+    def draw(self, context):
+        layout = self.layout
+        scene = getattr(context, "scene", None)
+        prefs = _addon_preferences()
+        if scene is not None and hasattr(scene, "mfo_reference_object"):
+            layout.prop(scene, "mfo_reference_object", text="Reference Object")
+        if prefs is not None:
+            layout.prop(prefs, "activation_key", text="Activation Key")
+            layout.prop(prefs, "double_tap_window", text="Double-tap Window")
+            layout.prop(prefs, "show_indicator", text="Show Indicator")
+            layout.prop(
+                prefs,
+                "retopoflow_target_island_filter",
+                text="RetopoFlow Island Filter",
+            )
+        try:
+            state = _active_states.get(int(context.area.as_pointer()))
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            state = None
+        if state is not None and getattr(state, "active", False):
+            label = "Face Set MFO: ON" if isinstance(state, _FaceSetOrbitState) else "MFO: ON"
+            layout.label(text=label, icon="CHECKMARK")
+        else:
+            layout.label(text="MFO: OFF", icon="X")
+        layout.separator()
+        layout.label(text="Tツール: クリックで対象面を指定")
+        if context.mode in {"OBJECT", "EDIT_MESH"}:
+            layout.label(text="Ctrl + クリック: Face Set (厳密)")
+        elif context.mode == "SCULPT":
+            layout.label(text="Sculpt: SFSF / Guided Ridge は専用ツール")
+
+
+_MFO_TOOL_ICON_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "assets",
+    "mfo-toolbar-icons-astra",
+)
+
+
+def _mfo_toolbar_icon(stem, fallback):
+    """Return an installed VCO stem, or a shipped Blender icon fallback."""
+    custom_stem = os.path.join(_MFO_TOOL_ICON_DIR, str(stem))
+    return custom_stem if os.path.isfile(custom_stem + ".dat") else fallback
+
+
+_MFO_ICON_FOCUS = _mfo_toolbar_icon("mfo-focus-surface", "ops.generic.cursor")
+_MFO_ICON_FACE_SET = _mfo_toolbar_icon("mfo-face-set", "ops.sculpt.border_face_set")
+_MFO_ICON_SMART_FILL = _mfo_toolbar_icon(
+    "mfo-smart-face-set-fill", "ops.sculpt.border_face_set"
+)
+_MFO_ICON_GUIDED_RIDGE = _mfo_toolbar_icon(
+    "mfo-guided-ridge", "ops.sculpt.border_mask"
+)
+_MFO_ICON_TUBE = _mfo_toolbar_icon("mfo-tube-shape", "ops.sculpt.box_trim")
+
+
+class VIEW3D_WST_mesh_focus_normal_object(bpy.types.WorkSpaceTool):
+    bl_idname = "mfo.normal_object"
+    bl_label = "MFO: Focus Surface"
+    bl_description = "Click a mesh surface to set the temporary orbit target"
+    bl_space_type = "VIEW_3D"
+    bl_context_mode = "OBJECT"
+    bl_icon = _MFO_ICON_FOCUS
+    bl_keymap = (
+        (TOOL_NORMAL_OPERATOR_ID, {"type": "LEFTMOUSE", "value": "PRESS"}, {}),
+        (TOOL_FACE_SET_OPERATOR_ID, {"type": "LEFTMOUSE", "value": "PRESS", "ctrl": True}, {}),
+    )
+
+
+class VIEW3D_WST_mesh_focus_normal_edit(bpy.types.WorkSpaceTool):
+    bl_idname = "mfo.normal_edit"
+    bl_label = "MFO: Focus Surface"
+    bl_description = "Click an edit-mode mesh surface to set the orbit target"
+    bl_space_type = "VIEW_3D"
+    bl_context_mode = "EDIT_MESH"
+    bl_icon = _MFO_ICON_FOCUS
+    bl_keymap = VIEW3D_WST_mesh_focus_normal_object.bl_keymap
+
+
+class VIEW3D_WST_mesh_focus_normal_sculpt(bpy.types.WorkSpaceTool):
+    bl_idname = "mfo.normal_sculpt"
+    bl_label = "MFO: Focus Surface"
+    bl_description = "Click a Sculpt mesh surface to set the temporary orbit target"
+    bl_space_type = "VIEW_3D"
+    bl_context_mode = "SCULPT"
+    bl_icon = _MFO_ICON_FOCUS
+    bl_keymap = ((TOOL_NORMAL_OPERATOR_ID, {"type": "LEFTMOUSE", "value": "PRESS"}, {}),)
+
+
+class VIEW3D_WST_mesh_focus_face_set_object(bpy.types.WorkSpaceTool):
+    bl_idname = "mfo.face_set_object"
+    bl_label = "MFO: Face Set Focus"
+    bl_description = "Click a configured Reference Object Face Set"
+    bl_space_type = "VIEW_3D"
+    bl_context_mode = "OBJECT"
+    bl_icon = _MFO_ICON_FACE_SET
+    bl_keymap = ((TOOL_FACE_SET_OPERATOR_ID, {"type": "LEFTMOUSE", "value": "PRESS"}, {}),)
+
+
+class VIEW3D_WST_mesh_focus_face_set_edit(bpy.types.WorkSpaceTool):
+    bl_idname = "mfo.face_set_edit"
+    bl_label = "MFO: Face Set Focus"
+    bl_description = "Click a configured Reference Object Face Set"
+    bl_space_type = "VIEW_3D"
+    bl_context_mode = "EDIT_MESH"
+    bl_icon = _MFO_ICON_FACE_SET
+    bl_keymap = VIEW3D_WST_mesh_focus_face_set_object.bl_keymap
+
+
+class VIEW3D_WST_mesh_focus_smart_fill_sculpt(bpy.types.WorkSpaceTool):
+    bl_idname = "mfo.smart_fill_sculpt"
+    bl_label = "MFO: Smart Face Set Fill"
+    bl_description = "Click a Sculpt surface to preview Smart Face Set Fill"
+    bl_space_type = "VIEW_3D"
+    bl_context_mode = "SCULPT"
+    bl_icon = _MFO_ICON_SMART_FILL
+    bl_keymap = (
+        (LOCAL_FACE_SET_GROW_OPERATOR_ID, {"type": "LEFTMOUSE", "value": "PRESS"}, {}),
+        (LOCAL_FACE_SET_GROW_OPERATOR_ID, {"type": "LEFTMOUSE", "value": "PRESS", "ctrl": True}, {}),
+    )
+
+
+class VIEW3D_WST_mesh_focus_guided_ridge_sculpt(bpy.types.WorkSpaceTool):
+    bl_idname = "mfo.guided_ridge_sculpt"
+    bl_label = "MFO: Guided Ridge"
+    bl_description = "Click a Sculpt Face Set to start a Guided Ridge guide"
+    bl_space_type = "VIEW_3D"
+    bl_context_mode = "SCULPT"
+    bl_icon = _MFO_ICON_GUIDED_RIDGE
+    bl_keymap = ((GUIDED_RIDGE_OPERATOR_ID, {"type": "LEFTMOUSE", "value": "PRESS"}, {}),)
+
+
+class VIEW3D_WST_mesh_focus_tube_sculpt(bpy.types.WorkSpaceTool):
+    bl_idname = "mfo.tube_shape_sculpt"
+    bl_label = "MFO: Tube Shape"
+    bl_description = "Click a Sculpt Face Set tube to start Tube Shape"
+    bl_space_type = "VIEW_3D"
+    bl_context_mode = "SCULPT"
+    bl_icon = _MFO_ICON_TUBE
+    bl_keymap = ((TUBE_SHAPE_OPERATOR_ID, {"type": "LEFTMOUSE", "value": "PRESS"}, {}),)
+
+
+_TOOL_CLASSES = (
+    VIEW3D_WST_mesh_focus_normal_object,
+    VIEW3D_WST_mesh_focus_normal_edit,
+    VIEW3D_WST_mesh_focus_normal_sculpt,
+    VIEW3D_WST_mesh_focus_face_set_object,
+    VIEW3D_WST_mesh_focus_face_set_edit,
+    VIEW3D_WST_mesh_focus_smart_fill_sculpt,
+    VIEW3D_WST_mesh_focus_guided_ridge_sculpt,
+    VIEW3D_WST_mesh_focus_tube_sculpt,
+)
+_MFO_TOOL_CONTEXT_LABELS = {
+    "OBJECT": "Object",
+    "EDIT_MESH": "Edit Mesh",
+    "SCULPT": "Sculpt",
+}
+_MFO_TOOL_KEYMAP_NAMES = frozenset(
+    "3D View Tool: {mode}, {label}".format(
+        mode=_MFO_TOOL_CONTEXT_LABELS.get(
+            str(tool_cls.bl_context_mode),
+            str(tool_cls.bl_context_mode),
+        ),
+        label=str(tool_cls.bl_label),
+    )
+    for tool_cls in _TOOL_CLASSES
+)
+
+
+def _remove_stale_tool_keymaps():
+    """Remove MFO tool keymaps left by a failed/reloaded registration.
+
+    Blender's ``unregister_tool`` can only remove keymaps through the exact
+    old Python class object.  After ``importlib.reload`` that object is gone,
+    so empty or partial ``3D View Tool: ..., MFO: ...`` keymaps can survive.
+    They are owned exclusively by this add-on and are safe to rebuild before
+    registering the current tool classes.  Match only the exact names Blender
+    generates from the current mode and tool labels so an unrelated add-on's
+    similarly named keymap is not swept up.
+    """
+    try:
+        keyconfigs = bpy.context.window_manager.keyconfigs
+        # The user's keyconfig may contain hand-customized generated tool
+        # bindings.  Never remove it during registration/reload; only clean
+        # the add-on/default owners that MFO can safely regenerate.
+        for keyconfig_name in ("default", "addon"):
+            keyconfig = getattr(keyconfigs, keyconfig_name, None)
+            if keyconfig is None:
+                continue
+            for keymap in list(keyconfig.keymaps):
+                keymap_name = str(getattr(keymap, "name", ""))
+                if keymap_name in _MFO_TOOL_KEYMAP_NAMES:
+                    keyconfig.keymaps.remove(keymap)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        pass
+
+
+def _register_tools():
+    registered = []
+    _remove_stale_tool_keymaps()
+    for tool_cls in _TOOL_CLASSES:
+        try:
+            bpy.utils.register_tool(tool_cls)
+            registered.append(tool_cls)
+        except Exception as error:
+            # importlib.reload can replace the Python class object while
+            # Blender still owns the old WorkSpaceTool registration.  The
+            # existing id is already the one visible in the toolbar; keeping
+            # it avoids a duplicate and lets addon_utils disable/enable
+            # finish without treating a stale class identity as fatal.
+            if "already exists" in str(error).lower():
+                continue
+            for registered_cls in reversed(registered):
+                try:
+                    bpy.utils.unregister_tool(registered_cls)
+                except (AttributeError, RuntimeError, TypeError, ValueError):
+                    pass
+            raise
+
+
+def _unregister_tools():
+    for tool_cls in reversed(_TOOL_CLASSES):
+        try:
+            bpy.utils.unregister_tool(tool_cls)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            pass
+
+
 def _remove_keymaps():
     for keymap, keymap_item in _addon_keymaps:
         try:
@@ -26399,6 +30150,12 @@ def _remove_keymaps():
             "view3d.mesh_focus_shadow_analysis_toggle",
         }
         for keymap in keyconfig.keymaps:
+            # WorkSpaceTool keymaps are owned by ``register_tool`` and may
+            # intentionally reuse the same operator IDs as legacy hotkeys.
+            # Never remove their click bindings during the regular keymap
+            # rebuild; ``_unregister_tools`` handles those as a unit.
+            if str(getattr(keymap, "name", "")).startswith("3D View Tool:"):
+                continue
             for keymap_item in list(keymap.keymap_items):
                 if keymap_item.idname not in owned_operator_ids:
                     continue
@@ -26664,6 +30421,8 @@ class MESH_FOCUS_ORBIT_AddonPreferences(bpy.types.AddonPreferences):
 CLASSES = (
     VIEW3D_OT_mesh_focus_orbit_recover_face_set_state,
     VIEW3D_OT_mesh_focus_orbit_watcher,
+    VIEW3D_OT_mesh_focus_orbit_tool,
+    VIEW3D_OT_mesh_focus_face_set_tool,
     VIEW3D_OT_mesh_focus_face_set_activate,
     VIEW3D_OT_mesh_focus_orbit,
     VIEW3D_OT_mesh_focus_guided_ridge,
@@ -26675,6 +30434,7 @@ CLASSES = (
     VIEW3D_OT_mesh_focus_topology_color_assign,
     VIEW3D_PT_mesh_focus_local_feature_brush,
     VIEW3D_PT_mesh_focus_guided_ridge,
+    VIEW3D_PT_mesh_focus_orbit_tools,
     VIEW3D_PT_mesh_focus_topology_colors,
     MESH_FOCUS_ORBIT_AddonPreferences,
 )
@@ -26696,6 +30456,7 @@ def register():
             poll=_reference_object_poll,
         )
     _is_registered = True
+    _register_tools()
     # A script reload can leave an old MFO wrapper on RetopoFlow's class even
     # though the previous module no longer has Python state for it.
     _restore_retopoflow_hooks()
@@ -26793,6 +30554,7 @@ def unregister():
                 _handler_list.remove(_handler)
         _restore_retopoflow_hooks()
         _stop_topology_color_draw()
+        _unregister_tools()
         return
     _finish_all_states()
     _fill_preview_cancel(reason="unregister")
@@ -26845,6 +30607,7 @@ def unregister():
             _handler_list.remove(_handler)
     _stop_topology_color_draw()
     _remove_keymaps()
+    _unregister_tools()
     _local_face_set_adjacency_cache.clear()
     _fill_preview_adjacency_cache.clear()
     _fill_preview_cursor_cache.clear()

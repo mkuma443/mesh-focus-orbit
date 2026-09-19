@@ -1,0 +1,232 @@
+{
+  "mfo-focus-surface": {
+    "triangles": 3869,
+    "rows": [
+      {
+        "background": [
+          32,
+          33,
+          38
+        ],
+        "bbox_128": [
+          10,
+          22,
+          120,
+          106
+        ],
+        "coverage_128": 4718
+      },
+      {
+        "background": [
+          224,
+          226,
+          230
+        ],
+        "bbox_128": [
+          10,
+          22,
+          120,
+          106
+        ],
+        "coverage_128": 4718
+      }
+    ],
+    "source_png": {
+      "size": [
+        512,
+        512
+      ],
+      "alpha_bbox": [
+        41,
+        87,
+        481,
+        421
+      ],
+      "alpha_pixels": 74985
+    }
+  },
+  "mfo-face-set": {
+    "triangles": 1829,
+    "rows": [
+      {
+        "background": [
+          32,
+          33,
+          38
+        ],
+        "bbox_128": [
+          31,
+          22,
+          113,
+          106
+        ],
+        "coverage_128": 4403
+      },
+      {
+        "background": [
+          224,
+          226,
+          230
+        ],
+        "bbox_128": [
+          31,
+          22,
+          113,
+          106
+        ],
+        "coverage_128": 4403
+      }
+    ],
+    "source_png": {
+      "size": [
+        512,
+        512
+      ],
+      "alpha_bbox": [
+        126,
+        87,
+        454,
+        421
+      ],
+      "alpha_pixels": 70132
+    }
+  },
+  "mfo-smart-face-set-fill": {
+    "triangles": 1555,
+    "rows": [
+      {
+        "background": [
+          32,
+          33,
+          38
+        ],
+        "bbox_128": [
+          5,
+          18,
+          121,
+          107
+        ],
+        "coverage_128": 5763
+      },
+      {
+        "background": [
+          224,
+          226,
+          230
+        ],
+        "bbox_128": [
+          5,
+          18,
+          121,
+          107
+        ],
+        "coverage_128": 5763
+      }
+    ],
+    "source_png": {
+      "size": [
+        512,
+        512
+      ],
+      "alpha_bbox": [
+        23,
+        81,
+        485,
+        437
+      ],
+      "alpha_pixels": 92141
+    }
+  },
+  "mfo-guided-ridge": {
+    "triangles": 994,
+    "rows": [
+      {
+        "background": [
+          32,
+          33,
+          38
+        ],
+        "bbox_128": [
+          6,
+          22,
+          120,
+          92
+        ],
+        "coverage_128": 4820
+      },
+      {
+        "background": [
+          224,
+          226,
+          230
+        ],
+        "bbox_128": [
+          6,
+          22,
+          120,
+          92
+        ],
+        "coverage_128": 4820
+      }
+    ],
+    "source_png": {
+      "size": [
+        512,
+        512
+      ],
+      "alpha_bbox": [
+        25,
+        142,
+        480,
+        421
+      ],
+      "alpha_pixels": 76318
+    }
+  },
+  "mfo-tube-shape": {
+    "triangles": 5121,
+    "rows": [
+      {
+        "background": [
+          32,
+          33,
+          38
+        ],
+        "bbox_128": [
+          14,
+          14,
+          115,
+          107
+        ],
+        "coverage_128": 4898
+      },
+      {
+        "background": [
+          224,
+          226,
+          230
+        ],
+        "bbox_128": [
+          14,
+          14,
+          115,
+          107
+        ],
+        "coverage_128": 4898
+      }
+    ],
+    "source_png": {
+      "size": [
+        512,
+        512
+      ],
+      "alpha_bbox": [
+        60,
+        83,
+        460,
+        455
+      ],
+      "alpha_pixels": 77622
+    }
+  }
+}

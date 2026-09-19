@@ -2,13 +2,13 @@
 
 Blender 5.2 用のリトポロジー支援アドオンです。
 
-アドオンバージョン: **3.3.13**
+アドオンバージョン: **3.3.34**
 
 ## 主な機能
 
 - **通常 MFO**: Object / Edit / Sculpt Mode で、現在の 3D Viewport の中央レイが最初に当たる表示中の MESH 面を一時的な Orbit 中心にします。
 - **Face Set MFO (FSMFO)**: Reference Object の中央レイが当たる Face Set と、対応が明確な Retopo island だけを一時表示します。
-- **Guided Ridge**: Sculpt Mode で複数のガイド点を置き、同じ Face Set の一つの連結成分だけに、ガイドに沿った変形を一度適用します。これはブラシではなく、ガイドを使う変形コマンドです。
+- **Guided Ridge**: Sculpt Mode で固定したcrest guideと左右rail幅を指定し、幅内の既存protrusionだけを内側へplaningします。凹みを埋めず、guide・anchor・裏面は固定します。
 - **Smart Face Set Fill**: Sculpt Mode でカーソル下の局所形状から Face Set の範囲をプレビューし、確定時に Face Set を書き込みます。
 - **Shadow Analysis View**: `Shift + Alt + E` で現在の View3D だけに独立した解析表示を切り替えます。
 - **Topology Colors**: Edit Mode の選択面に 1〜6 の半透明ガイド色を保存します。
@@ -18,10 +18,19 @@ Blender 5.2 用のリトポロジー支援アドオンです。
 
 1. `Edit > Preferences > Add-ons > Install...` を開きます。
 2. `mesh_focus_orbit.py` を選択します。
-3. `Mesh Focus Orbit` を有効にします。
-4. FSMFO を使う場合は、Add-on Preferences の `Reference Object` に Face Set を持つ参照メッシュを指定します。
+3. 配布物の `assets/mfo-toolbar-icons-astra/` を、アドオンファイルと同じ配置先の相対 `assets/mfo-toolbar-icons-astra/` へコピーします（欠落時はBlender標準アイコンへフォールバックします）。
+4. `Mesh Focus Orbit` を有効にします。
+5. FSMFO を使う場合は、Add-on Preferences の `Reference Object` に Face Set を持つ参照メッシュを指定します。
 
 アドオンはユーザー設定以外のシーンを自動保存しません。Reference Object は FSMFO 専用です。通常 MFO は現在の View3D で表示中の MESH 群を中央レイで調べ、最前面の hit を対象にします。Guided Ridge は現在のアクティブな MESH を対象にします。
+
+Tツールバーは、編集可能なAstra Blenderソースから生成した5種のBlender VCO `.dat` ジオメトリアイコンを使用します。`assets/mfo-toolbar-icons-astra/` をアドオンの相対パスへ保持してください。欠落時は機能ごとにBlender標準アイコンへ安全にフォールバックします。
+
+### TツールバーとNサイドバー
+
+左側のTツールバーにはモード別のMFO常駐ツールが表示されます。`MFO: Focus Surface` を選んでメッシュ面を左クリックすると、クリック座標直下を通常MFOの対象にします。Object/Edit Modeでは同じツールの `Ctrl + 左クリック` が、従来のCtrl起動と同じFace Set MFO（厳密）経路になります。Face Set MFO専用、Smart Face Set Fill（Ctrlで厳格）、Guided Ridge、Tube Shapeも対応モードに表示されます。
+
+右側の `MFO` タブでは、Preferencesを開かずに `Reference Object` と日常設定を変更できます。Reference ObjectはPreferencesと同じSceneプロパティを編集するため、設定値は二重化されません。クリック座標は常にイベントの3D View WINDOW region座標を使用し、画面中央や過去のブラシ位置へ置き換えません。
 
 ## 基本操作
 
@@ -29,8 +38,11 @@ Blender 5.2 用のリトポロジー支援アドオンです。
 | --- | --- | --- | --- |
 | 通常 MFO | Object / Edit / Sculpt | 設定した Activation Key を短時間に 2 回 | 同じ操作で終了 |
 | Face Set MFO | Object / Edit | `Ctrl` + Activation Key を短時間に 2 回 | 同じ操作で終了 |
+| MFO Tツール | Object / Edit / Sculpt | Tツールで選択後、面を左クリック（Object/EditはCtrlでFace Set） | 同種入口を3D View region内で再クリックしてトグルOFF。Face Set ON中はFace Set入口を使う |
+| Smart Face Set Fill Tツール | Sculpt | ツールで選択後、面を左クリック（Ctrlで厳格） | 開始クリックを離した後、次のLMBで確定。以降は既存SFSFモーダルの操作 |
+| Guided Ridge / Tube Shape Tツール | Sculpt | ツールで選択後、対象面を左クリック（Guided Ridgeの最初のクリックは起点設定のみ） | Guided Ridgeは準備・計算中に進捗を表示し、`Esc`/右クリックで取消。準備完了後にLMBで点追加、Wheel/Shift+Wheelで左右共通幅（requested max）を調整、`Enter`で適用 |
 | Guided Ridge | Sculpt | `Ctrl + G`。カーソル下の面を起点にし、LMB で点を追加、`Enter` で適用 | `Backspace` で直前の点を削除、`Esc` または右クリックで取消 |
-| Guided Ridge Repeat Last | Sculpt | Blender 標準の `Shift + R` | 保存済みガイドを現在の表面へ再投影して再適用。専用 Shift+R keymap はありません |
+| Guided Ridge Repeat Last | Sculpt | Blender 標準の `Shift + R` | 保存済みguide/widthを現在の表面へ再投影して独立Undoで適用。専用Shift+R keymapはありません |
 | Smart Face Set Fill | Sculpt | `E`、開始キーを離してから `E` または `Enter` | ホイールで距離、`Esc` で取消 |
 | Strict Smart Face Set Fill | Sculpt | `Ctrl + E`、開始キーを離してから `E` または `Enter` | ホイールで距離、`Esc` で取消 |
 | Shadow Analysis View | Sculpt | `Shift + Alt + E` | 現在の View3D の表示補助だけを切替 |
@@ -55,16 +67,16 @@ Preferences の `RetopoFlow Focus-Island Snap/Weld Filter` を有効にすると
 
 ## Guided Ridge
 
-Guided Ridge は、ガイド点を使って局所的な ridge 状の変形を作るコマンドです。ブラシストロークや Sculpt Brush の選択は使用しません。
+Guided Ridge（3.3.34）は、固定したguide crestと、Wheelで指定する左右共通planing半幅（requested max）から2枚のtarget planeを作り、幅内でtargetより外側へ突出した既存surfaceだけを内側へ削ります。毛先などsurfaceの可用幅が狭い区間では左右を独立に実surfaceへtaperし、別sheetへ飛ばず、表示railと適用railを一致させます。盛り上げや凹みの埋め戻しは行わず、guide、左右rail anchor/support、幅外、裏面、Face Set boundary、hidden、full maskは固定します。partial maskは削り量を減衰します。railとcandidateは同じcaptured width/frame resultを共有し、投影不能区間や明確な別sheet競合は無変更で拒否します。準備とEnter後の計算はtimerで進捗表示し、`Esc`/右クリックで取消できます。各railの実投影q/hとbarycentric supportも共通結果を使うため、投影が公称幅からずれても表示railを通るtargetになります。通常MFO/Face Set MFOがONでも状態を変更せず開始できます。ガイド編集中のMMB/NDOF/NUMPAD/Navigation GizmoはBlenderの視点操作へ透過します。
 
-1. Sculpt Mode で対象 Face Set 上にカーソルを置き、`Ctrl + G` を押します。
-2. カーソル下の可視面を起点に、同じ Face Set ID の同一 edge-connected component を取得します。
-3. 同じ成分上を LMB でクリックしてガイド点を追加します。点の間は表面へ投影した滑らかな曲線として表示されます。
-4. `Backspace` で直前の点を戻せます。`Enter` で確定すると、対象成分の安全な頂点だけを一つの Undo ステップで変形します。
+1. Sculpt Mode で対象 Face Set 上にカーソルを置き、`Ctrl + G` を押します。Tツールでは対象面を最初に左クリックします。この最初のクリックは起点設定と準備開始だけで、点追加・適用には再利用されません。
+2. カーソル下の可視面を起点に、同じ Face Set ID の同一 edge-connected component を取得します。準備中は工程と進捗を表示し、`Esc` または右クリックで安全に取消できます。
+3. 準備完了後、同じ成分上を LMB でクリックしてガイド点を追加します。点の間は表面へ投影した滑らかな曲線として表示されます。
+4. `Backspace` で直前の点を戻せます。Wheelは左右共通のplaning半幅を拡大し、Wheel Downは縮小します。`Shift + Wheel`は細かく調整します。HUDとrail previewで幅を確認し、`Enter`で計算・適用を開始します。幅変更は同じguide frameを再利用し、軽いrail更新だけを行います。
 5. `Esc` または右クリックは、入力中のガイドを破棄してメッシュを変更しません。
-6. 確定後は Blender 標準の `Shift + R` (Repeat Last) を使えます。保存済みの面アンカーとバリセントリック座標を現在の同じ表面へ再投影し、同じ方向の変形を一回ずつ適用します。各 Repeat は独立した Undo/Redo 境界です。
+6. 適用後は Blender 標準の `Shift + R` (Repeat Last) を使えます。保存済みguideと幅を現在の同じsurfaceへ再投影し、同じplaning方向で独立したUndoステップとして適用します。
 
-Face Set の境界、非表示面・非表示頂点、完全マスク頂点、同じ Face Set ID でも非連結の成分、対象外オブジェクトは変更しません。部分マスク頂点はマスク量に応じて変形量を減衰させます。共有 Mesh、Shape Key、Multires、Dyntopo、リンク／評価済み Mesh、ライブラリオーバーライドなど、安定した頂点対応を保証できない状態では開始または Repeat を拒否します。ガイド、対象オブジェクト、Mesh datablock、可視性、トポロジーが無効になった場合も、変更せず安全に取消します。
+Face Set の境界、非表示面・非表示頂点、完全マスク頂点、同じ Face Set ID でも非連結の成分、対象外オブジェクトは変更しません。部分マスク頂点はマスク量に応じて変形量を減衰させます。共有 Mesh、Shape Key、Multires、Dyntopo、リンク／評価済み Mesh、ライブラリオーバーライドなど、安定した頂点対応を保証できない状態では開始またはRepeatを拒否します。ガイド、対象オブジェクト、Mesh datablock、可視性、トポロジーが無効になった場合も、変更せず安全に取消します。
 
 ## Smart Face Set Fill
 
@@ -112,9 +124,9 @@ Edit Mode で面を選択し、`Ctrl + Alt + 1`〜`6` を押すと、表示中�
 - 通常 MFO は Reference Object がなくても、中央レイが表示中の MESH に当たれば起動します。
 - FSMFO は Reference Object、`.sculpt_face_set`、中央レイの Face Set hit が必要です。
 - RetopoFlow 連携は RetopoFlow がインストールされている場合だけ有効です。
-- Shape Key、共有 Mesh、Multires、Dyntopo、リンク Mesh、評価済み Mesh などは Guided Ridge の直接書き込み対象外です。
+- Shape Key、共有 Mesh、Multires、Dyntopo、リンク Mesh、評価済み MeshなどはGuided Ridgeの直接書き込み対象外です。
 - ファイルロード、Undo による対象変更、モード・オブジェクト・Mesh・可視性・トポロジーの変更、アドオン無効化では一時状態・予測・draw handler・isolation を cleanup します。
-- Blender 標準の Undo/Redo は初回適用と各 Repeat を個別に戻せます。保存済みガイドの対象が無効になった場合は Repeat を適用しません。
+- Blender標準のUndo/Redoは初回適用と各Repeatを個別に戻せます。保存済みguideの対象が無効になった場合はRepeatを適用しません。
 
 ---
 
@@ -122,13 +134,13 @@ Edit Mode で面を選択し、`Ctrl + Alt + 1`〜`6` を押すと、表示中�
 
 A Blender 5.2 add-on for manual retopology workflows.
 
-Add-on version: **3.3.13**
+Add-on version: **3.3.34**
 
 ## Main features
 
 - **Normal MFO**: in Object, Edit, or Sculpt Mode, temporarily orbits around the first visible MESH surface hit by the center ray of the current 3D Viewport.
 - **Face Set MFO (FSMFO)**: temporarily shows the Face Set hit on the configured Reference Object and isolates a clearly matching Retopo island when possible.
-- **Guided Ridge**: places several surface guide points and applies one guided deformation to one connected component of the same Face Set. It is a guided deformation command, not a brush.
+- **Guided Ridge**: fixes a guide crest and user-selected shared width rails, then planes only existing protrusions inward inside that width. It does not fill depressions or move the guide, anchors, backside, or protected vertices.
 - **Smart Face Set Fill**: previews a local Face Set region under the cursor and writes the Face Set only when confirmed.
 - **Shadow Analysis View**: toggles an independent analysis display in the current View3D with `Shift + Alt + E`.
 - **Topology Colors**: stores six translucent topology guide colors on selected Edit Mode faces.
@@ -138,10 +150,19 @@ Add-on version: **3.3.13**
 
 1. Open `Edit > Preferences > Add-ons > Install...`.
 2. Select `mesh_focus_orbit.py`.
-3. Enable `Mesh Focus Orbit`.
-4. For FSMFO, set a Face Set-bearing reference mesh in Add-on Preferences > `Reference Object`.
+3. Copy the distribution's `assets/mfo-toolbar-icons-astra/` beside the add-on using the same relative path (missing files safely fall back to Blender's standard icons).
+4. Enable `Mesh Focus Orbit`.
+5. For FSMFO, set a Face Set-bearing reference mesh in Add-on Preferences > `Reference Object`.
 
 The add-on does not automatically save a scene. `Reference Object` is used by FSMFO only. Normal MFO ray-casts the visible MESH objects in the current View3D and uses the nearest hit; Guided Ridge operates on the current active MESH.
+
+The T-toolbar uses five custom Blender VCO `.dat` geometry icons generated from the editable Astra Blender source in `work/astra-icon-modeling/`. Keep those `.dat` files beside the add-on under `assets/mfo-toolbar-icons-astra/`; every tool falls back to a shipped Blender icon when its custom file is unavailable.
+
+### T-toolbar and N-sidebar
+
+The left T-toolbar contains resident, mode-specific MFO tools. Select `MFO: Focus Surface` and left-click a mesh surface to use that click location as the normal MFO target. In Object/Edit Mode, `Ctrl + left-click` on the same tool follows the existing strict Face Set MFO activation path. Dedicated Face Set MFO, Smart Face Set Fill (Ctrl for strict), Guided Ridge, and Tube Shape tools appear only in their supported modes.
+
+The `MFO` tab in the right N-sidebar exposes `Reference Object` and compact daily settings without opening Preferences. It edits the same Scene property used by Preferences, so there is no duplicated source of truth. Clicks always use the event's 3D View WINDOW-region coordinates rather than the viewport center or a previous brush position.
 
 ## Basic operations
 
@@ -149,8 +170,11 @@ The add-on does not automatically save a scene. `Reference Object` is used by FS
 | --- | --- | --- | --- |
 | Normal MFO | Object / Edit / Sculpt | Press the configured Activation Key twice quickly | Press it twice again to leave |
 | Face Set MFO | Object / Edit | `Ctrl` + Activation Key twice quickly | Press the same combination again to leave |
+| MFO T-tool | Object / Edit / Sculpt | Select in T-toolbar, then left-click a surface (Ctrl uses Face Set in Object/Edit) | Re-click the same entry inside the 3D View region to toggle OFF; while Face Set is ON, use the Face Set entry |
+| Smart Face Set Fill T-tool | Sculpt | Select in T-toolbar, then left-click (Ctrl for strict) | Release the start click, then use the next LMB to confirm; existing SFSF modal controls apply afterward |
+| Guided Ridge / Tube Shape T-tools | Sculpt | Select in T-toolbar, then left-click a target surface (the first Guided Ridge click only sets the start point) | Guided Ridge shows preparation/computation progress; `Esc`/right-click cancels. After Ready, LMB adds points, Wheel/Shift+Wheel adjusts the shared requested maximum width, and `Enter` applies |
 | Guided Ridge | Sculpt | `Ctrl + G`; the cursor hit starts the guide, LMB adds points, `Enter` applies | `Backspace` removes the last point; `Esc` or right click cancels |
-| Guided Ridge Repeat Last | Sculpt | Blender's standard `Shift + R` | Reprojects the saved guide to the current surface; no Guided Ridge Shift+R keymap is added |
+| Guided Ridge Repeat Last | Sculpt | Blender's standard `Shift + R` | Reprojects the saved guide/width and applies an independent Undo step; no Guided Ridge Shift+R keymap is added |
 | Smart Face Set Fill | Sculpt | `E`, release it, then press `E` again or `Enter` | Wheel changes distance; `Esc` cancels |
 | Strict Smart Face Set Fill | Sculpt | `Ctrl + E`, release it, then press `E` again or `Enter` | Wheel changes distance; `Esc` cancels |
 | Shadow Analysis View | Sculpt | `Shift + Alt + E` | Display helper for the current View3D |
@@ -175,16 +199,16 @@ When `RetopoFlow Focus-Island Snap/Weld Filter` is enabled, PolyPen Snap and Tra
 
 ## Guided Ridge
 
-Guided Ridge is a command that forms a local ridge-like deformation from a surface guide. It does not use a brush stroke or Sculpt Brush selection.
+Guided Ridge (3.3.34) fixes the guide as a crest line and builds two planing target planes from the shared requested maximum half-width shown by the rails. Where the surface narrows, each side tapers independently to the available surface without jumping to another sheet; preview and apply use the same projected rails. It moves only existing protrusions inside the selected width inward toward those planes; it never adds material or fills depressions. Guide, rail anchors/support, width outside, backside, Face Set boundaries, hidden vertices, and fully masked vertices remain fixed, while partial masks attenuate the displacement. Preview rails, candidate target planes, fixed-anchor checks, and Repeat share the same captured width/frame result. The candidate uses each projected rail's actual local q/h endpoint rather than nominal width, and preserves triangle/edge barycentric support so every rail support remains fixed. Projection gaps and clearly competing nearby sheets are rejected without a mesh write. Preparation and post-Enter computation yield through timer slices with progress HUD and `Esc`/right-click cancellation. Guided Ridge may start while Normal/Face Set MFO remains active; viewport MMB/NDOF/NUMPAD/Navigation Gizmo events pass through during guide editing.
 
-1. In Sculpt Mode, place the cursor over a Face Set and press `Ctrl + G`.
-2. The visible cursor hit becomes the start point, and the add-on captures the same Face Set ID's single edge-connected component.
-3. Click LMB on that component to add guide points. The guide is displayed as a smooth curve projected onto the surface.
-4. Press `Backspace` to remove the last point. Press `Enter` to apply one safe deformation to the component as one Undo step.
+1. In Sculpt Mode, place the cursor over a Face Set and press `Ctrl + G`. With the T-tool, left-click the target surface first. That first click only sets the start point and begins preparation; it is never reused as a point or confirmation.
+2. The visible cursor hit becomes the start point, and the add-on captures the same Face Set ID's single edge-connected component. Preparation shows its stage/progress; `Esc` or right-click cancels safely.
+3. After the Ready state, click LMB on that component to add guide points. The guide is displayed as a smooth curve projected onto the surface.
+4. Press `Backspace` to remove the last point. Use Wheel to change the shared left/right half-width and `Shift + Wheel` for fine adjustment; the HUD and projected rails show the active width. Width changes reuse the same guide frame and only refresh the lightweight rails. `Enter` computes and applies the planing candidate as one Undo step; `Esc`/right click cancels it.
 5. `Esc` or right click discards the in-progress guide without changing the mesh.
-6. After confirmation, use Blender's standard `Shift + R` (Repeat Last). The saved face anchors and barycentric coordinates are reprojected to the current same surface and applied in the same direction. Each Repeat has its own Undo/Redo boundary.
+6. After confirmation, use Blender's standard `Shift + R` Repeat Last. The saved guide and half-width are reprojected to the same surface and applied with the same planing direction in an independent Undo step.
 
-Face Set boundaries, hidden faces and vertices, fully masked vertices, disconnected components with the same Face Set ID, and other objects are not changed. Partial masks attenuate the displacement according to the mask value. Shared Mesh data, Shape Keys, Multires, Dyntopo, linked/evaluated meshes, and library overrides are rejected because stable vertex mapping cannot be guaranteed. If the guide, target object, Mesh datablock, visibility, or topology becomes invalid, the operation cancels without a write.
+Face Set boundaries, hidden faces and vertices, fully masked vertices, disconnected components with the same Face Set ID, and other objects are not changed. Partial masks attenuate the displacement according to mask value. Shared Mesh data, Shape Keys, Multires, Dyntopo, linked/evaluated meshes, and library overrides are rejected because stable vertex mapping cannot be guaranteed. If the guide, target object, Mesh datablock, visibility, or topology becomes invalid, the operation cancels without a write.
 
 ## Smart Face Set Fill
 

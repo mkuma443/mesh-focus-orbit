@@ -1,0 +1,168 @@
+{
+  "mfo-focus-surface": {
+    "triangles": 3869,
+    "path": "C:\\Users\\mkuma\\.codex\\worktrees\\d126\\blender-5-2-add-on-temporary\\assets\\mfo-toolbar-icons-astra\\mfo-focus-surface.dat",
+    "evaluation": {
+      "scene": "01 | MFO Focus Surface",
+      "evaluated_scene": "01 | MFO Focus Surface",
+      "view_layer": "ViewLayer",
+      "modifier_objects": [
+        {
+          "object": "Orbit | broad beveled lavender ribbon",
+          "modifiers": [
+            "BEVEL",
+            "WEIGHTED_NORMAL"
+          ],
+          "source_vertices": 516,
+          "source_polygons": 514,
+          "source_triangles": 1028,
+          "evaluated_vertices": 2128,
+          "evaluated_polygons": 2130,
+          "evaluated_triangles": 4252,
+          "changed": true
+        },
+        {
+          "object": "Orbit | broad directional arrowhead",
+          "modifiers": [
+            "BEVEL",
+            "WEIGHTED_NORMAL"
+          ],
+          "source_vertices": 6,
+          "source_polygons": 5,
+          "source_triangles": 8,
+          "evaluated_vertices": 72,
+          "evaluated_polygons": 74,
+          "evaluated_triangles": 140,
+          "changed": true
+        }
+      ]
+    }
+  },
+  "mfo-face-set": {
+    "triangles": 1829,
+    "path": "C:\\Users\\mkuma\\.codex\\worktrees\\d126\\blender-5-2-add-on-temporary\\assets\\mfo-toolbar-icons-astra\\mfo-face-set.dat",
+    "evaluation": {
+      "scene": "02 | Face Set MFO",
+      "evaluated_scene": "02 | Face Set MFO",
+      "view_layer": "ViewLayer",
+      "modifier_objects": [
+        {
+          "object": "Orbit | Face Set arrowhead",
+          "modifiers": [
+            "BEVEL",
+            "WEIGHTED_NORMAL"
+          ],
+          "source_vertices": 6,
+          "source_polygons": 5,
+          "source_triangles": 8,
+          "evaluated_vertices": 72,
+          "evaluated_polygons": 74,
+          "evaluated_triangles": 140,
+          "changed": true
+        },
+        {
+          "object": "Orbit | Face Set curved lavender ribbon",
+          "modifiers": [
+            "BEVEL",
+            "WEIGHTED_NORMAL"
+          ],
+          "source_vertices": 388,
+          "source_polygons": 386,
+          "source_triangles": 772,
+          "evaluated_vertices": 1616,
+          "evaluated_polygons": 1618,
+          "evaluated_triangles": 3228,
+          "changed": true
+        }
+      ]
+    }
+  },
+  "mfo-smart-face-set-fill": {
+    "triangles": 1555,
+    "path": "C:\\Users\\mkuma\\.codex\\worktrees\\d126\\blender-5-2-add-on-temporary\\assets\\mfo-toolbar-icons-astra\\mfo-smart-face-set-fill.dat",
+    "evaluation": {
+      "scene": "03 | Smart Face Set Fill",
+      "evaluated_scene": "03 | Smart Face Set Fill",
+      "view_layer": "ViewLayer",
+      "modifier_objects": [
+        {
+          "object": "Fill | bounded face-set surface",
+          "modifiers": [
+            "SOLIDIFY"
+          ],
+          "source_vertices": 17,
+          "source_polygons": 24,
+          "source_triangles": 24,
+          "evaluated_vertices": 34,
+          "evaluated_polygons": 56,
+          "evaluated_triangles": 64,
+          "changed": true
+        }
+      ]
+    }
+  },
+  "mfo-guided-ridge": {
+    "triangles": 994,
+    "path": "C:\\Users\\mkuma\\.codex\\worktrees\\d126\\blender-5-2-add-on-temporary\\assets\\mfo-toolbar-icons-astra\\mfo-guided-ridge.dat",
+    "evaluation": {
+      "scene": "04 | Guided Ridge",
+      "evaluated_scene": "04 | Guided Ridge",
+      "view_layer": "ViewLayer",
+      "modifier_objects": [
+        {
+          "object": "Guide | lavender rail directly on the crest",
+          "modifiers": [
+            "BEVEL",
+            "WEIGHTED_NORMAL"
+          ],
+          "source_vertices": 24,
+          "source_polygons": 22,
+          "source_triangles": 44,
+          "evaluated_vertices": 224,
+          "evaluated_polygons": 230,
+          "evaluated_triangles": 444,
+          "changed": true
+        }
+      ]
+    }
+  },
+  "mfo-tube-shape": {
+    "triangles": 5121,
+    "path": "C:\\Users\\mkuma\\.codex\\worktrees\\d126\\blender-5-2-add-on-temporary\\assets\\mfo-toolbar-icons-astra\\mfo-tube-shape.dat",
+    "evaluation": {
+      "scene": "05 | Tube Shape",
+      "evaluated_scene": "05 | Tube Shape",
+      "view_layer": "ViewLayer",
+      "modifier_objects": [
+        {
+          "object": "Shape | local cross-section band 0",
+          "modifiers": [
+            "BEVEL",
+            "WEIGHTED_NORMAL"
+          ],
+          "source_vertices": 388,
+          "source_polygons": 386,
+          "source_triangles": 772,
+          "evaluated_vertices": 1616,
+          "evaluated_polygons": 1618,
+          "evaluated_triangles": 3228,
+          "changed": true
+        },
+        {
+          "object": "Shape | local cross-section band 1",
+          "modifiers": [
+            "BEVEL",
+            "WEIGHTED_NORMAL"
+          ],
+          "source_vertices": 388,
+          "source_polygons": 386,
+          "source_triangles": 772,
+          "evaluated_vertices": 1616,
+          "evaluated_polygons": 1618,
+          "evaluated_triangles": 3228,
+          "changed": true
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,97 @@
+{
+  "mfo-focus-surface": {
+    "size": [
+      512,
+      512
+    ],
+    "mode": "RGBA",
+    "visible_bbox": [
+      41,
+      87,
+      481,
+      421
+    ],
+    "transparent_pixels": 187159,
+    "opaque_pixels": 71050,
+    "antialiased_edge_pixels": 3935,
+    "components_alpha32": [
+      73757
+    ]
+  },
+  "mfo-face-set": {
+    "size": [
+      512,
+      512
+    ],
+    "mode": "RGBA",
+    "visible_bbox": [
+      126,
+      87,
+      454,
+      421
+    ],
+    "transparent_pixels": 192012,
+    "opaque_pixels": 66928,
+    "antialiased_edge_pixels": 3204,
+    "components_alpha32": [
+      69120
+    ]
+  },
+  "mfo-smart-face-set-fill": {
+    "size": [
+      512,
+      512
+    ],
+    "mode": "RGBA",
+    "visible_bbox": [
+      23,
+      81,
+      485,
+      437
+    ],
+    "transparent_pixels": 170003,
+    "opaque_pixels": 89505,
+    "antialiased_edge_pixels": 2636,
+    "components_alpha32": [
+      91349
+    ]
+  },
+  "mfo-guided-ridge": {
+    "size": [
+      512,
+      512
+    ],
+    "mode": "RGBA",
+    "visible_bbox": [
+      25,
+      142,
+      480,
+      421
+    ],
+    "transparent_pixels": 185826,
+    "opaque_pixels": 73790,
+    "antialiased_edge_pixels": 2528,
+    "components_alpha32": [
+      75561
+    ]
+  },
+  "mfo-tube-shape": {
+    "size": [
+      512,
+      512
+    ],
+    "mode": "RGBA",
+    "visible_bbox": [
+      60,
+      83,
+      460,
+      455
+    ],
+    "transparent_pixels": 184522,
+    "opaque_pixels": 74843,
+    "antialiased_edge_pixels": 2779,
+    "components_alpha32": [
+      76719
+    ]
+  }
+}
