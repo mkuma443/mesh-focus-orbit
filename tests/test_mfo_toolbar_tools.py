@@ -49,9 +49,15 @@ def _guided_ridge_snapshot_equivalence(module):
 
     mesh = bpy.data.meshes.new("_mfo_guided_ridge_equivalence_mesh")
     mesh.from_pydata(
-        [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)],
+        [
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (1.0, 1.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (-1.0, 1.0, 0.0),
+        ],
         [],
-        [(0, 1, 2), (0, 2, 3)],
+        [(0, 1, 2), (0, 2, 3), (0, 3, 4)],
     )
     mesh.update()
     attr = mesh.attributes.new(".sculpt_face_set", "INT", "FACE")
@@ -1677,6 +1683,304 @@ def _guided_ridge_mfo_navigation_fixture(module):
         module._guided_ridge_overlay_tag = original["overlay"]
 
 
+def _smart_fill_vertex_paint_fixture(module):
+    """Confirm Smart Fill writes only the sampled Vertex Paint region."""
+    import bpy
+    import numpy as np
+    from mathutils import Vector
+
+    mesh = bpy.data.meshes.new("_mfo_smart_fill_vertex_mesh")
+    mesh.from_pydata(
+        [
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (1.0, 1.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (-1.0, 1.0, 0.0),
+        ],
+        [],
+        [(0, 1, 2), (0, 2, 3), (0, 3, 4)],
+    )
+    mesh.update()
+    obj = bpy.data.objects.new("_mfo_smart_fill_vertex_object", mesh)
+    original_flood = module._fill_preview_confirm_flood
+    original_valid = module._fill_preview_valid
+    original_cancel = module._fill_preview_cancel
+    original_sample = module._vertex_paint_sample_color
+    try:
+        corner = mesh.color_attributes.new(
+            name="mfo_corner_color", type="BYTE_COLOR", domain="CORNER"
+        )
+        point = mesh.color_attributes.new(
+            name="mfo_point_color", type="FLOAT_COLOR", domain="POINT"
+        )
+        # Make the clicked face red, the adjacent target face blue, and the
+        # outside face green.  The two target faces share vertices, so the
+        # POINT case also documents Blender's native shared-vertex semantics.
+        red = (0.9, 0.1, 0.05, 1.0)
+        blue = (0.05, 0.1, 0.9, 1.0)
+        green = (0.1, 0.8, 0.2, 1.0)
+        for index, item in enumerate(corner.data):
+            item.color = red if index in {0, 1, 2} else blue if index in {3, 4, 5} else green
+        for item in point.data:
+            item.color = blue
+        mesh.color_attributes.active_color_index = 0
+        active, reason = module._vertex_paint_active_color_attribute(obj)
+        assert active is not None and active.name == corner.name and reason is None
+        no_active, no_active_reason = module._vertex_paint_active_color_attribute(
+            SimpleNamespace(data=SimpleNamespace(color_attributes=SimpleNamespace(active_color=None)))
+        )
+        assert no_active is None and "active" in no_active_reason.lower()
+        seed_location = Vector((0.2, 0.2, 0.0))
+        seed = module._vertex_paint_sample_color(obj, 0, seed_location, corner)
+        assert seed is not None and np.allclose(seed, red, atol=1.0e-2)
+        module._fill_preview_confirm_flood = lambda _state, _result: np.asarray(
+            [0, 1], dtype=np.int32
+        )
+        state = {
+            "backend": "PAINT_VERTEX",
+            "obj": obj,
+            "seed_face": 0,
+            "seed_local_location": tuple(seed_location),
+            "seed_color": tuple(seed),
+            "color_attribute_signature": module._vertex_paint_color_signature(obj, corner),
+        }
+        written, reason = module._fill_preview_write_vertex_paint(state, {})
+        assert reason is None and written[0] == 3 and written[2] == "CORNER"
+        corner_values = np.empty((len(corner.data), 4), dtype=np.float32)
+        corner.data.foreach_get("color", corner_values.ravel())
+        assert np.allclose(corner_values[:3], seed, atol=2.0e-5)
+        assert np.allclose(corner_values[3:6], seed, atol=2.0e-5)
+        outside_corner_before = np.array(corner_values[6:], copy=True)
+        assert np.allclose(corner_values[6], green, atol=1.0e-2)
+        assert np.array_equal(corner_values[6:], outside_corner_before)
+
+        mesh.color_attributes.active_color_index = 1
+        active, reason = module._vertex_paint_active_color_attribute(obj)
+        assert active is not None and active.name == point.name and reason is None
+        for index, item in enumerate(point.data):
+            item.color = red if index == 0 else blue
+        point_seed = module._vertex_paint_sample_color(
+            obj, 0, seed_location, point
+        )
+        assert point_seed is not None
+        point_state = dict(state)
+        point_state.update(
+            {
+                "seed_color": point_seed,
+                "color_attribute_signature": module._vertex_paint_color_signature(obj, point),
+            }
+        )
+        point_values = np.empty((len(point.data), 4), dtype=np.float32)
+        point.data.foreach_get("color", point_values.ravel())
+        outside_point_before = np.array(point_values[4], copy=True)
+        point_written, reason = module._fill_preview_write_vertex_paint(point_state, {})
+        assert reason is None and point_written[0] > 0 and point_written[2] == "POINT"
+        point_values = np.empty((len(point.data), 4), dtype=np.float32)
+        point.data.foreach_get("color", point_values.ravel())
+        assert np.allclose(point_values[:4], point_seed, atol=2.0e-5)
+        assert np.allclose(point_values[4], blue, atol=2.0e-5)
+        assert np.array_equal(point_values[4], outside_point_before)
+
+        stale = dict(point_state)
+        stale["color_attribute_signature"] = (0, "stale", "POINT", "FLOAT_COLOR", 4)
+        stale_written, stale_reason = module._fill_preview_write_vertex_paint(stale, {})
+        assert stale_written is None and "changed" in stale_reason
+        # Exercise the real modal confirm branch: Vertex Paint must not look
+        # up Sculpt's .sculpt_face_set attribute before dispatching its writer.
+        module._fill_preview_valid = lambda _state, _context: True
+        module._fill_preview_cancel = lambda current, _reason: current.__setitem__("active", False)
+        confirm_state = dict(point_state)
+        confirm_state.update(
+            {
+                "active": True,
+                "phase": "ready",
+                "pending": False,
+                "result": {"created_generation": 0},
+                "generation": 0,
+            }
+        )
+        confirm_reports = []
+        confirm_operator = SimpleNamespace(
+            report=lambda level, message: confirm_reports.append((level, message))
+        )
+        confirm_result = module.VIEW3D_OT_mesh_focus_local_face_set_grow._finish_confirm(
+            confirm_operator, SimpleNamespace(), confirm_state
+        )
+        assert confirm_result == {"FINISHED"}
+        assert confirm_reports and "point" in confirm_reports[-1][1].lower()
+
+        # Unmodified source geometry is supported, while a viewport modifier
+        # would make the evaluated hit triangle diverge from source colors.
+        compatible, compatibility_reason = module._vertex_paint_geometry_compatibility(obj)
+        assert compatible and compatibility_reason is None
+        modifier = obj.modifiers.new("mfo_vertex_paint_test_subsurf", "SUBSURF")
+        try:
+            compatible, compatibility_reason = module._vertex_paint_geometry_compatibility(obj)
+            assert not compatible and "modifier" in compatibility_reason.lower()
+        finally:
+            obj.modifiers.remove(modifier)
+        shape_key_obj = SimpleNamespace(
+            modifiers=[],
+            data=SimpleNamespace(
+                shape_keys=SimpleNamespace(key_blocks=[object(), object()])
+            ),
+        )
+        compatible, compatibility_reason = module._vertex_paint_geometry_compatibility(
+            shape_key_obj
+        )
+        assert not compatible and "shape" in compatibility_reason.lower()
+
+        # Isolated invoke observation: an evaluated/source mismatch is
+        # rejected before raycast, preview allocation, or any color write;
+        # Ctrl remains visible to the strict-mode flag on this path.
+        original_cursor_coordinate = module._sculpt_cursor_region_coordinate
+        original_geometry_compatibility = module._vertex_paint_geometry_compatibility
+        try:
+            module._sculpt_cursor_region_coordinate = lambda _context, _event: Vector((2.0, 3.0))
+            module._vertex_paint_geometry_compatibility = lambda _obj: (
+                False, "injected evaluated/source mismatch"
+            )
+            invoke_reports = []
+            invoke_proxy = SimpleNamespace(
+                poll=module.VIEW3D_OT_mesh_focus_local_face_set_grow.poll,
+                report=lambda level, message: invoke_reports.append((level, message)),
+                strict_mode=False,
+            )
+            invoke_context = SimpleNamespace(
+                area=SimpleNamespace(type="VIEW_3D"),
+                region=SimpleNamespace(type="WINDOW"),
+                space_data=SimpleNamespace(),
+                mode="PAINT_VERTEX",
+                active_object=SimpleNamespace(type="MESH"),
+            )
+            invoke_result = module.VIEW3D_OT_mesh_focus_local_face_set_grow.invoke(
+                invoke_proxy,
+                invoke_context,
+                SimpleNamespace(type="E", value="PRESS", ctrl=True),
+            )
+            assert invoke_result == {"CANCELLED"}
+            assert invoke_proxy.strict_mode is True
+            assert invoke_reports and "mismatch" in invoke_reports[-1][1]
+        finally:
+            module._sculpt_cursor_region_coordinate = original_cursor_coordinate
+            module._vertex_paint_geometry_compatibility = original_geometry_compatibility
+
+        # Exercise the n-gon fallback path: a point outside all loop triangles
+        # samples the deterministic average of the polygon's corner colors.
+        ngon_mesh = bpy.data.meshes.new("_mfo_smart_fill_vertex_ngon_mesh")
+        ngon_obj = None
+        try:
+            ngon_mesh.from_pydata(
+                [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.5, 0.8, 0.0),
+                 (0.5, 1.3, 0.0), (-0.2, 0.7, 0.0)],
+                [], [(0, 1, 2, 3, 4)],
+            )
+            ngon_mesh.update()
+            ngon_obj = bpy.data.objects.new("_mfo_smart_fill_vertex_ngon_object", ngon_mesh)
+            ngon = ngon_mesh.color_attributes.new(
+                name="mfo_ngon_color", type="FLOAT_COLOR", domain="CORNER"
+            )
+            ngon_colors = np.asarray(
+                [(0.9, 0.1, 0.05, 1.0), (0.1, 0.8, 0.2, 1.0),
+                 (0.2, 0.3, 0.9, 1.0), (0.8, 0.4, 0.1, 1.0),
+                 (0.4, 0.1, 0.7, 1.0)],
+                dtype=np.float32,
+            )
+            ngon.data.foreach_set("color", ngon_colors.ravel())
+            ngon_seed = module._vertex_paint_sample_color(
+                ngon_obj, 0, Vector((10.0, 10.0, 0.0)), ngon
+            )
+            assert ngon_seed is not None
+            assert np.allclose(ngon_seed, np.mean(ngon_colors, axis=0), atol=1.0e-5)
+        finally:
+            if ngon_obj is not None:
+                bpy.data.objects.remove(ngon_obj, do_unlink=True)
+            bpy.data.meshes.remove(ngon_mesh)
+
+        # Inject a failure after the first foreach_set (the simulated write)
+        # and verify that the writer restores the complete original array.
+        class _FailingColorData:
+            def __init__(self, values):
+                self.values = np.array(values, dtype=np.float32, copy=True)
+                self.calls = 0
+
+            def __len__(self):
+                return len(self.values)
+
+            def foreach_get(self, _name, target):
+                target[:] = self.values.ravel()
+
+            def foreach_set(self, _name, source):
+                self.calls += 1
+                self.values = np.array(source, dtype=np.float32, copy=True).reshape((-1, 4))
+                if self.calls == 1:
+                    raise RuntimeError("injected foreach_set failure")
+
+        original_failure_values = np.asarray(
+            [(0.2, 0.3, 0.4, 1.0), (0.7, 0.6, 0.5, 1.0), (0.1, 0.2, 0.3, 1.0)],
+            dtype=np.float32,
+        )
+        failing_data = _FailingColorData(original_failure_values)
+        failing_attribute = SimpleNamespace(
+            name="mfo_failure_color",
+            domain="POINT",
+            data_type="FLOAT_COLOR",
+            data=failing_data,
+        )
+        failing_attrs = SimpleNamespace(active_color=failing_attribute)
+        failing_mesh = SimpleNamespace(
+            color_attributes=failing_attrs,
+            polygons=[SimpleNamespace(loop_indices=[0, 1, 2])],
+            loops=[SimpleNamespace(vertex_index=0), SimpleNamespace(vertex_index=1),
+                   SimpleNamespace(vertex_index=2)],
+            as_pointer=lambda: 9137,
+            update=lambda: None,
+        )
+        failing_obj = SimpleNamespace(data=failing_mesh, modifiers=[])
+        module._vertex_paint_sample_color = lambda *_args: tuple(original_failure_values[0])
+        failure_state = {
+            "obj": failing_obj,
+            "seed_face": 0,
+            "seed_local_location": (0.0, 0.0, 0.0),
+            "seed_color": tuple(original_failure_values[0]),
+            "color_attribute_signature": module._vertex_paint_color_signature(
+                failing_obj, failing_attribute
+            ),
+        }
+        module._fill_preview_confirm_flood = lambda _state, _result: np.asarray(
+            [0], dtype=np.int32
+        )
+        failure_written, failure_reason = module._fill_preview_write_vertex_paint(
+            failure_state, {}
+        )
+        assert failure_written is None and "restored" in failure_reason
+        assert failing_data.calls == 2
+        assert np.array_equal(failing_data.values, original_failure_values)
+        return {
+            "passed": True,
+            "corner_changed": int(written[0]),
+            "point_changed": int(point_written[0]),
+            "outside_corner_exact": True,
+            "outside_point_exact": True,
+            "shared_point_semantics": True,
+            "stale_attribute_rejected": True,
+            "modifier_rejected": True,
+            "shape_key_rejected": True,
+            "no_active_attribute_rejected": True,
+            "invoke_modifier_guard": True,
+            "ngon_sampling": True,
+            "modal_confirm_finished": True,
+        }
+    finally:
+        module._fill_preview_confirm_flood = original_flood
+        module._fill_preview_valid = original_valid
+        module._fill_preview_cancel = original_cancel
+        module._vertex_paint_sample_color = original_sample
+        bpy.data.objects.remove(obj, do_unlink=True)
+        bpy.data.meshes.remove(mesh)
+
+
 def run():
     module = _load_module()
     region = SimpleNamespace(type="WINDOW", x=40, y=30, width=800, height=600)
@@ -2194,6 +2498,21 @@ def run():
         tool for tool in module._TOOL_CLASSES if tool.bl_idname == "mfo.smart_fill_sculpt"
     )
     assert any(item[1].get("ctrl") is True for item in sfsf_sculpt.bl_keymap)
+    sfsf_vertex = next(
+        tool for tool in module._TOOL_CLASSES if tool.bl_idname == "mfo.smart_fill_vertex"
+    )
+    assert sfsf_vertex.bl_context_mode == "PAINT_VERTEX"
+    assert sfsf_vertex.bl_icon == sfsf_sculpt.bl_icon
+    assert any(item[1].get("ctrl") is True for item in sfsf_vertex.bl_keymap)
+    vertex_poll_context = SimpleNamespace(
+        area=context.area,
+        region=region,
+        space_data=context.space_data,
+        mode="PAINT_VERTEX",
+        active_object=SimpleNamespace(type="MESH"),
+    )
+    assert module.VIEW3D_OT_mesh_focus_local_face_set_grow.poll(vertex_poll_context)
+    smart_fill_vertex = _smart_fill_vertex_paint_fixture(module)
 
     # WorkSpaceTool icons must resolve to Blender's shipped .dat assets, not
     # regular UI enum names (which silently render as no icon).
@@ -2250,11 +2569,14 @@ def run():
             self.keymaps = _FakeKeymaps(keymaps)
 
     known_name = "3D View Tool: Object, MFO: Focus Surface"
+    known_vertex_name = "3D View Tool: Paint Vertex, MFO: Smart Fill"
     unknown_name = "3D View Tool: Object, MFO: Focus Surface Custom"
     fake_user_sentinel = _FakeKeymap(known_name, [SimpleNamespace(idname="wm.search_menu")])
     fake_keyconfigs = SimpleNamespace(
-        default=_FakeKeyconfig([_FakeKeymap(known_name), _FakeKeymap(unknown_name)]),
-        addon=_FakeKeyconfig([_FakeKeymap(known_name)]),
+        default=_FakeKeyconfig([
+            _FakeKeymap(known_name), _FakeKeymap(known_vertex_name), _FakeKeymap(unknown_name)
+        ]),
+        addon=_FakeKeyconfig([_FakeKeymap(known_name), _FakeKeymap(known_vertex_name)]),
         user=_FakeKeyconfig([fake_user_sentinel]),
     )
     original_bpy_for_keymaps = module.bpy
@@ -2267,6 +2589,7 @@ def run():
         module._remove_stale_tool_keymaps()
         assert [km.name for km in fake_keyconfigs.default.keymaps] == [unknown_name]
         assert list(fake_keyconfigs.addon.keymaps) == []
+        assert known_vertex_name in module._MFO_TOOL_KEYMAP_NAMES
         assert fake_keyconfigs.user.keymaps[0] is fake_user_sentinel
         assert fake_user_sentinel.keymap_items[0].idname == "wm.search_menu"
         user_keymap_result = {
@@ -2303,6 +2626,7 @@ def run():
         "icon_dat_count": len(icon_paths),
         "user_keymap": user_keymap_result,
         "sfsf_ctrl_binding": True,
+        "smart_fill_vertex": smart_fill_vertex,
         "dispatch_observed": {"on_coordinate": True, "off_toggle": True},
         "guided_ridge_lifecycle": guided_lifecycle,
         "guided_ridge_prepare_cleanup": prepare_cleanup,

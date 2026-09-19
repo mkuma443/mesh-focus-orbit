@@ -9,7 +9,7 @@ rotating the view.
 bl_info = {
     "name": "Mesh Focus Orbit",
     "author": "OpenAI",
-    "version": (3, 3, 34),
+    "version": (3, 3, 36),
     "blender": (5, 2, 0),
     "location": "3D View",
     "description": "Mesh-centered orbit, Face Set tools, Smart Fill, and Guided Ridge",
@@ -7451,6 +7451,181 @@ def _raycast_sculpt_face_set(context, coord):
         return None
 
 
+def _raycast_visible_mesh_face(context, coord):
+    """Return the first visible active-mesh face under a viewport coordinate."""
+    obj = getattr(context, "active_object", None)
+    if obj is None or getattr(obj, "type", None) != "MESH":
+        return None
+    try:
+        coord = Vector(coord)
+        region = context.region
+        rv3d = context.space_data.region_3d
+        direction = view3d_utils.region_2d_to_vector_3d(region, rv3d, coord)
+        if direction.length_squared <= 1.0e-20:
+            return None
+        direction.normalize()
+        world_segment = _sculpt_cursor_ray_segment(context, coord, direction)
+        if world_segment is None:
+            return None
+        world_start, world_end = world_segment
+        world_ray = world_end - world_start
+        ray_length_squared = float(world_ray.length_squared)
+        if ray_length_squared <= 1.0e-20:
+            return None
+        world_direction = world_ray.normalized()
+        inverse = obj.matrix_world.inverted_safe()
+        local_origin = inverse @ world_start
+        local_direction = inverse.to_3x3() @ world_direction
+        if local_direction.length_squared <= 1.0e-20:
+            return None
+        local_direction.normalize()
+        for _attempt in range(256):
+            hit, local_location, _local_normal, face_index = obj.ray_cast(
+                local_origin, local_direction
+            )
+            if not hit or face_index < 0 or face_index >= len(obj.data.polygons):
+                return None
+            polygon = obj.data.polygons[int(face_index)]
+            world_location = obj.matrix_world @ local_location
+            hit_fraction = float(
+                (world_location - world_start).dot(world_ray)
+            ) / ray_length_squared
+            if hit_fraction < -1.0e-6 or hit_fraction > 1.0 + 1.0e-6:
+                return None
+            if not bool(polygon.hide):
+                return (
+                    obj,
+                    int(face_index),
+                    world_location,
+                    Vector(local_location),
+                    coord,
+                )
+            hit_distance = max((world_location - world_start).length, 1.0e-7)
+            advance = min(max(hit_distance * 1.0e-6, 1.0e-7), 1.0e-3)
+            local_origin = inverse @ (world_location + world_direction * advance)
+        return None
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _vertex_paint_active_color_attribute(obj):
+    """Return the active supported Vertex Paint color attribute and reason."""
+    try:
+        color_attributes = obj.data.color_attributes
+        attribute = getattr(color_attributes, "active_color", None)
+        if attribute is None:
+            return None, "no active color attribute"
+        domain = str(attribute.domain)
+        data_type = str(attribute.data_type)
+        if domain not in {"POINT", "CORNER"}:
+            return None, f"unsupported color domain: {domain}"
+        if data_type not in {"FLOAT_COLOR", "BYTE_COLOR"}:
+            return None, f"unsupported color type: {data_type}"
+        return attribute, None
+    except (AttributeError, IndexError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None, "active color attribute is unavailable"
+
+
+def _vertex_paint_geometry_compatibility(obj):
+    """Reject visible/evaluated geometry whose hit cannot map to source colors.
+
+    The color writer targets the original Mesh attribute.  Until an explicit
+    evaluated-triangle-to-source mapping exists, viewport modifiers and
+    non-basis shape keys can make a ray hit differ from that source mesh.
+    Unmodified meshes (and a basis-only shape-key datablock) retain the native
+    polygon/loop correspondence and are safe to sample.
+    """
+    try:
+        for modifier in obj.modifiers:
+            if bool(getattr(modifier, "show_viewport", True)):
+                return False, "Vertex Paint Smart Fill requires modifiers disabled in the viewport"
+        shape_keys = getattr(obj.data, "shape_keys", None)
+        key_blocks = getattr(shape_keys, "key_blocks", None) if shape_keys is not None else None
+        if key_blocks is not None and len(key_blocks) > 1:
+            return False, "Vertex Paint Smart Fill does not support non-basis shape keys"
+        return True, None
+    except (AttributeError, IndexError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return False, "Vertex Paint Smart Fill could not verify source/evaluated geometry"
+
+
+def _vertex_paint_color_signature(obj, attribute):
+    try:
+        return (
+            int(obj.data.as_pointer()),
+            str(attribute.name),
+            str(attribute.domain),
+            str(attribute.data_type),
+            int(len(attribute.data)),
+        )
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _vertex_paint_triangle_barycentric(point, tri_points):
+    import numpy as np
+
+    origin = np.asarray(tri_points[0], dtype=np.float64)
+    edge_a = np.asarray(tri_points[1], dtype=np.float64) - origin
+    edge_b = np.asarray(tri_points[2], dtype=np.float64) - origin
+    offset = np.asarray(point, dtype=np.float64) - origin
+    d00 = float(np.dot(edge_a, edge_a))
+    d01 = float(np.dot(edge_a, edge_b))
+    d11 = float(np.dot(edge_b, edge_b))
+    d20 = float(np.dot(offset, edge_a))
+    d21 = float(np.dot(offset, edge_b))
+    denominator = d00 * d11 - d01 * d01
+    if denominator <= 1.0e-20:
+        return None
+    value_b = (d11 * d20 - d01 * d21) / denominator
+    value_c = (d00 * d21 - d01 * d20) / denominator
+    value_a = 1.0 - value_b - value_c
+    values = np.asarray((value_a, value_b, value_c), dtype=np.float64)
+    if not np.all(np.isfinite(values)) or float(np.min(values)) < -1.0e-5:
+        return None
+    return tuple(float(value) for value in values)
+
+
+def _vertex_paint_sample_color(obj, face_index, local_location, attribute):
+    """Sample the actual active color attribute at a hit face location."""
+    import numpy as np
+
+    mesh = obj.data
+    polygon = mesh.polygons[int(face_index)]
+    mesh.calc_loop_triangles()
+    candidates = [
+        triangle
+        for triangle in mesh.loop_triangles
+        if int(triangle.polygon_index) == int(face_index)
+    ]
+    selected_values = None
+    selected_weights = None
+    selected_ids = None
+    for triangle in candidates:
+        loop_ids = tuple(int(value) for value in triangle.loops)
+        vertex_ids = tuple(int(value) for value in triangle.vertices)
+        points = [mesh.vertices[index].co for index in vertex_ids]
+        weights = _vertex_paint_triangle_barycentric(local_location, points)
+        if weights is not None:
+            selected_weights = weights
+            selected_ids = loop_ids if str(attribute.domain) == "CORNER" else vertex_ids
+            break
+    if selected_ids is None:
+        selected_ids = tuple(
+            int(loop_index) if str(attribute.domain) == "CORNER" else int(mesh.loops[loop_index].vertex_index)
+            for loop_index in polygon.loop_indices
+        )
+        selected_weights = tuple(1.0 / max(len(selected_ids), 1) for _ in selected_ids)
+    values = np.asarray(
+        [tuple(attribute.data[index].color) for index in selected_ids],
+        dtype=np.float64,
+    )
+    if values.ndim != 2 or values.shape[1] != 4 or not len(values):
+        return None
+    weights = np.asarray(selected_weights, dtype=np.float64)
+    weights /= max(float(np.sum(weights)), 1.0e-20)
+    return tuple(float(value) for value in np.sum(values * weights[:, None], axis=0))
+
+
 def _sculpt_cursor_region_coordinate(context, event):
     """Return the event cursor in the owning View3D WINDOW region.
 
@@ -7458,7 +7633,7 @@ def _sculpt_cursor_region_coordinate(context, event):
     (``mouse_region_x/y``) event fields.  The latter is normally correct, but
     it is not a sufficient ownership check when an operator is reached from a
     keymap while a sibling region (header/sidebar/asset shelf) is under the
-    pointer.  Smart Face Set Fill must never silently reinterpret such an
+    pointer.  Smart Fill must never silently reinterpret such an
     event as a different point in the 3D view.
 
     Use the absolute event position and the actual WINDOW region origin as the
@@ -11855,7 +12030,7 @@ def _guided_ridge_conflict_reason(context):
     if _guided_ridge_state is not None and _guided_ridge_state.get("active"):
         return "Guided Ridge is already active"
     if _fill_preview_state is not None and _fill_preview_state.get("active"):
-        return "Smart Face Set Fill is active"
+        return "Smart Fill is active"
     if _tube_preview_state is not None and _tube_preview_state.get("active"):
         return "Tube Shape is active"
     try:
@@ -15366,7 +15541,7 @@ class VIEW3D_OT_mesh_focus_tube_shape(bpy.types.Operator):
         if not self.poll(context):
             return {"PASS_THROUGH"}
         if _fill_preview_state is not None and _fill_preview_state.get("active"):
-            self.report({"WARNING"}, "Tube Shape: 先に Smart Face Set Fill の予測を終了してください")
+            self.report({"WARNING"}, "Tube Shape: 先に Smart Fill の予測を終了してください")
             return {"CANCELLED"}
         if _tube_preview_state is not None:
             _tube_preview_cancel(reason="replaced")
@@ -16319,7 +16494,7 @@ def _fill_preview_cursor_prepare_steps(obj, seed_face):
 def _fill_preview_topology_fingerprint(loop_edges, loop_vertices, totals):
     """Return a compact fingerprint for the connectivity-only cache layer.
 
-    Face Set values are intentionally absent.  The Smart Face Set Fill graph
+    Face Set values are intentionally absent.  The Smart Fill graph
     is an expensive connectivity index; a Face Set paint changes only the
     live classification read by each E invocation and must not evict this
     index.  The loop arrays are retained only as a compact integrity guard so
@@ -16402,7 +16577,7 @@ def _fill_preview_refresh_cached_adjacency(obj, cached):
         if int(cached.get("count", -1)) != face_count:
             return False
 
-        # Face Set Paint and SFSF confirmation are the common dirty path.  The
+        # Face Set Paint and Smart Fill confirmation are the common dirty path.  The
         # graph deliberately excludes Face Set IDs, so identify that path from
         # the live attribute first and avoid touching the large loop/coordinate
         # arrays.  Hidden state is still checked because visibility is a hard
@@ -16465,7 +16640,7 @@ def _fill_preview_refresh_cached_adjacency(obj, cached):
             and hidden_matches
             and coordinate_fingerprint == cached.get("coordinate_fingerprint")
         ):
-            # This is the common Face Set Paint/SFSF-confirm case.  The
+            # This is the common Face Set Paint/Smart Fill-confirm case.  The
             # topology graph and its geometry are still valid; only the live
             # Face Set attribute changed.  Clear the dirty marker without
             # sorting or rebuilding the CSR graph.
@@ -26979,8 +27154,13 @@ def _fill_preview_make_result(state, radius):
         local["partitions"] = {}
     # Face Set assistance belongs to the geometry strict initial phase only;
     # ordinary E is entirely shadow/graph based and never reads the ID layer.
+    # Vertex Paint uses only geometry/shading adjacency plus the sampled
+    # active color; Sculpt Face Set IDs are never a region prior or seed
+    # constraint for that backend.
     face_set_initial_phase = (
-        state.get("processed_radius") is None and not shadow_mode
+        state.get("backend", "SCULPT") == "SCULPT"
+        and state.get("processed_radius") is None
+        and not shadow_mode
     )
     face_set_metrics = {
         "face_set_prior_phase": "initial" if face_set_initial_phase else "disabled-after-initial",
@@ -28610,7 +28790,7 @@ def _fill_preview_valid(state, context):
                 not window_key
                 or (window is not None and int(window.as_pointer()) == window_key)
             )
-            and context.mode == "SCULPT"
+            and context.mode == str(state.get("mode", "SCULPT"))
             and context.active_object is obj
             and _fill_preview_signature(obj) == state["signature"]
         )
@@ -28641,6 +28821,20 @@ def _on_fill_preview_depsgraph_update(_scene, depsgraph):
     state = _fill_preview_state
     try:
         updates = tuple(depsgraph.updates)
+        # Vertex Paint color edits are shading-only updates.  They do not
+        # alter polygon topology or the reusable adjacency graph, so retain
+        # that graph and let the confirm writer's seed/signature validation
+        # decide whether a stale preview may be committed.  Geometry updates
+        # remain fully invalidating and are still handled conservatively.
+        if state is not None and state.get("active") and state.get("backend") == "PAINT_VERTEX":
+            updates = tuple(
+                update
+                for update in updates
+                if not (
+                    getattr(update, "is_updated_shading", False)
+                    and getattr(update, "is_updated_geometry", False) is False
+                )
+            )
         updated_pointers = _fill_preview_update_pointers(updates)
         if not updated_pointers:
             return
@@ -29049,13 +29243,114 @@ def _smart_face_set_fill(context, coord, strict_mode=False):
 
 
 
+def _fill_preview_write_vertex_paint(state, result):
+    """Write the ready Smart Fill candidate through the active color layer."""
+    import numpy as np
+
+    obj = state.get("obj")
+    attribute, reason = _vertex_paint_active_color_attribute(obj)
+    if attribute is None:
+        return None, reason or "active color attribute is unavailable"
+    signature = _vertex_paint_color_signature(obj, attribute)
+    if signature != state.get("color_attribute_signature"):
+        return None, "active color attribute changed during preview"
+    seed_location = state.get("seed_local_location")
+    seed_color = state.get("seed_color")
+    if seed_location is None or seed_color is None:
+        return None, "seed color sample is unavailable"
+    current_seed = _vertex_paint_sample_color(
+        obj,
+        int(state.get("seed_face", -1)),
+        Vector(seed_location),
+        attribute,
+    )
+    if current_seed is None or not np.allclose(
+        np.asarray(current_seed, dtype=np.float64),
+        np.asarray(seed_color, dtype=np.float64),
+        atol=2.0e-5,
+        rtol=0.0,
+    ):
+        return None, "seed color changed during preview"
+    faces = _fill_preview_confirm_flood(state, result)
+    if faces is None or len(faces) == 0:
+        return None, "confirm graph is unavailable"
+    mesh = obj.data
+    domain = str(attribute.domain)
+    if domain == "CORNER":
+        target_indices = np.asarray(
+            [
+                int(loop_index)
+                for face_index in faces
+                for loop_index in mesh.polygons[int(face_index)].loop_indices
+            ],
+            dtype=np.int64,
+        )
+    elif domain == "POINT":
+        target_indices = np.asarray(
+            sorted(
+                {
+                    int(mesh.loops[int(loop_index)].vertex_index)
+                    for face_index in faces
+                    for loop_index in mesh.polygons[int(face_index)].loop_indices
+                }
+            ),
+            dtype=np.int64,
+        )
+    else:
+        return None, f"unsupported color domain: {domain}"
+    if len(target_indices) == 0:
+        return None, "candidate has no writable color elements"
+    colors = np.empty((len(attribute.data), 4), dtype=np.float32)
+    attribute.data.foreach_get("color", colors.ravel())
+    original_colors = np.array(colors, copy=True)
+    target = np.asarray(seed_color, dtype=np.float32)
+    changed_mask = np.any(
+        np.abs(colors[target_indices].astype(np.float64) - target.astype(np.float64))
+        > 2.0e-5,
+        axis=1,
+    )
+    changed = int(np.count_nonzero(changed_mask))
+    if changed:
+        colors[target_indices[changed_mask]] = target
+        try:
+            attribute.data.foreach_set("color", colors.ravel())
+            mesh.update()
+        except (
+            AttributeError,
+            IndexError,
+            MemoryError,
+            ReferenceError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as error:
+            restore_error = None
+            try:
+                attribute.data.foreach_set("color", original_colors.ravel())
+                mesh.update()
+            except (
+                AttributeError,
+                IndexError,
+                MemoryError,
+                ReferenceError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+            ) as restore:
+                restore_error = restore
+            if restore_error is not None:
+                return None, f"color write failed and restoration failed: {restore_error}"
+            return None, f"color write failed; original colors restored: {error}"
+    return (changed, int(len(faces)), domain), None
+
+
 class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
-    """Preview and apply one geometry-aware local Face Set region."""
+    """Preview and apply one geometry-aware local Smart Fill region."""
 
     bl_idname = LOCAL_FACE_SET_GROW_OPERATOR_ID
-    bl_label = "Mesh Focus: Smart Face Set Fill"
+    bl_label = "Mesh Focus: Smart Fill"
     bl_description = (
-        "Fill the connected smooth region under the cursor with the seed Face Set"
+        "Fill the connected smooth region under the cursor with the seed Face Set or color"
     )
     bl_options = {"REGISTER", "UNDO"}
 
@@ -29071,7 +29366,7 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
             and context.region is not None
             and context.region.type == "WINDOW"
             and context.space_data is not None
-            and context.mode == "SCULPT"
+            and context.mode in {"SCULPT", "PAINT_VERTEX"}
             and context.active_object is not None
             and context.active_object.type == "MESH"
         )
@@ -29081,13 +29376,13 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
         import numpy as np
         if not self.poll(context):
             return {"PASS_THROUGH"}
-        if _tube_preview_state is not None and _tube_preview_state.get("active"):
-            self.report({"WARNING"}, "Smart Face Set Fill: 先に Tube Shape の予測を終了してください")
+        if context.mode == "SCULPT" and _tube_preview_state is not None and _tube_preview_state.get("active"):
+            self.report({"WARNING"}, "Smart Fill: 先に Tube Shape の予測を終了してください")
             return {"CANCELLED"}
 
         coord = _sculpt_cursor_region_coordinate(context, event)
         if coord is None:
-            self.report({"WARNING"}, "Smart Face Set Fill: cursor is outside the View3D window region")
+            self.report({"WARNING"}, "Smart Fill: cursor is outside the View3D window region")
             return {"CANCELLED"}
 
         self.mouse_region_x = int(round(coord.x))
@@ -29095,13 +29390,53 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
         self.strict_mode = bool(
             self.strict_mode or getattr(event, "ctrl", False)
         )
-        hit = _raycast_sculpt_face_set(context, coord)
-        if hit is None:
-            self.report({"WARNING"}, "Smart Face Set Fill: no visible face under cursor")
-            return {"CANCELLED"}
+        backend = "SCULPT" if context.mode == "SCULPT" else "PAINT_VERTEX"
+        color_attribute = None
+        color_attribute_reason = None
+        seed_color = None
+        seed_local_location = None
+        if backend == "SCULPT":
+            hit = _raycast_sculpt_face_set(context, coord)
+            if hit is None:
+                self.report({"WARNING"}, "Smart Fill: no visible Face Set face under cursor")
+                return {"CANCELLED"}
+        else:
+            geometry_ok, geometry_reason = _vertex_paint_geometry_compatibility(
+                context.active_object
+            )
+            if not geometry_ok:
+                self.report(
+                    {"WARNING"},
+                    f"Smart Fill: {geometry_reason or 'source/evaluated geometry is incompatible'}",
+                )
+                return {"CANCELLED"}
+            color_attribute, color_attribute_reason = _vertex_paint_active_color_attribute(
+                context.active_object
+            )
+            if color_attribute is None:
+                self.report(
+                    {"WARNING"},
+                    f"Smart Fill: {color_attribute_reason or 'active color attribute is unavailable'}",
+                )
+                return {"CANCELLED"}
+            hit = _raycast_visible_mesh_face(context, coord)
+            if hit is None:
+                self.report({"WARNING"}, "Smart Fill: no visible mesh face under cursor")
+                return {"CANCELLED"}
+            hit_obj, hit_face, _hit_world, seed_local_location, _hit_screen = hit
+            seed_color = _vertex_paint_sample_color(
+                hit_obj, hit_face, seed_local_location, color_attribute
+            )
+            if seed_color is None:
+                self.report({"WARNING"}, "Smart Fill: could not sample the active color")
+                return {"CANCELLED"}
         if _fill_preview_state is not None:
             _fill_preview_cancel(_fill_preview_state, "replaced")
-        obj, seed_face, seed_face_set, _location, _screen = hit
+        if backend == "SCULPT":
+            obj, seed_face, seed_face_set, _location, _screen = hit
+        else:
+            obj, seed_face, _location, seed_local_location, _screen = hit
+            seed_face_set = -1
         try:
             seed_screen = (float(_screen.x), float(_screen.y))
         except (AttributeError, TypeError, ValueError):
@@ -29140,8 +29475,25 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
             "mesh_pointer": int(obj.data.as_pointer()),
             "signature": signature,
             "mode": str(context.mode),
+            "backend": backend,
             "seed_face": int(seed_face),
             "seed_face_set": int(seed_face_set),
+            "seed_color": tuple(seed_color) if seed_color is not None else None,
+            "seed_local_location": tuple(seed_local_location) if seed_local_location is not None else None,
+            "color_attribute_signature": (
+                _vertex_paint_color_signature(obj, color_attribute)
+                if color_attribute is not None
+                else None
+            ),
+            "color_attribute_name": (
+                str(color_attribute.name) if color_attribute is not None else None
+            ),
+            "color_attribute_domain": (
+                str(color_attribute.domain) if color_attribute is not None else None
+            ),
+            "color_attribute_type": (
+                str(color_attribute.data_type) if color_attribute is not None else None
+            ),
             "seed_screen": seed_screen,
             # Screen ROI/capture is dormant on the active progressive path.
             "shadow_screen_roi_radius": 0,
@@ -29491,7 +29843,7 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
         ) as error:
             try:
                 message = str(error).strip() or "preview calculation failed"
-                self.report({"WARNING"}, f"Smart Face Set Fill: {message}")
+                self.report({"WARNING"}, f"Smart Fill: {message}")
             except (AttributeError, RuntimeError, TypeError, ValueError):
                 pass
             _fill_preview_cancel(state, "compute-error")
@@ -29511,6 +29863,34 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
             _fill_preview_cancel(state, "stale-result")
             return {"CANCELLED"}
         obj = state["obj"]
+        # Vertex Paint uses the same geometry/preview graph, but its confirm
+        # writer is an active color attribute rather than Sculpt's Face Set
+        # integer layer.  Keep this branch before the Sculpt-only attribute
+        # lookup so PAINT_VERTEX never requires a .sculpt_face_set layer.
+        if state.get("backend") == "PAINT_VERTEX":
+            try:
+                written, reason = _fill_preview_write_vertex_paint(state, result)
+            except (
+                AttributeError,
+                IndexError,
+                MemoryError,
+                ReferenceError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+            ) as error:
+                written, reason = None, str(error) or "color write failed"
+            if written is None:
+                _fill_preview_cancel(state, "vertex-color-write")
+                self.report({"WARNING"}, f"Smart Fill: {reason or 'color write failed'}")
+                return {"CANCELLED"}
+            changed, face_count, domain = written
+            _fill_preview_cancel(state, "confirm")
+            self.report(
+                {"INFO"},
+                f"Smart Fill: {changed} {str(domain).lower()} color elements changed ({face_count} faces)",
+            )
+            return {"FINISHED"}
         attr = obj.data.attributes.get(".sculpt_face_set")
         if attr is None or attr.domain != "FACE":
             _fill_preview_cancel(state, "face-set-layer")
@@ -29554,7 +29934,7 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
         _fill_preview_cancel(state, "confirm")
         self.report(
             {"INFO"},
-            f"Smart Face Set Fill: {changed} faces changed ({candidate_count} candidates)",
+            f"Smart Fill: {changed} faces changed ({candidate_count} candidates)",
         )
         return {"FINISHED"}
 
@@ -29680,7 +30060,7 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
         )
 
 
-# SFSF responsiveness diagnostics are deliberately installed at the function
+# Smart Fill responsiveness diagnostics are deliberately installed at the function
 # boundary.  This keeps the hot-path selection semantics untouched while
 # measuring the full callback, including GPU batch construction and cleanup.
 _sfsf_draw_uninstrumented = _fill_preview_draw
@@ -29925,7 +30305,7 @@ class VIEW3D_PT_mesh_focus_orbit_tools(bpy.types.Panel):
         if context.mode in {"OBJECT", "EDIT_MESH"}:
             layout.label(text="Ctrl + クリック: Face Set (厳密)")
         elif context.mode == "SCULPT":
-            layout.label(text="Sculpt: SFSF / Guided Ridge は専用ツール")
+            layout.label(text="Sculpt: Smart Fill / Guided Ridge は専用ツール")
 
 
 _MFO_TOOL_ICON_DIR = os.path.join(
@@ -30007,8 +30387,8 @@ class VIEW3D_WST_mesh_focus_face_set_edit(bpy.types.WorkSpaceTool):
 
 class VIEW3D_WST_mesh_focus_smart_fill_sculpt(bpy.types.WorkSpaceTool):
     bl_idname = "mfo.smart_fill_sculpt"
-    bl_label = "MFO: Smart Face Set Fill"
-    bl_description = "Click a Sculpt surface to preview Smart Face Set Fill"
+    bl_label = "MFO: Smart Fill"
+    bl_description = "Click a Sculpt surface to preview Smart Fill"
     bl_space_type = "VIEW_3D"
     bl_context_mode = "SCULPT"
     bl_icon = _MFO_ICON_SMART_FILL
@@ -30016,6 +30396,16 @@ class VIEW3D_WST_mesh_focus_smart_fill_sculpt(bpy.types.WorkSpaceTool):
         (LOCAL_FACE_SET_GROW_OPERATOR_ID, {"type": "LEFTMOUSE", "value": "PRESS"}, {}),
         (LOCAL_FACE_SET_GROW_OPERATOR_ID, {"type": "LEFTMOUSE", "value": "PRESS", "ctrl": True}, {}),
     )
+
+
+class VIEW3D_WST_mesh_focus_smart_fill_vertex(bpy.types.WorkSpaceTool):
+    bl_idname = "mfo.smart_fill_vertex"
+    bl_label = "MFO: Smart Fill"
+    bl_description = "Click a Vertex Paint surface to preview Smart Fill"
+    bl_space_type = "VIEW_3D"
+    bl_context_mode = "PAINT_VERTEX"
+    bl_icon = _MFO_ICON_SMART_FILL
+    bl_keymap = VIEW3D_WST_mesh_focus_smart_fill_sculpt.bl_keymap
 
 
 class VIEW3D_WST_mesh_focus_guided_ridge_sculpt(bpy.types.WorkSpaceTool):
@@ -30045,6 +30435,7 @@ _TOOL_CLASSES = (
     VIEW3D_WST_mesh_focus_face_set_object,
     VIEW3D_WST_mesh_focus_face_set_edit,
     VIEW3D_WST_mesh_focus_smart_fill_sculpt,
+    VIEW3D_WST_mesh_focus_smart_fill_vertex,
     VIEW3D_WST_mesh_focus_guided_ridge_sculpt,
     VIEW3D_WST_mesh_focus_tube_sculpt,
 )
@@ -30052,6 +30443,7 @@ _MFO_TOOL_CONTEXT_LABELS = {
     "OBJECT": "Object",
     "EDIT_MESH": "Edit Mesh",
     "SCULPT": "Sculpt",
+    "PAINT_VERTEX": "Paint Vertex",
 }
 _MFO_TOOL_KEYMAP_NAMES = frozenset(
     "3D View Tool: {mode}, {label}".format(
@@ -30620,7 +31012,7 @@ def unregister():
         del bpy.types.Scene.mfo_reference_object
 
 
-# Wrap only the SFSF modal boundary so every event, including timer and Esc,
+# Wrap only the Smart Fill modal boundary so every event, including timer and Esc,
 # contributes to the responsiveness measurements shown in diagnostics.
 _sfsf_modal_uninstrumented = VIEW3D_OT_mesh_focus_local_face_set_grow.modal
 def _sfsf_modal_instrumented(self, context, event):
