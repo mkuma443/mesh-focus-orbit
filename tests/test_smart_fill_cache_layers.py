@@ -135,9 +135,14 @@ def _patch_foreach_get(mesh):
 
 
 def _load_module():
-    source = pathlib.Path(__file__).resolve().parents[1] / "mesh_focus_orbit.py"
+    package_dir = pathlib.Path(__file__).resolve().parents[1] / "mesh_focus_orbit"
+    source = package_dir / "__init__.py"
     name = "_sfsf_cache_test_module"
-    spec = importlib.util.spec_from_file_location(name, source)
+    spec = importlib.util.spec_from_file_location(
+        name,
+        source,
+        submodule_search_locations=[str(package_dir)],
+    )
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
@@ -149,14 +154,14 @@ def _make_cache(module, obj):
     edges = np.asarray(mesh.loops.values, dtype=np.int32)
     vertices = np.asarray(mesh.loop_vertices, dtype=np.int32)
     totals = np.asarray(mesh.polygons.loop_total, dtype=np.int32)
-    topology = module._fill_preview_topology_fingerprint(edges, vertices, totals)
+    topology = module.smart_fill_geometry._fill_preview_topology_fingerprint(edges, vertices, totals)
     coords = np.asarray(mesh.vertices.values, dtype=np.float32)
     hidden = np.asarray(mesh.polygons.hidden, dtype=bool)
     centers = np.asarray(mesh.polygons.values, dtype=np.float64)
     normals = np.asarray(mesh.polygons.normals, dtype=np.float64)
     face_set = np.asarray(mesh.attributes.face_set.data.values, dtype=np.int32)
     return {
-        "signature": module._fill_preview_signature(obj),
+        "signature": module.smart_fill_preview._fill_preview_signature(obj),
         "count": 2,
         "hidden": hidden.copy(),
         "topology_fingerprint": topology,
@@ -164,8 +169,8 @@ def _make_cache(module, obj):
         "topology_second": np.asarray([1], dtype=np.int32),
         "topology_edge_v0": np.asarray([0], dtype=np.int32),
         "topology_edge_v1": np.asarray([2], dtype=np.int32),
-        "coordinate_fingerprint": module._fill_preview_array_fingerprint(coords),
-        "face_set_fingerprint": module._fill_preview_array_fingerprint(face_set),
+        "coordinate_fingerprint": module.smart_fill_preview._fill_preview_array_fingerprint(coords),
+        "face_set_fingerprint": module.smart_fill_preview._fill_preview_array_fingerprint(face_set),
         "centers": centers.copy(),
         "normals": normals.copy(),
         "world_vertices": coords.astype(np.float64).copy(),
@@ -200,7 +205,7 @@ def _test_real_builder(module):
     mesh.update()
     obj = bpy.data.objects.new("_sfsf_cache_layer_test_object", mesh)
     try:
-        job = module._fill_preview_build_adjacency_cooperative(obj)
+        job = module.registration._fill_preview_build_adjacency_cooperative(obj)
         while True:
             try:
                 next(job)
@@ -221,20 +226,20 @@ def _test_boundary_green_predicate(module):
 
     # A cyan segment keeps the established cyan/orange split, regardless of
     # the candidate count or any hypothetical next wheel stage.
-    assert not module._fill_preview_should_use_green_boundary([True, False])
+    assert not module.smart_fill_preview._fill_preview_should_use_green_boundary([True, False])
     # An all-orange boundary is green even when a later candidate would add
     # faces: the display state is intentionally local to the current result.
-    assert module._fill_preview_should_use_green_boundary([True, True])
-    assert module._fill_preview_should_use_green_boundary([True])
+    assert module.smart_fill_preview._fill_preview_should_use_green_boundary([True, True])
+    assert module.smart_fill_preview._fill_preview_should_use_green_boundary([True])
     # Shrinking back to a stage with a cyan segment immediately clears green.
-    assert not module._fill_preview_should_use_green_boundary([False, True])
-    assert not module._fill_preview_should_use_green_boundary([])
+    assert not module.smart_fill_preview._fill_preview_should_use_green_boundary([False, True])
+    assert not module.smart_fill_preview._fill_preview_should_use_green_boundary([])
     # The production mask includes non-boundary graph pairs.  Restricting it
     # to the existing boundary mask must preserve the same all-orange result.
-    assert module._fill_preview_should_use_green_boundary(
+    assert module.smart_fill_preview._fill_preview_should_use_green_boundary(
         [True, False, True], [True, False, True]
     )
-    assert not module._fill_preview_should_use_green_boundary(
+    assert not module.smart_fill_preview._fill_preview_should_use_green_boundary(
         [True, False, True], [True, True, True]
     )
     return {
@@ -248,7 +253,7 @@ def _test_boundary_green_predicate(module):
 def _test_draw_uses_saved_color_flag(module):
     """Drawing must consume the result flag without rescanning boundary rows."""
 
-    source = inspect.getsource(module._sfsf_draw_uninstrumented)
+    source = inspect.getsource(module.smart_fill_preview._fill_preview_draw)
     assert "boundary_all_orange" in source
     assert "boundary_records" not in source
     assert "np.asarray" not in source
@@ -268,18 +273,18 @@ def run():
     _patch_foreach_get(obj.data)
     cache = _make_cache(module, obj)
     signature = cache["signature"]
-    module._fill_preview_adjacency_cache.clear()
-    module._fill_preview_adjacency_cache[signature] = cache
+    module.runtime.fill_preview_adjacency_cache.clear()
+    module.runtime.fill_preview_adjacency_cache[signature] = cache
     cache_identity = id(cache)
     adjacency_before = cache["first"].copy()
     topology_before = cache["topology_first"].copy()
 
     # External Face Set Paint: only the volatile Face Set values change.
     obj.data.attributes.face_set.data.values = [7, 7]
-    module._fill_preview_mark_cache_pointers_dirty({200})
+    module.smart_fill_preview._fill_preview_mark_cache_pointers_dirty({200})
     assert cache["geometry_dirty"]
-    assert module._fill_preview_refresh_cached_adjacency(obj, cache)
-    assert id(module._fill_preview_adjacency_cache[signature]) == cache_identity
+    assert module.smart_fill_geometry._fill_preview_refresh_cached_adjacency(obj, cache)
+    assert id(module.runtime.fill_preview_adjacency_cache[signature]) == cache_identity
     assert cache["geometry_refresh_reason"] == "face-set-only"
     assert np.array_equal(cache["first"], adjacency_before)
     assert np.array_equal(cache["topology_first"], topology_before)
@@ -287,32 +292,32 @@ def run():
     # SFSF confirmation uses the same ordinary attribute write path.
     obj.data.attributes.face_set.data.foreach_set("value", [9, 9])
     obj.data.update()
-    module._fill_preview_mark_cache_pointers_dirty({100, 200})
-    assert module._fill_preview_refresh_cached_adjacency(obj, cache)
+    module.smart_fill_preview._fill_preview_mark_cache_pointers_dirty({100, 200})
+    assert module.smart_fill_geometry._fill_preview_refresh_cached_adjacency(obj, cache)
     assert cache["geometry_refresh_reason"] == "face-set-only"
-    assert id(module._fill_preview_adjacency_cache[signature]) == cache_identity
+    assert id(module.runtime.fill_preview_adjacency_cache[signature]) == cache_identity
 
     # A coordinate edit refreshes geometry in place, without changing the graph.
     obj.data.vertices.values[2] = (1, 1, 0.25)
     obj.data.polygons.values[0] = (0.6666667, 0.3333333, 0.0833333)
-    module._fill_preview_mark_cache_pointers_dirty({200})
-    assert module._fill_preview_refresh_cached_adjacency(obj, cache)
+    module.smart_fill_preview._fill_preview_mark_cache_pointers_dirty({200})
+    assert module.smart_fill_geometry._fill_preview_refresh_cached_adjacency(obj, cache)
     assert cache["geometry_refresh_reason"] == "depsgraph-dirty"
-    assert id(module._fill_preview_adjacency_cache[signature]) == cache_identity
+    assert id(module.runtime.fill_preview_adjacency_cache[signature]) == cache_identity
     assert cache["world_vertices"][2, 2] == 0.25
 
     # Visibility is refreshed from the retained raw pair list.
     obj.data.polygons.hidden[1] = True
-    module._fill_preview_mark_cache_pointers_dirty({200})
-    assert module._fill_preview_refresh_cached_adjacency(obj, cache)
+    module.smart_fill_preview._fill_preview_mark_cache_pointers_dirty({200})
+    assert module.smart_fill_geometry._fill_preview_refresh_cached_adjacency(obj, cache)
     assert cache["geometry_refresh_reason"] == "depsgraph-dirty"
     assert len(cache["first"]) == 0
 
     # Same-count rewiring fails the topology guard and must be rebuilt by caller.
     obj.data.polygons.hidden[1] = False
     obj.data.loops.values[2] = 5
-    module._fill_preview_mark_cache_pointers_dirty({200})
-    assert not module._fill_preview_refresh_cached_adjacency(obj, cache)
+    module.smart_fill_preview._fill_preview_mark_cache_pointers_dirty({200})
+    assert not module.smart_fill_geometry._fill_preview_refresh_cached_adjacency(obj, cache)
 
     return {
         "passed": True,

@@ -17,8 +17,13 @@ def _load_module():
     import sys
 
     root = pathlib.Path(__file__).resolve().parents[1]
-    path = root / "mesh_focus_orbit.py"
-    spec = importlib.util.spec_from_file_location("mfo_sfsf_responsiveness", path)
+    package_dir = root / "mesh_focus_orbit"
+    path = package_dir / "__init__.py"
+    spec = importlib.util.spec_from_file_location(
+        "mfo_sfsf_responsiveness",
+        path,
+        submodule_search_locations=[str(package_dir)],
+    )
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -63,16 +68,16 @@ def _assert_builder_equivalence(module, obj):
         "face_ids", "seam_count", "topology_fingerprint",
         "topology_first", "topology_second", "topology_edge_v0", "topology_edge_v1",
     )
-    module._fill_preview_adjacency_cache.clear()
-    baseline = module._fill_preview_build_adjacency(obj)
-    module._fill_preview_adjacency_cache.clear()
-    raw, _ = _run(module._fill_preview_adjacency_steps(obj))
-    candidate, _ = _run(module._fill_preview_build_adjacency_cooperative(obj, prepared=raw))
+    module.runtime.fill_preview_adjacency_cache.clear()
+    baseline = module.smart_fill_geometry._fill_preview_build_adjacency(obj)
+    module.runtime.fill_preview_adjacency_cache.clear()
+    raw, _ = _run(module.smart_fill_geometry._fill_preview_adjacency_steps(obj))
+    candidate, _ = _run(module.registration._fill_preview_build_adjacency_cooperative(obj, prepared=raw))
     for key in common:
         assert key in baseline and key in candidate, key
         _assert_same_value(baseline[key], candidate[key])
     baseline_faces = baseline["face_vertex_ids"]
-    candidate_faces = module._fill_preview_face_vertex_sequence(candidate)
+    candidate_faces = module.smart_fill_geometry._fill_preview_face_vertex_sequence(candidate)
     assert candidate_faces is not None
     assert len(baseline_faces) == len(candidate_faces)
     for index in range(len(baseline_faces)):
@@ -104,7 +109,7 @@ def _fixture_equivalence(module, name, vertices, faces, hidden_index=None):
             mesh.update()
         return _assert_builder_equivalence(module, obj)
     finally:
-        module._fill_preview_adjacency_cache.clear()
+        module.runtime.fill_preview_adjacency_cache.clear()
         bpy.data.objects.remove(obj, do_unlink=True)
         bpy.data.meshes.remove(mesh)
 
@@ -129,10 +134,10 @@ def run():
     obj = bpy.data.objects.new("_sfsf_responsiveness_test_object", mesh)
     try:
         equivalence = _assert_builder_equivalence(module, obj)
-        module._fill_preview_adjacency_cache.clear()
-        raw, raw_slices = _run(module._fill_preview_adjacency_steps(obj))
+        module.runtime.fill_preview_adjacency_cache.clear()
+        raw, raw_slices = _run(module.smart_fill_geometry._fill_preview_adjacency_steps(obj))
         cache, build_slices = _run(
-            module._fill_preview_build_adjacency_cooperative(obj, prepared=raw)
+            module.registration._fill_preview_build_adjacency_cooperative(obj, prepared=raw)
         )
         assert cache["count"] == len(faces)
         # The active cooperative path must retain only the flat schema; the
