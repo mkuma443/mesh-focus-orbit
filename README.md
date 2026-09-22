@@ -1,10 +1,10 @@
 # Mesh Focus Orbit
 
-Current source version: 3.4.2.
+Current source version: 3.4.3.
 
 Blender 5.2 用のリトポロジー支援アドオンです。
 
-アドオンバージョン: **3.4.2**
+アドオンバージョン: **3.4.3**
 
 ## 主な機能
 
@@ -12,7 +12,7 @@ Blender 5.2 用のリトポロジー支援アドオンです。
 - **Face Set MFO (FSMFO)**: Reference Object の中央レイが当たる Face Set と、対応が明確な Retopo island だけを一時表示します。
 - **Guided Ridge Curve Sculpt (Step 2)**: Sculpt Modeで各クリックを可視mesh面へスナップした3Dルートを滑らかなカーブとしてプレビューし、明示的なEnterでBlender 5.2 ESSENTIALSのPinch/Magnify、Ctrl+EnterでCrease Polishをbrush.asset_activate経由で選択し、表示中の曲線を同期sculpt.brush_strokeで一度適用します。適用前はメッシュを変更せず、完了後は元のブラシ資産とツールを復元します。Dyntopo中はBlenderネイティブUndo/BMLogを壊さないため適用せず、警告して無変更で戻ります。
 - **Smart Fill**: Sculpt Mode では Face Set、Vertex Paint ではアクティブな FLOAT_COLOR/BYTE_COLOR の POINT/CORNER 属性を使って、カーソル下の局所領域をプレビューし、確定時に同じシード色を書き込みます。`Shift + E` は隣接面の法線角だけを使う軽量モードで、明確な山・谷を越える距離コストを平面の2倍にして拡大します。
-- **Shadow Analysis View**: `Shift + Alt + E` で現在の View3D だけに独立した解析表示を切り替えます。
+- **Wire Overlay View**: `Shift + Alt + E` で通常の View3D 表示を保ったまま、薄いワイヤーフレームを重ねます。
 - **Topology Colors**: Edit Mode の選択面に 1〜6 の半透明ガイド色を保存します。
 - **Curved Face Set Tube Shape**: 曲がった Face Set チューブを局所断面に沿って均一化または先細り補正します。
 
@@ -50,7 +50,7 @@ Tツールバーは、編集可能なAstra Blenderソースから生成した5�
 | Smart Fill | Sculpt / Vertex Paint | `E`、開始キーを離してから `E` または `Enter` | SculptはFace Set、Vertex Paintはアクティブ色属性。ホイールで距離、`Esc` で取消 |
 | Smart Fill Expand Only | Sculpt / Vertex Paint | `Shift + E`、開始キーを離してから `E` または `Enter` | サーフェス／valley／ridge／edge-cost評価を省略し、トポロジー距離だけで拡大。ホイールで段階変更、`Esc` で取消 |
 | Strict Smart Fill | Sculpt / Vertex Paint | `Ctrl + E`、開始キーを離してから `E` または `Enter` | SculptはFace Set、Vertex Paintはアクティブ色属性。ホイールで距離、`Esc` で取消 |
-| Shadow Analysis View | Sculpt | `Shift + Alt + E` | 現在の View3D の表示補助だけを切替 |
+| Wire Overlay View | Sculpt | `Shift + Alt + E` | 通常表示を変えず、現在の View3D に薄いワイヤーだけを重ねる |
 | Topology Colors | Edit | `Ctrl + Alt + 1`〜`6` | `Ctrl + Alt + 0` で選択面の色を解除 |
 | Curved Face Set Tube Shape | Sculpt | `Ctrl + Alt + T`、`T`、LMB、または `Enter` | `Esc` または右クリックで取消。ホイールで半径・先細り、`Shift + ホイール`で補正強度 |
 
@@ -109,7 +109,7 @@ Vertex Paint では同じカーソル面からアクティブな FLOAT_COLOR/BYT
 
 Smart Fill 自身の確定直後は surface adjacency / cursor cache を再利用し、座標・可視性・トポロジー・変換などの更新時は安全側に無効化します。
 
-`Shift + Alt + E` はこのソルバーとは独立した表示補助です。現在の View3D に toon-dark MATCAP、Face Set 色、wire overlay を表示し、終了時・ファイルロード時・アドオン解除時に表示設定を復元します。表示補助の切替は通常 E の候補や結果を変更しません。
+`Shift + Alt + E` はこのソルバーとは独立した表示補助です。現在の通常シェーディング、Face Set 色、マスク表示を変えずに薄い wire overlay だけを重ね、再実行時・ファイルロード時・アドオン解除時に元の overlay 設定を復元します。表示補助の切替は通常 E の候補や結果を変更しません。
 
 非表示面、非多様体 edge、未接続 seam、別 sheet、メッシュ境界を越える候補は保護します。大規模メッシュでは局所 graph の準備に時間がかかることがあります。形状上区別できない境界や有効な連結領域がない場合は、無変更で終了します。
 
@@ -157,7 +157,7 @@ Edit Mode で面を選択し、`Ctrl + Alt + 1`〜`6` を押すと、表示中�
 
 A Blender 5.2 add-on for manual retopology workflows.
 
-Add-on version: **3.4.2**
+Add-on version: **3.4.3**
 
 ## Main features
 
@@ -165,7 +165,7 @@ Add-on version: **3.4.2**
 - **Face Set MFO (FSMFO)**: temporarily shows the Face Set hit on the configured Reference Object and isolates a clearly matching Retopo island when possible.
 - **Guided Ridge Curve Sculpt (Step 2)**: previews a click-snapped 3D route, then activates the Blender 5.2 ESSENTIALS Pinch/Magnify or Crease Polish brush and applies one synchronous sculpt.brush_stroke from the accepted current-view curve. Before explicit apply it creates no mesh change; the exact prior asset reference and active tool are restored on exit. RUNNING_MODAL/PASS_THROUGH are treated as incomplete.
 - **Smart Fill**: in Sculpt Mode it previews a local Face Set region; in Vertex Paint it samples the active FLOAT_COLOR/BYTE_COLOR POINT/CORNER attribute under the cursor and writes that sampled color only on confirm. `Shift + E` uses a lightweight adjacent-normal test and makes a clear ridge or valley cost twice as much to cross as flat adjacency.
-- **Shadow Analysis View**: toggles an independent analysis display in the current View3D with `Shift + Alt + E`.
+- **Wire Overlay View**: adds faint wireframes to the normal current View3D with `Shift + Alt + E`.
 - **Topology Colors**: stores six translucent topology guide colors on selected Edit Mode faces.
 - **Curved Face Set Tube Shape**: equalizes or tapers a curved Face Set tube while following its local cross-section.
 
@@ -203,7 +203,7 @@ The `MFO` tab in the right N-sidebar exposes `Reference Object` and compact dail
 | Smart Fill | Sculpt / Vertex Paint | `E`, release it, then press `E` again or `Enter` | Sculpt uses Face Sets; Vertex Paint uses the active color attribute. Wheel changes distance; `Esc` cancels |
 | Smart Fill Expand Only | Sculpt / Vertex Paint | `Shift + E`, release it, then press `E` again or `Enter` | Bypasses surface/valley/ridge/edge-cost evaluation and expands by topology distance only. Wheel changes stages; `Esc` cancels |
 | Strict Smart Fill | Sculpt / Vertex Paint | `Ctrl + E`, release it, then press `E` again or `Enter` | Sculpt uses Face Sets; Vertex Paint uses the active color attribute. Wheel changes distance; `Esc` cancels |
-| Shadow Analysis View | Sculpt | `Shift + Alt + E` | Display helper for the current View3D |
+| Wire Overlay View | Sculpt | `Shift + Alt + E` | Adds faint wires without replacing the current viewport shading |
 | Topology Colors | Edit | `Ctrl + Alt + 1`–`6` | `Ctrl + Alt + 0` clears selected faces |
 | Curved Face Set Tube Shape | Sculpt | `Ctrl + Alt + T`; confirm with `T`, LMB, or `Enter` | `Esc` or right click cancels; wheel changes radius/taper, `Shift + wheel` changes correction strength |
 
@@ -262,7 +262,7 @@ On confirmation, every candidate face shown by the Ready preview is written as-i
 
 Immediately after a Smart Fill confirmation, the surface adjacency/cursor caches are reused; coordinate, visibility, topology, transform, and other unowned updates invalidate them conservatively.
 
-`Shift + Alt + E` is an independent display helper. It shows a toon-dark MATCAP, Face Set colors, and a wire overlay in the current View3D, then restores the display settings on exit, file load, or add-on unload. It does not change the normal E solver or its result.
+`Shift + Alt + E` is an independent display helper. It leaves the current shading, Face Set colors, and mask display unchanged, adds only a faint wire overlay in the current View3D, then restores the previous overlay settings on exit, file load, or add-on unload. It does not change the normal E solver or its result.
 
 Hidden faces, non-manifold edges, disconnected seams, separate sheets, and mesh boundaries are protected. Initial local graph preparation can take time on large meshes. Vertex Paint Smart Fill currently rejects enabled viewport modifiers/deform geometry and non-basis shape keys because evaluated hit triangles do not yet have a guaranteed source-color mapping; unmodified meshes remain supported. Ambiguous boundaries and regions without a valid connected area are rejected without a write.
 

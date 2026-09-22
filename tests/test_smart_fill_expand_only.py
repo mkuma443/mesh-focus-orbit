@@ -13,6 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 REGISTRATION = ROOT / "mesh_focus_orbit" / "registration.py"
 PREVIEW = ROOT / "mesh_focus_orbit" / "smart_fill" / "preview.py"
+GEOMETRY = ROOT / "mesh_focus_orbit" / "smart_fill" / "geometry.py"
 INIT = ROOT / "mesh_focus_orbit" / "__init__.py"
 
 
@@ -73,7 +74,22 @@ def test_patch_version_is_bumped():
         if isinstance(key, ast.Constant) and key.value == "version"
     )
     assert isinstance(version, ast.Tuple)
-    assert tuple(element.value for element in version.elts) == (3, 4, 2)
+    assert tuple(element.value for element in version.elts) == (3, 4, 3)
+
+
+def test_shift_alt_e_preserves_shading_and_adds_only_faint_wires():
+    source, tree = _tree(GEOMETRY)
+    helper = _segment(source, _function(tree, "_fill_preview_visible_analysis_profile"))
+
+    assert '"show_wireframes"' in helper
+    assert '"wireframe_threshold"' in helper
+    assert '"wireframe_opacity"' in helper
+    assert 'apply(overlay, "wireframe_opacity", 0.22)' in helper
+    assert "_fill_preview_analysis_shader_path" not in helper
+    assert "show_sculpt_face_sets" not in helper
+    assert "sculpt_mode_face_sets_opacity" not in helper
+    assert "show_sculpt_mask" not in helper
+    assert "apply(shading" not in helper
 
 
 def test_shift_e_dispatch_is_distinct_from_normal_and_strict_modes():
@@ -254,6 +270,7 @@ def test_expand_only_keeps_confirmation_parity_for_face_sets_and_vertex_paint():
 def run():
     tests = [
         test_patch_version_is_bumped,
+        test_shift_alt_e_preserves_shading_and_adds_only_faint_wires,
         test_shift_e_dispatch_is_distinct_from_normal_and_strict_modes,
         test_enter_and_e_confirmation_share_single_modal_owner_cleanup,
         test_shift_e_keymap_does_not_conflict_with_e_ctrl_e_or_shift_alt_e,

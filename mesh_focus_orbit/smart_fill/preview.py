@@ -240,12 +240,12 @@ def _fill_preview_apply_visible_selection_floor(state, geometry, local_ids, radi
     return np.unique(candidate).astype(np.int32, copy=False)
 
 class VIEW3D_OT_mesh_focus_shadow_analysis_toggle(bpy.types.Operator):
-    """Toggle the toon_dark + Face Set + wire analysis look in this View3D."""
+    """Toggle a faint wire overlay without changing this View3D's shading."""
 
     bl_idname = "view3d.mesh_focus_shadow_analysis_toggle"
-    bl_label = "Mesh Focus: Toggle Shadow Analysis View"
+    bl_label = "Mesh Focus: Toggle Wire Overlay"
     bl_description = (
-        "Show toon_dark with Face Sets and wire overlay, or restore this View3D"
+        "Overlay faint mesh wires on the normal viewport, or restore this View3D"
     )
 
     @classmethod
@@ -262,7 +262,7 @@ class VIEW3D_OT_mesh_focus_shadow_analysis_toggle(bpy.types.Operator):
             return {"CANCELLED"}
         key = _fill_preview_shadow_view_key(context)
         if not key:
-            self.report({"WARNING"}, "Shadow analysis view: no View3D space")
+            self.report({"WARNING"}, "Wire overlay: no View3D space")
             return {"CANCELLED"}
         token = _runtime.shadow_analysis_view_tokens.get(key)
         if isinstance(token, dict) and token.get("active"):
@@ -271,25 +271,24 @@ class VIEW3D_OT_mesh_focus_shadow_analysis_toggle(bpy.types.Operator):
             if restored:
                 self.report(
                     {"INFO"},
-                    "Analysis View: OFF (restored; Shift+Alt+E to enable)",
+                    "Wire Overlay: OFF (restored; Shift+Alt+E to enable)",
                 )
                 _tag_redraw(context.area)
                 return {"FINISHED"}
-            self.report({"WARNING"}, "Shadow analysis view: restore failed")
+            self.report({"WARNING"}, "Wire overlay: restore failed")
             return {"CANCELLED"}
         token = _fill_preview_visible_analysis_profile(context)
         if not token.get("applied"):
             self.report(
                 {"WARNING"},
-                "Shadow analysis view: " + str(token.get("reason", "apply failed")),
+                "Wire overlay: " + str(token.get("reason", "apply failed")),
             )
             return {"CANCELLED"}
         token["manual"] = True
         _runtime.shadow_analysis_view_tokens[key] = token
         self.report(
             {"INFO"},
-            "Analysis View: toon_dark + Face Sets + Wire ON "
-            "(Shift+Alt+E to restore)",
+            "Wire Overlay: faint wires ON (Shift+Alt+E to restore)",
         )
         return {"FINISHED"}
 

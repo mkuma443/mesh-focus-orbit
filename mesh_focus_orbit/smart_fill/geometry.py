@@ -3283,65 +3283,44 @@ def _fill_preview_capture_shadow_signal(context, seed_screen=None):
 
 
 def _fill_preview_visible_analysis_profile(context):
-    """Apply the manually toggled analysis look to the visible View3D.
+    """Overlay faint mesh wires without changing the visible View3D shading.
 
     This helper is intentionally independent from normal E.  It is a viewing
-    utility only: toon_dark is shown together with semi-transparent Face Set
-    colors and mesh wire overlay.  No material/datablock is touched; the exact
-    SpaceView3D values are retained in the returned token and restoration is
-    idempotent.
+    utility only: the current shading, Face Set display, and mask display remain
+    untouched.  The exact overlay values are retained in the returned token and
+    restoration is idempotent.
     """
     space = getattr(context, "space_data", None)
     overlay = getattr(space, "overlay", None)
-    shading = getattr(space, "shading", None)
     token = {
         "active": False,
         "applied": False,
         "restore_verified": False,
         "space": space,
         "overlay": overlay,
-        "shading": shading,
+        "shading": None,
         "saved": {"overlay": {}, "shading": {}},
-        "analysis_shader_name": _FILL_PREVIEW_ANALYSIS_SHADER_PROFILE["name"],
-        "analysis_shader_matcap": "",
+        "display_mode": "faint-wire-overlay",
         "reason": "not-attempted",
     }
-    if space is None or (overlay is None and shading is None):
+    if space is None or overlay is None:
         token["reason"] = "view3d-state-unavailable"
         return token
-    matcap_name, _matcap_path, profile_registered = _fill_preview_analysis_shader_path()
-    token["analysis_shader_matcap"] = matcap_name
-    if not profile_registered:
-        token["reason"] = "analysis-shader-not-found"
-        return token
     overlay_properties = (
-        "show_overlays", "show_sculpt_face_sets",
-        "sculpt_mode_face_sets_opacity", "show_sculpt_mask",
-        "sculpt_mode_mask_opacity",
-        "show_wireframes", "wireframe_threshold",
+        "show_overlays",
+        "show_wireframes",
+        "wireframe_threshold",
+        "wireframe_opacity",
     )
-    shading_properties = (
-        "type", "light", "studio_light", "use_world_space_lighting",
-        "use_studiolight_view_rotation", "studiolight_rotate_z", "intensity",
-        "color_type", "single_color", "show_shadows", "shadow_intensity",
-        "show_specular_highlight", "show_cavity", "cavity_type",
-        "curvature_ridge_factor", "curvature_valley_factor", "background_type",
-        "background_color", "background_strength", "show_xray",
-        "show_backface_culling",
-    )
-    for owner, properties, key in (
-        (overlay, overlay_properties, "overlay"),
-        (shading, shading_properties, "shading"),
-    ):
-        if owner is None:
+    for prop_name in overlay_properties:
+        if not hasattr(overlay, prop_name):
             continue
-        for prop_name in properties:
-            if not hasattr(owner, prop_name):
-                continue
-            try:
-                token["saved"][key][prop_name] = copy.deepcopy(getattr(owner, prop_name))
-            except (AttributeError, RuntimeError, TypeError, ValueError):
-                pass
+        try:
+            token["saved"]["overlay"][prop_name] = copy.deepcopy(
+                getattr(overlay, prop_name)
+            )
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            pass
     errors = []
     def apply(owner, name, value):
         if owner is None or not hasattr(owner, name):
@@ -3352,34 +3331,19 @@ def _fill_preview_visible_analysis_profile(context):
         except (AttributeError, RuntimeError, TypeError, ValueError):
             errors.append(name)
             return False
-    # Keep the overlay pass visible for the custom orange/cyan draw handler.
-    # Manual analysis deliberately retains Face Set colors at a readable,
-    # semi-transparent opacity and enables wireframes when Blender exposes
-    # those overlay properties.
-    if overlay is not None:
-        apply(overlay, "show_overlays", True)
-        apply(overlay, "show_sculpt_face_sets", True)
-        apply(overlay, "sculpt_mode_face_sets_opacity", 0.45)
-        apply(overlay, "show_sculpt_mask", False)
-        apply(overlay, "sculpt_mode_mask_opacity", 0.0)
-        apply(overlay, "show_wireframes", True)
-        apply(overlay, "wireframe_threshold", 0.5)
-    if shading is not None:
-        apply(shading, "type", "SOLID")
-        apply(shading, "light", "MATCAP")
-        apply(shading, "studio_light", matcap_name)
-        apply(shading, "color_type", "SINGLE")
-        apply(shading, "single_color", (0.72, 0.72, 0.72))
-        apply(shading, "show_specular_highlight", False)
-        apply(shading, "show_shadows", False)
-        apply(shading, "show_cavity", False)
+    # Preserve the user's ordinary viewport and add only a subtle all-edge
+    # wire overlay.  Blender 5.2 exposes opacity independently from density.
+    apply(overlay, "show_overlays", True)
+    apply(overlay, "show_wireframes", True)
+    apply(overlay, "wireframe_threshold", 1.0)
+    apply(overlay, "wireframe_opacity", 0.22)
     if errors:
-        token["reason"] = "analysis-profile-apply-failed"
+        token["reason"] = "wire-overlay-apply-failed"
         _fill_preview_restore_visible_analysis_profile(token)
         return token
     token["active"] = True
     token["applied"] = True
-    token["reason"] = "visible-analysis-profile-active"
+    token["reason"] = "faint-wire-overlay-active"
     try:
         _tag_redraw(getattr(context, "area", None))
     except (AttributeError, RuntimeError, TypeError, ValueError):
