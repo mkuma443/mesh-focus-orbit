@@ -11,14 +11,19 @@ application path.
 import bpy
 
 from .. import lifecycle as _lifecycle
+from .. import runtime as _runtime
 
 
 _ESSENTIALS_LIBRARY = "ESSENTIALS"
 _ESSENTIALS_FILE = "brushes/essentials_brushes-mesh_sculpt.blend"
 _ESSENTIALS_ASSETS = {
     "RIDGE": "Pinch/Magnify",
-    "GROOVE": "Crease Sharp",
+    "GROOVE": "Crease Polish",
 }
+
+# Custom ownership marker for any temporary IDs created by the legacy
+# compatibility path.  Built-in ESSENTIALS assets are never tagged or removed.
+_OWNER_PROP = "_mfo_guided_ridge_owner"
 
 
 def _report(operator, level, message):
@@ -138,6 +143,174 @@ def mesh_revision_signature(state):
             int(len(data.polygons)), tuple(samples),
         )
     except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _transaction(state):
+    tx = state.setdefault(
+        "curve_sculpt_transaction",
+        {
+            "history": [],
+            "cursor": 0,
+            "pending_history": None,
+            "baseline_signature": None,
+            "external_change": False,
+            "history_pre_direction": None,
+            "history_post_direction": None,
+            "history_wait_ticks": 0,
+        },
+    )
+    tx.setdefault("history", [])
+    tx.setdefault("cursor", 0)
+    tx.setdefault("pending_history", None)
+    tx.setdefault("history_pre_direction", None)
+    tx.setdefault("history_post_direction", None)
+    tx.setdefault("history_wait_ticks", 0)
+    return tx
+
+
+def record_transaction_apply(state, pre_signature, post_signature, mode):
+    """Record one completed native stroke without taking an Undo step in Python.
+
+    Blender's native Sculpt operator owns the actual Undo record.  The editor
+    keeps only bounded signatures so Ctrl+Z/Ctrl+Shift+Z can validate the
+    history change and refresh/cancel the guide safely.
+    """
+    if pre_signature is None or post_signature is None:
+        return False
+    tx = _transaction(state)
+    history = tx["history"]
+    cursor = max(0, min(int(tx.get("cursor", 0)), len(history)))
+    if cursor < len(history):
+        del history[cursor:]
+    history.append({"mode": str(mode), "pre": pre_signature, "post": post_signature})
+    tx["cursor"] = len(history)
+    if tx.get("baseline_signature") is None:
+        tx["baseline_signature"] = pre_signature
+    tx["pending_history"] = None
+    return True
+
+
+def request_history_change(state, direction):
+    """Arm standard Blender Undo/Redo pass-through for the active session."""
+    if not state or not state.get("active"):
+        return False
+    tx = _transaction(state)
+    history = tx["history"]
+    cursor = int(tx.get("cursor", 0))
+    direction = "redo" if str(direction).lower() == "redo" else "undo"
+    if direction == "undo":
+        if cursor <= 0:
+            return False
+        expected = history[cursor - 1]["pre"]
+        index = cursor - 1
+    else:
+        if cursor >= len(history):
+            return False
+        expected = history[cursor]["post"]
+        index = cursor
+    tx["pending_history"] = {"direction": direction, "index": index, "expected": expected}
+    tx["history_pre_direction"] = None
+    tx["history_post_direction"] = None
+    tx["history_last_phase"] = None
+    tx["history_wait_ticks"] = 0
+    state["curve_sculpt_history_reacquire_pending"] = False
+    return True
+
+
+def observe_history_change(state, current_signature, *, advance_wait=True):
+    """Consume a validated standard Undo/Redo notification."""
+    if not state or current_signature is None:
+        return "unavailable"
+    tx = _transaction(state)
+    pending = tx.get("pending_history")
+    if pending is None:
+        return None
+    direction = str(pending.get("direction"))
+    if tx.get("history_post_direction") != direction:
+        if advance_wait:
+            tx["history_wait_ticks"] = int(tx.get("history_wait_ticks", 0) or 0) + 1
+        if tx["history_wait_ticks"] >= 20:
+            tx["pending_history"] = None
+            tx["external_change"] = True
+            return "external"
+        return "pending"
+    expected = pending.get("expected")
+    signature_shape_matches = (
+        current_signature == expected
+        or (
+            isinstance(current_signature, tuple)
+            and isinstance(expected, tuple)
+            and len(current_signature) >= 3
+            and len(expected) >= 3
+            and current_signature[2:] == expected[2:]
+        )
+    )
+    if not signature_shape_matches:
+        tx["pending_history"] = None
+        tx["external_change"] = True
+        return "external"
+    if direction == "undo":
+        tx["cursor"] = int(pending["index"])
+    else:
+        tx["cursor"] = int(pending["index"]) + 1
+    tx["history_observed_direction"] = direction
+    tx["history_wait_ticks"] = 0
+    tx["history_pre_direction"] = None
+    tx["history_post_direction"] = None
+    tx["pending_history"] = None
+    state["curve_sculpt_history_reacquire_pending"] = False
+    return direction
+
+
+def prepare_rollback(context, state):
+    """Arm post-modal standard Undo rollback without invoking Undo here."""
+    if not state or not state.get("active"):
+        return False
+    tx = _transaction(state)
+    count = int(tx.get("cursor", 0))
+    if count <= 0 or tx.get("pending_history") is not None:
+        return False
+    _runtime.guided_ridge_native_transaction = {
+        "kind": "rollback",
+        "state": state,
+        "context": context or state.get("preview_context"),
+        "remaining": count,
+        "history": tuple(tx.get("history", ())[:count]),
+        "baseline_signature": tx.get("baseline_signature"),
+        "token": state.get("curve_sculpt_session_token"),
+        "status": "armed",
+    }
+    return True
+
+
+def rollback_step():
+    """Run one standard Undo after the editor modal has returned."""
+    tx = _runtime.guided_ridge_native_transaction
+    if not tx or tx.get("kind") != "rollback":
+        return None
+    context = tx.get("context")
+    try:
+        override = _temporary_override(context)
+        if override is None:
+            result = bpy.ops.ed.undo()
+        else:
+            with override:
+                result = bpy.ops.ed.undo()
+        if "FINISHED" not in result:
+            tx["status"] = "undo-unavailable"
+            _report(None, "WARNING", "Guided Ridge: standard Undo could not restore the pre-session geometry")
+            _runtime.guided_ridge_native_transaction = None
+            return None
+        tx["remaining"] = int(tx.get("remaining", 0)) - 1
+        if tx["remaining"] <= 0:
+            tx["status"] = "restored"
+            _runtime.guided_ridge_native_transaction = None
+            return None
+        return 0.0
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        tx["status"] = "undo-error"
+        _runtime.guided_ridge_native_transaction = None
         return None
 
 
@@ -564,7 +737,16 @@ def _legacy_paintcurve_apply(context, state, mode="RIDGE"):
 
 
 def apply(context, state, mode="RIDGE"):
-    """Apply the displayed route synchronously with a Blender ESSENTIALS brush."""
+    """Apply the displayed route synchronously with a Blender ESSENTIALS brush.
+
+    Dyntopo is deliberately a hard safety boundary here.  ``sculpt.brush_stroke``
+    owns Blender's native paint/BMLog transaction, while this service is called
+    from the long-lived Guided Ridge modal.  Starting that native stroke from
+    an active Dyntopo modal can leave a vpaint modal callback alive after Esc and
+    corrupt the subsequent ``BM_log_undo`` restore.  There is no supported
+    Python API to split that native transaction safely, so refuse before brush
+    activation and leave the mesh, undo stack, and session untouched.
+    """
     if state is None or not state.get("active"):
         return False
     if state.get("phase") not in {"curve_preview", "curve_sculpt"}:
@@ -573,6 +755,17 @@ def apply(context, state, mode="RIDGE"):
     points = tuple(state.get("curve_screen_preview") or ())
     if len(points) < 2 or state.get("curve_screen_cache_status") != "valid":
         _report(state.get("operator"), "WARNING", "Guided Ridge: current-view curve is not ready")
+        return False
+    obj = state.get("obj")
+    try:
+        if bool(getattr(obj, "use_dynamic_topology_sculpting", False)):
+            reason = "Guided Ridge: Dyntopo is active; curve stroke is disabled to protect Blender's native Undo"
+            state["curve_sculpt_apply_rejected_reason"] = "dyntopo-native-undo-boundary"
+            _report(state.get("operator"), "WARNING", reason)
+            return False
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        state["curve_sculpt_apply_rejected_reason"] = "dyntopo-state-unavailable"
+        _report(state.get("operator"), "WARNING", "Guided Ridge: Dyntopo state is unavailable; curve stroke was not started")
         return False
     context = context or state.get("preview_context")
     sculpt = getattr(getattr(getattr(context, "scene", None), "tool_settings", None), "sculpt", None)
@@ -593,6 +786,8 @@ def apply(context, state, mode="RIDGE"):
         post_signature = mesh_revision_signature(state)
         if post_signature is None:
             raise RuntimeError("mesh revision could not be captured after synchronous stroke")
+        if not record_transaction_apply(state, pre_signature, post_signature, mode):
+            raise RuntimeError("Guided Ridge transaction signature could not be recorded")
         state["curve_sculpt_expected_mesh_signature"] = post_signature
         state["curve_sculpt_apply_active"] = False
         state["curve_sculpt_expected_update_generation"] = None
@@ -626,4 +821,14 @@ def apply(context, state, mode="RIDGE"):
         return False
 
 
-__all__ = ("apply", "cleanup", "retry_restore", "mesh_revision_signature")
+__all__ = (
+    "apply",
+    "cleanup",
+    "retry_restore",
+    "mesh_revision_signature",
+    "record_transaction_apply",
+    "request_history_change",
+    "observe_history_change",
+    "prepare_rollback",
+    "rollback_step",
+)

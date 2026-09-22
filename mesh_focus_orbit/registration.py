@@ -136,6 +136,10 @@ from .guided_ridge.core import (
     _on_guided_ridge_depsgraph_update,
     _on_guided_ridge_load_post,
     _on_guided_ridge_load_pre,
+    _on_guided_ridge_redo_post,
+    _on_guided_ridge_redo_pre,
+    _on_guided_ridge_undo_post,
+    _on_guided_ridge_undo_pre,
     _raycast_sculpt_face_set,
     _raycast_visible_mesh_face,
     _sculpt_cursor_region_coordinate,
@@ -184,6 +188,7 @@ from .smart_fill.preview import (
     _fill_preview_draw_text_handler,
     _on_fill_preview_depsgraph_update,
     _fill_preview_make_result,
+    _fill_preview_make_expand_only_result,
     _fill_preview_initial_radius,
     _fill_preview_shader_get,
     _fill_preview_tag_redraw,
@@ -204,13 +209,15 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
     bl_idname = LOCAL_FACE_SET_GROW_OPERATOR_ID
     bl_label = "Mesh Focus: Smart Fill"
     bl_description = (
-        "Fill the connected smooth region under the cursor with the seed Face Set or color"
+        "Fill the connected smooth region under the cursor with the seed Face Set or color; "
+        "Shift+E expands with a lightweight ridge/valley crossing cost"
     )
     bl_options = {"REGISTER", "UNDO"}
 
     mouse_region_x: IntProperty(options={"SKIP_SAVE"})
     mouse_region_y: IntProperty(options={"SKIP_SAVE"})
     strict_mode: BoolProperty(options={"SKIP_SAVE"}, default=False)
+    expand_only: BoolProperty(options={"SKIP_SAVE"}, default=False)
 
     @classmethod
     def poll(cls, context):
@@ -242,6 +249,14 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
         self.mouse_region_y = int(round(coord.y))
         self.strict_mode = bool(
             self.strict_mode or getattr(event, "ctrl", False)
+        )
+        self.expand_only = bool(
+            self.expand_only
+            or (
+                getattr(event, "shift", False)
+                and not getattr(event, "ctrl", False)
+                and not getattr(event, "alt", False)
+            )
         )
         backend = "SCULPT" if context.mode == "SCULPT" else "PAINT_VERTEX"
         color_attribute = None
@@ -361,6 +376,7 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
             # Screen ROI/capture is dormant on the active progressive path.
             "shadow_screen_roi_radius": 0,
             "strict_mode": bool(self.strict_mode),
+            "expand_only": bool(self.expand_only and not self.strict_mode),
             "shadow_capture": shadow_capture,
             "shadow_capture_generation": int(time.time_ns()),
             "visible_analysis_profile": None,
@@ -702,11 +718,14 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
                 # accepted full-graph rows. A shrink is always recomputed from
                 # scratch; it never reuses an additive frontier or a radius-
                 # only cache entry from an earlier, larger selection.
-                key = (
-                    "progressive-range"
-                    if not bool(state.get("strict_mode", False))
-                    else "geometry-strict"
-                ), round(radius, 10)
+                if bool(state.get("expand_only", False)):
+                    key = ("expand-only", round(radius, 10))
+                else:
+                    key = (
+                        "progressive-range"
+                        if not bool(state.get("strict_mode", False))
+                        else "geometry-strict"
+                    ), round(radius, 10)
                 strict_mode = bool(state.get("strict_mode", False))
                 previous_radius = state.get("processed_radius")
                 growing = (
@@ -715,7 +734,9 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
                 )
                 cached_candidate = state["results"].get(key)
                 cached = None
-                if strict_mode:
+                if bool(state.get("expand_only", False)):
+                    cached = cached_candidate
+                elif strict_mode:
                     # Strict retains its established radius-cache semantics.
                     cached = cached_candidate
                 elif growing and normal_cache_hit_allowed(
@@ -732,7 +753,8 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
                 state["active_result_cache_hit"] = cached is not None
                 terminal_expansion = False
                 if (
-                    cached is None
+                    not bool(state.get("expand_only", False))
+                    and cached is None
                     and not bool(state.get("strict_mode", False))
                     and state.get("terminal_base_radius") is not None
                     and radius > float(
@@ -765,7 +787,8 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
                     terminal_expansion = cached is not None
                 if cached is None:
                     if (
-                        not bool(state.get("strict_mode", False))
+                        not bool(state.get("expand_only", False))
+                        and not bool(state.get("strict_mode", False))
                         and state.get("terminal_base_radius") is not None
                         and radius < float(
                             (state.get("terminal_frontier") or {}).get(
@@ -780,7 +803,11 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
                         # reusable through the ordinary branch.
                         _fill_preview_terminal_reset(state)
                     make_result_started = time.perf_counter()
-                    cached = _fill_preview_make_result(state, radius)
+                    cached = (
+                        _fill_preview_make_expand_only_result(state, radius)
+                        if bool(state.get("expand_only", False))
+                        else _fill_preview_make_result(state, radius)
+                    )
                     state["metrics"]["make_result_seconds"] = max(
                         float(state["metrics"].get("make_result_seconds", 0.0)),
                         time.perf_counter() - make_result_started,
@@ -794,7 +821,8 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
                     except (AttributeError, TypeError, ValueError):
                         terminal_count_eligible = False
                     if (
-                        not bool(state.get("strict_mode", False))
+                        not bool(state.get("expand_only", False))
+                        and not bool(state.get("strict_mode", False))
                         and (
                             float(radius)
                             >= float(state.get("initial_radius") or radius)
@@ -813,6 +841,7 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
                 # monotonic wheel growth, even before the radius threshold.
                 if (
                     cached is not None
+                    and not bool(state.get("expand_only", False))
                     and not bool(state.get("strict_mode", False))
                     and state.get("terminal_base_radius") is None
                 ):
@@ -1001,6 +1030,17 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
         )
         return {"FINISHED"}
 
+    def _finish_confirm_terminal(self, context, state):
+        """Confirm the ready result and release the modal owner exactly once."""
+        result = self._finish_confirm(context, state)
+        if result != {"RUNNING_MODAL"}:
+            _lifecycle.modal_terminal(
+                operator=self,
+                status=("FINISHED" if result == {"FINISHED"} else "CANCELLED"),
+            )
+            _fill_preview_modal_owner_terminal(self)
+        return result
+
     def modal(self, context, event):
         state = _runtime.fill_preview_state
         entry = _lifecycle.modal_entry(operator=self)
@@ -1064,18 +1104,7 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
                 and state.get("start_key_released")
                 and not bool(getattr(event, "is_repeat", False))
             ):
-                result = self._finish_confirm(context, state)
-                if result != {"RUNNING_MODAL"}:
-                    _lifecycle.modal_terminal(
-                        operator=self,
-                        status=(
-                            "FINISHED"
-                            if result == {"FINISHED"}
-                            else "CANCELLED"
-                        ),
-                    )
-                    _fill_preview_modal_owner_terminal(self)
-                return result
+                return self._finish_confirm_terminal(context, state)
             # The initial press, auto-repeat, and a press held through the
             # preparation phase must never confirm the old/partial result.
             return {"RUNNING_MODAL"}
@@ -1124,7 +1153,7 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
             _fill_preview_tag_redraw(state)
             return {"RUNNING_MODAL"}
         if event.type in {"RET", "NUMPAD_ENTER", "ENTER"}:
-            return self._finish_confirm(context, state)
+            return self._finish_confirm_terminal(context, state)
         if event_type in {"LEFTMOUSE", "RIGHTMOUSE"}:
             # Consume selection/stroke clicks while the preview owns the
             # modal handler.  Neither button confirms nor cancels this tool.
@@ -1396,7 +1425,7 @@ class VIEW3D_PT_mesh_focus_guided_ridge(bpy.types.Panel):
         layout.label(text="LMB: 点追加 / Enter: Curve Preview")
         layout.label(text="Wheel: Curve Shape -100..100 (Attenuated/Raw/Amplified)")
         layout.label(text="Backspace: 編集へ戻る")
-        layout.label(text="Enter: Pinch Ridge / Ctrl+Enter: Crease Groove")
+        layout.label(text="Enter: Pinch Ridge / Ctrl+Enter: Crease Polish Valley")
 
 
 class VIEW3D_PT_mesh_focus_orbit_tools(bpy.types.Panel):
@@ -1753,6 +1782,18 @@ def _rebuild_keymaps():
         )
         _runtime.addon_keymaps.append((keymap, local_grow_item))
 
+        expand_only_item = keymap.keymap_items.new(
+            LOCAL_FACE_SET_GROW_OPERATOR_ID,
+            LOCAL_FACE_SET_GROW_KEY,
+            "PRESS",
+            any=False,
+            shift=True,
+            ctrl=False,
+            alt=False,
+        )
+        expand_only_item.properties.expand_only = True
+        _runtime.addon_keymaps.append((keymap, expand_only_item))
+
         strict_grow_item = keymap.keymap_items.new(
             LOCAL_FACE_SET_GROW_OPERATOR_ID,
             LOCAL_FACE_SET_GROW_KEY,
@@ -2026,6 +2067,10 @@ def _remove_registered_handlers():
         (bpy.app.handlers.depsgraph_update_post, _on_guided_ridge_depsgraph_update),
         (bpy.app.handlers.load_pre, _on_guided_ridge_load_pre),
         (bpy.app.handlers.load_post, _on_guided_ridge_load_post),
+        (bpy.app.handlers.undo_pre, _on_guided_ridge_undo_pre),
+        (bpy.app.handlers.undo_post, _on_guided_ridge_undo_post),
+        (bpy.app.handlers.redo_pre, _on_guided_ridge_redo_pre),
+        (bpy.app.handlers.redo_post, _on_guided_ridge_redo_post),
         (bpy.app.handlers.depsgraph_update_post, _on_tube_preview_depsgraph_update),
         (bpy.app.handlers.depsgraph_update_post, _on_local_feature_brush_depsgraph_update),
         (bpy.app.handlers.undo_post, _on_local_feature_brush_undo_post),
@@ -2089,6 +2134,14 @@ def register():
         bpy.app.handlers.load_pre.append(_on_guided_ridge_load_pre)
     if _on_guided_ridge_load_post not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_on_guided_ridge_load_post)
+    if _on_guided_ridge_undo_pre not in bpy.app.handlers.undo_pre:
+        bpy.app.handlers.undo_pre.append(_on_guided_ridge_undo_pre)
+    if _on_guided_ridge_undo_post not in bpy.app.handlers.undo_post:
+        bpy.app.handlers.undo_post.append(_on_guided_ridge_undo_post)
+    if _on_guided_ridge_redo_pre not in bpy.app.handlers.redo_pre:
+        bpy.app.handlers.redo_pre.append(_on_guided_ridge_redo_pre)
+    if _on_guided_ridge_redo_post not in bpy.app.handlers.redo_post:
+        bpy.app.handlers.redo_post.append(_on_guided_ridge_redo_post)
     if _on_tube_preview_depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(_on_tube_preview_depsgraph_update)
     if _on_local_feature_brush_depsgraph_update not in bpy.app.handlers.depsgraph_update_post:

@@ -3261,6 +3261,7 @@ def _guided_ridge_curve_preview_fixture(module):
     original_overlay = module.guided_ridge._guided_ridge_overlay_tag
     original_width_preview = module.guided_ridge._guided_ridge_update_width_preview
     original_projection = module.guided_ridge._guided_ridge_project_3d_to_region_2d
+    original_begin_native = module.guided_ridge._guided_ridge_begin_native_transaction
     original_smoothing = module.runtime.guided_ridge_curve_last_smoothing
     reports = []
     before_route = [
@@ -3291,6 +3292,9 @@ def _guided_ridge_curve_preview_fixture(module):
         module.guided_ridge._guided_ridge_context_signature = lambda _context: dict(context_signature)
         module.guided_ridge._guided_ridge_navigation_passthrough = lambda *_args: False
         module.guided_ridge._guided_ridge_overlay_tag = lambda _state: None
+        # This fixture covers only route/curve preview invariants.  Keep the
+        # native transaction boundary in its dedicated fixture below.
+        module.guided_ridge._guided_ridge_begin_native_transaction = lambda *_args: False
         rebuild_calls = []
         module.guided_ridge._guided_ridge_update_width_preview = lambda _state: rebuild_calls.append(True)
         module.guided_ridge._guided_ridge_project_3d_to_region_2d = (
@@ -3404,6 +3408,7 @@ def _guided_ridge_curve_preview_fixture(module):
         module.guided_ridge._guided_ridge_overlay_tag = original_overlay
         module.guided_ridge._guided_ridge_update_width_preview = original_width_preview
         module.guided_ridge._guided_ridge_project_3d_to_region_2d = original_projection
+        module.guided_ridge._guided_ridge_begin_native_transaction = original_begin_native
         module.runtime.guided_ridge_curve_last_smoothing = original_smoothing
 
 
@@ -5952,7 +5957,7 @@ def _guided_ridge_native_asset_fixture(module):
         assert ridge.sculpt_brush_type == "PINCH"
         groove = service._activate_builtin_asset(native_context, sculpt, state, "GROOVE")
         groove_ref = service._asset_reference(sculpt)
-        assert groove_ref["relative_asset_identifier"].endswith("/Brush/Crease Sharp")
+        assert groove_ref["relative_asset_identifier"].endswith("/Brush/Crease Polish")
         assert groove.sculpt_brush_type == "CREASE"
         return {"passed": True, "asset_activate": True, "ridge_asset": ridge_ref["relative_asset_identifier"], "groove_asset": groove_ref["relative_asset_identifier"], "no_custom_asset": True}
     finally:
@@ -6091,6 +6096,48 @@ def _guided_ridge_curve_sculpt_apply_fixture(module):
             "float_mouse_coordinates": True,
         }
     finally:
+        service.bpy = original_bpy
+
+
+def _guided_ridge_dyntopo_undo_guard_fixture(module):
+    """Dyntopo must be rejected before asset activation or native stroke."""
+    service = module.guided_ridge_curve_sculpt
+    original_bpy = service.bpy
+    reports = []
+    native_calls = []
+
+    class _Operator:
+        def report(self, level, message):
+            reports.append((tuple(level), str(message)))
+
+    class _Object:
+        use_dynamic_topology_sculpting = True
+
+    original_native = service._apply_native_stroke
+    service._apply_native_stroke = lambda *_args, **_kwargs: native_calls.append(True)
+    state = {
+        "active": True,
+        "phase": "curve_preview",
+        "curve_screen_preview": ((12.0, 20.0), (32.0, 48.0)),
+        "curve_screen_cache_status": "valid",
+        "obj": _Object(),
+        "operator": _Operator(),
+    }
+    try:
+        result = service.apply(None, state, "RIDGE")
+        assert result is False
+        assert state.get("curve_sculpt_apply_rejected_reason") == "dyntopo-native-undo-boundary"
+        assert not native_calls
+        assert any("Dyntopo" in message and "Undo" in message for _level, message in reports)
+        return {
+            "passed": True,
+            "result": result,
+            "native_stroke_started": False,
+            "asset_activation_started": False,
+            "undo_boundary_untouched": True,
+        }
+    finally:
+        service._apply_native_stroke = original_native
         service.bpy = original_bpy
 
 
@@ -6434,10 +6481,69 @@ def _guided_ridge_curve_sculpt_transaction_fixture(module):
         state["curve_sculpt_apply_active"] = False
         guided_core._on_guided_ridge_depsgraph_update(None, depsgraph)
         assert cancelled
-        return {"passed": True, "self_update_ignored_during_generation": True, "external_update_cancelled": True}
+        cancelled.clear()
+        state["curve_sculpt_transaction"] = {
+            "pending_history": {"direction": "undo", "expected": None},
+        }
+        guided_core._on_guided_ridge_depsgraph_update(None, depsgraph)
+        assert not cancelled
+        assert state.get("curve_sculpt_history_depsgraph_pending") is True
+        return {
+            "passed": True,
+            "self_update_ignored_during_generation": True,
+            "external_update_cancelled": True,
+            "history_update_deferred": True,
+        }
     finally:
         guided_core._guided_ridge_cancel = original_cancel
         module.runtime.guided_ridge_state = original_state
+
+
+def _guided_ridge_history_transaction_fixture(module):
+    """The modal's history cursor follows standard Undo/Redo notifications."""
+    service = module.guided_ridge_curve_sculpt
+    guided_core = module.guided_ridge
+    original_runtime_state = module.runtime.guided_ridge_state
+    state = {"active": True}
+    pre_signature = ("object", "mesh", 8, 12, ((0.0, 0.0, 0.0),))
+    post_signature = ("object", "mesh", 8, 12, ((0.25, 0.0, 0.0),))
+    external_signature = ("object", "mesh", 8, 12, ((0.5, 0.0, 0.0),))
+    assert service.record_transaction_apply(state, pre_signature, post_signature, "RIDGE")
+    assert service.request_history_change(state, "undo")
+    state["curve_sculpt_transaction"]["history_pre_direction"] = "undo"
+    state["curve_sculpt_transaction"]["history_post_direction"] = "undo"
+    assert service.observe_history_change(state, pre_signature) == "undo"
+    assert state["curve_sculpt_transaction"]["cursor"] == 0
+    assert service.request_history_change(state, "redo")
+    state["curve_sculpt_transaction"]["history_pre_direction"] = "redo"
+    state["curve_sculpt_transaction"]["history_post_direction"] = "redo"
+    assert service.observe_history_change(state, post_signature) == "redo"
+    assert state["curve_sculpt_transaction"]["cursor"] == 1
+    assert service.request_history_change(state, "undo")
+    state["curve_sculpt_transaction"]["history_pre_direction"] = "undo"
+    state["curve_sculpt_transaction"]["history_post_direction"] = "undo"
+    assert service.observe_history_change(state, external_signature) == "external"
+    assert state["curve_sculpt_transaction"]["external_change"] is True
+    handler_state = {
+        "active": True,
+        "curve_sculpt_transaction": {
+            "pending_history": {"direction": "undo"},
+        },
+    }
+    module.runtime.guided_ridge_state = handler_state
+    guided_core._on_guided_ridge_undo_pre(None)
+    guided_core._on_guided_ridge_undo_post(None)
+    assert handler_state["curve_sculpt_transaction"]["history_pre_direction"] == "undo"
+    assert handler_state["curve_sculpt_transaction"]["history_post_direction"] == "undo"
+    assert handler_state["curve_sculpt_history_reacquire_pending"] is True
+    module.runtime.guided_ridge_state = original_runtime_state
+    return {
+        "passed": True,
+        "undo_cursor": 0,
+        "redo_cursor": 1,
+        "external_change_cancels": True,
+        "undo_redo_handlers_reacquire": True,
+    }
 
 
 def run():
@@ -7054,6 +7160,7 @@ def run():
     guided_ridge_mfo_navigation = _guided_ridge_mfo_navigation_fixture(module)
     guided_ridge_curve_preview = _guided_ridge_curve_preview_fixture(module)
     guided_ridge_curve_sculpt_apply = _guided_ridge_curve_sculpt_apply_fixture(module)
+    guided_ridge_dyntopo_undo_guard = _guided_ridge_dyntopo_undo_guard_fixture(module)
     guided_ridge_restore_retry = _guided_ridge_restore_retry_fixture(module)
     durable_restore = _durable_restore_fixture(module)
     smart_fill_terminal_failure = _smart_fill_terminal_failure_fixture(module)
@@ -7061,6 +7168,7 @@ def run():
     modal_return_contract = _modal_terminal_return_contract(module)
     modal_owner_preflight = _modal_owner_preflight_fixture(module)
     guided_ridge_curve_sculpt_transaction = _guided_ridge_curve_sculpt_transaction_fixture(module)
+    guided_ridge_history_transaction = _guided_ridge_history_transaction_fixture(module)
     smart_fill_modal_safety = _smart_fill_modal_safety_fixture(module)
     # Native asset activation, brush strokes, and mode switches are never run
     # in the user's connected Blender.  They are exercised by the dedicated
@@ -7331,6 +7439,7 @@ def run():
         "guided_ridge_mfo_navigation": guided_ridge_mfo_navigation,
         "guided_ridge_curve_preview": guided_ridge_curve_preview,
         "guided_ridge_curve_sculpt_apply": guided_ridge_curve_sculpt_apply,
+        "guided_ridge_dyntopo_undo_guard": guided_ridge_dyntopo_undo_guard,
         "guided_ridge_restore_retry": guided_ridge_restore_retry,
         "guided_ridge_durable_restore": durable_restore,
         "smart_fill_terminal_failure": smart_fill_terminal_failure,
@@ -7338,6 +7447,7 @@ def run():
         "modal_return_contract": modal_return_contract,
         "modal_owner_preflight": modal_owner_preflight,
         "guided_ridge_curve_sculpt_transaction": guided_ridge_curve_sculpt_transaction,
+        "guided_ridge_history_transaction": guided_ridge_history_transaction,
         "guided_ridge_native_asset": guided_ridge_native_asset,
         "guided_ridge_native_apply": guided_ridge_native_apply,
         "guided_ridge_curve_default_inscribed": guided_ridge_curve_default_inscribed,

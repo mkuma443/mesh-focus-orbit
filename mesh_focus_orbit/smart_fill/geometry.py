@@ -1417,6 +1417,60 @@ def _fill_preview_dijkstra_incremental(geometry, seed_face, max_distance, state)
     return distances, ids, int(state["popped"]), state
 
 
+def _fill_preview_simple_feature_neighbor_lengths(
+    geometry, feature_angle_radians=math.radians(12.0)
+):
+    """Double traversal cost across a clear ridge or valley.
+
+    The Shift+E path deliberately uses only the unsigned angle between
+    adjacent face normals.  Convex and concave folds therefore receive the
+    same lightweight cost, while flat adjacency keeps its physical length.
+    """
+    import numpy as np
+
+    base = np.asarray(geometry.get("neighbor_lengths", ()), dtype=np.float64).reshape(-1)
+    first = np.asarray(geometry.get("first", ()), dtype=np.int32).reshape(-1)
+    second = np.asarray(geometry.get("second", ()), dtype=np.int32).reshape(-1)
+    normals = np.asarray(geometry.get("normals", ()), dtype=np.float64)
+    count = int(geometry.get("count", 0))
+    if (
+        normals.shape != (count, 3)
+        or len(first) != len(second)
+        or len(base) != 2 * len(first)
+        or np.any(first < 0)
+        or np.any(second < 0)
+        or np.any(first >= count)
+        or np.any(second >= count)
+    ):
+        raise RuntimeError("simple feature-cost geometry schema is invalid")
+    dots = np.einsum("ij,ij->i", normals[first], normals[second])
+    threshold_dot = math.cos(max(float(feature_angle_radians), 0.0))
+    feature_pairs = np.isfinite(dots) & (
+        np.clip(dots, -1.0, 1.0) <= threshold_dot
+    )
+    directed_pairs = None
+    if not geometry.get("cursor_local"):
+        candidate = np.asarray(
+            geometry.get("edge_indices", ()), dtype=np.int64
+        ).reshape(-1)
+        if (
+            len(candidate) == len(base)
+            and (len(candidate) == 0 or np.min(candidate) >= 0)
+            and (len(candidate) == 0 or np.max(candidate) < len(first))
+        ):
+            directed_pairs = candidate
+    if directed_pairs is None:
+        sources = np.r_[first, second]
+        graph_order = np.argsort(sources, kind="stable")
+        directed_pairs = np.r_[
+            np.arange(len(first), dtype=np.int64),
+            np.arange(len(first), dtype=np.int64),
+        ][graph_order]
+    weighted = np.array(base, copy=True)
+    weighted[feature_pairs[directed_pairs]] *= 2.0
+    return weighted, feature_pairs
+
+
 def _fill_preview_progressive_range_step(state, radius):
     """Advance the active normal-E physical range by one bounded stage.
 
@@ -1437,10 +1491,35 @@ def _fill_preview_progressive_range_step(state, radius):
     seed_face = int(seed_value)
     halo = max(float(radius) * 0.5, float(state.get("initial_radius") or radius) * 0.5)
     patch_radius = float(radius) + halo
+    walk_geometry = geometry
+    if bool(state.get("expand_only", False)):
+        feature_cache_key = (
+            id(geometry),
+            geometry.get("coordinate_fingerprint"),
+            len(geometry.get("neighbor_lengths", ())),
+        )
+        feature_cache = state.get("simple_feature_cost_cache")
+        if (
+            not isinstance(feature_cache, dict)
+            or feature_cache.get("key") != feature_cache_key
+        ):
+            weighted_lengths, feature_pairs = (
+                _fill_preview_simple_feature_neighbor_lengths(geometry)
+            )
+            feature_cache = {
+                "key": feature_cache_key,
+                "neighbor_lengths": weighted_lengths,
+                "feature_pairs": feature_pairs,
+            }
+            state["simple_feature_cost_cache"] = feature_cache
+        else:
+            weighted_lengths = feature_cache["neighbor_lengths"]
+        walk_geometry = dict(geometry)
+        walk_geometry["neighbor_lengths"] = weighted_lengths
     previous = state.get("distance_state")
     popped_before = int(previous.get("popped", 0)) if isinstance(previous, dict) else 0
     distances, patch_ids, popped, distance_state = _fill_preview_dijkstra_incremental(
-        geometry, seed_face, patch_radius, previous
+        walk_geometry, seed_face, patch_radius, previous
     )
     state["distance_state"] = distance_state
     newly_processed = max(

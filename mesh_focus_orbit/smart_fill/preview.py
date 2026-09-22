@@ -8914,6 +8914,138 @@ def _fill_preview_terminal_result(state, radius):
     return result
 
 
+def _fill_preview_expand_only_selection(distances, hidden, radius):
+    """Return the visible topology-distance stage for Expand Only."""
+    import numpy as np
+
+    distances = np.asarray(distances, dtype=np.float64).reshape(-1)
+    hidden = np.asarray(hidden, dtype=bool).reshape(-1)
+    if len(distances) != len(hidden):
+        raise ValueError("expand-only distance/visibility schema is invalid")
+    tolerance = max(float(radius) * 1.0e-8, 1.0e-9)
+    return (
+        np.isfinite(distances)
+        & (distances <= float(radius) + tolerance)
+        & ~hidden
+    )
+
+
+def _fill_preview_make_expand_only_result(state, radius):
+    """Build a lightweight feature-cost candidate for Shift+E Smart Fill.
+
+    This path uses only topology distance plus a binary adjacent-normal cost:
+    clear ridges and valleys cost twice as much to cross as flat adjacency.
+    It does not call partition, contour, shadow, or boundary-refinement
+    analysis.
+    """
+    import numpy as np
+
+    started = time.perf_counter()
+    progressive = _fill_preview_progressive_range_step(state, radius)
+    geometry = progressive["geometry"]
+    distances = np.asarray(progressive["distances"], dtype=np.float64).reshape(-1)
+    count = int(geometry.get("count", 0))
+    if count <= 0 or len(distances) < count:
+        raise RuntimeError("expand-only adjacency graph is unavailable")
+    hidden = np.asarray(
+        geometry.get("hidden", np.zeros(count, dtype=bool)), dtype=bool
+    ).reshape(-1)
+    if len(hidden) != count:
+        raise RuntimeError("expand-only visibility schema is invalid")
+    seed_local = int(progressive["seed_face"])
+    if seed_local < 0 or seed_local >= count or bool(hidden[seed_local]):
+        raise RuntimeError("expand-only seed is hidden or outside the graph")
+    selected = _fill_preview_expand_only_selection(
+        distances[:count], hidden, radius
+    )
+    selected_local = np.flatnonzero(selected).astype(np.int32, copy=False)
+    if len(selected_local) == 0 or not bool(selected[seed_local]):
+        raise RuntimeError("expand-only produced no visible candidate")
+    face_ids = np.asarray(
+        geometry.get("face_ids", np.arange(count, dtype=np.int32)),
+        dtype=np.int32,
+    ).reshape(-1)
+    if len(face_ids) != count:
+        raise RuntimeError("expand-only face-id schema is invalid")
+    preview_faces = face_ids[selected_local].astype(np.int32, copy=True)
+    first = np.asarray(geometry.get("first", ()), dtype=np.int32).reshape(-1)
+    second = np.asarray(geometry.get("second", ()), dtype=np.int32).reshape(-1)
+    pair_v0 = np.asarray(geometry.get("pair_v0", ()), dtype=np.int32).reshape(-1)
+    pair_v1 = np.asarray(geometry.get("pair_v1", ()), dtype=np.int32).reshape(-1)
+    if not (len(first) == len(second) == len(pair_v0) == len(pair_v1)):
+        raise RuntimeError("expand-only boundary schema is invalid")
+    selected_mask = selected
+    crossing = selected_mask[first] != selected_mask[second]
+    world_vertices = np.asarray(
+        geometry.get("world_vertices", ()), dtype=np.float64
+    ).reshape((-1, 3))
+    if len(pair_v0) and (
+        np.any(pair_v0 < 0)
+        or np.any(pair_v1 < 0)
+        or np.any(pair_v0 >= len(world_vertices))
+        or np.any(pair_v1 >= len(world_vertices))
+    ):
+        raise RuntimeError("expand-only edge vertex schema is invalid")
+    distance_segments = [
+        (
+            tuple(float(value) for value in world_vertices[int(pair_v0[index])]),
+            tuple(float(value) for value in world_vertices[int(pair_v1[index])]),
+        )
+        for index in np.flatnonzero(crossing)
+    ]
+    boundary_records = tuple(
+        {
+            "geometry_face_a": int(first[index]),
+            "geometry_face_b": int(second[index]),
+            "mesh_face_a": int(face_ids[int(first[index])]),
+            "mesh_face_b": int(face_ids[int(second[index])]),
+            "mesh_edge": -1,
+            "shape": False,
+        }
+        for index in np.flatnonzero(crossing)
+    )
+    confirm_snapshot, confirm_domain_ids = _fill_preview_confirm_graph_snapshot(
+        geometry, distances, radius
+    )
+    if confirm_snapshot is None or len(confirm_domain_ids) == 0:
+        raise RuntimeError("expand-only confirmation graph is unavailable")
+    seed_matches = np.flatnonzero(face_ids == int(state.get("seed_face", -1)))
+    if len(seed_matches) != 1:
+        raise RuntimeError("expand-only seed mapping is invalid")
+    elapsed = time.perf_counter() - started
+    return {
+        "radius": float(radius),
+        "faces": preview_faces,
+        "candidate_count": int(len(preview_faces)),
+        "boundary_edge_count": int(len(boundary_records)),
+        "boundary_all_orange": False,
+        "analysis_faces": 0,
+        "popped_faces": int(progressive.get("popped", 0)),
+        "shape_segments": [],
+        "distance_segments": distance_segments,
+        "boundary_records": boundary_records,
+        "confirm_geometry": confirm_snapshot,
+        "confirm_seed_local": int(seed_matches[0]),
+        "confirm_domain_ids": confirm_domain_ids,
+        "confirm_signature": state["signature"],
+        "patch_edge_reached": bool(progressive.get("patch_ids") is not None),
+        "compute_seconds": float(elapsed),
+        "geometry": geometry,
+        "partition": None,
+        "created_generation": int(state["generation"]),
+        "progressive_range_mode": True,
+        "progressive_range_newly_processed_faces": int(
+            progressive.get("newly_processed_faces", 0)
+        ),
+        "progressive_range_reused_faces": int(progressive.get("reused_faces", 0)),
+        "progressive_range_wheel_compute_seconds": float(elapsed),
+        "expand_only_mode": True,
+        "surface_evaluation_bypassed": False,
+        "full_surface_analysis_bypassed": True,
+        "surface_analysis": "simple-dihedral-cost",
+    }
+
+
 def _fill_preview_make_result(state, radius):
     """Compute one immutable candidate result for the current wheel distance."""
     import numpy as np
@@ -10385,9 +10517,13 @@ def _fill_preview_draw_text(state, result):
             else:
                 lines = [
                     (
-                        "Smart Fill Preview - progressive range"
-                        if result.get("progressive_range_mode")
-                        else "Smart Fill Preview"
+                    "Smart Fill Preview - Simple Ridge/Valley Cost"
+                        if result.get("expand_only_mode")
+                        else (
+                            "Smart Fill Preview - progressive range"
+                            if result.get("progressive_range_mode")
+                            else "Smart Fill Preview"
+                        )
                     ),
                     f"Distance {float(result['radius']):.4g} m  Boundary edges {int(result.get('boundary_edge_count', 0))}",
                     (

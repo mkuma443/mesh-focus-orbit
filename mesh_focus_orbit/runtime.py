@@ -74,6 +74,12 @@ guided_ridge_state = None
 guided_ridge_last_guide = None
 guided_ridge_curve_2d_shader = None
 guided_ridge_curve_last_smoothing = -12.0
+# A short-lived native Sculpt transaction is owned here while the editor modal
+# is suspended.  Keeping the record outside the operator instance lets the
+# editor return a terminal status before Blender starts the native stroke, then
+# re-enter the same route/curve session after the one-shot operation completes.
+guided_ridge_native_transaction = None
+guided_ridge_native_transaction_timer = None
 
 local_feature_brush_load_guard = False
 local_feature_brush_pending_stroke = None

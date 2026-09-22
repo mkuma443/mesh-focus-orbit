@@ -7853,6 +7853,250 @@ def _guided_ridge_stop_draw():
         state[key] = None
 
 
+def _guided_ridge_install_session_handlers(context, state):
+    """Install the editor overlay/timer for an existing route session.
+
+    This is shared by initial invoke and the short-lived native transaction
+    resume path.  It intentionally does not rebuild the route or mesh
+    snapshot.
+    """
+    if state is None:
+        return False
+    try:
+        if state.get("draw_handler") is None:
+            state["draw_handler"] = bpy.types.SpaceView3D.draw_handler_add(
+                _guided_ridge_draw, (), "WINDOW", "POST_VIEW"
+            )
+        if state.get("text_draw_handler") is None:
+            state["text_draw_handler"] = bpy.types.SpaceView3D.draw_handler_add(
+                _guided_ridge_draw_text, (), "WINDOW", "POST_PIXEL"
+            )
+        if state.get("screen_curve_draw_handler") is None:
+            state["screen_curve_draw_handler"] = bpy.types.SpaceView3D.draw_handler_add(
+                _guided_ridge_draw_curve_screen, (), "WINDOW", "POST_PIXEL"
+            )
+        if state.get("timer") is None:
+            if state.get("prototype_route_only"):
+                if not _guided_ridge_route_monitor_start(context, state):
+                    raise RuntimeError("route monitor timer could not be restored")
+            else:
+                state["timer"] = state["window_manager"].event_timer_add(
+                    0.01, window=context.window
+                )
+        state["start_guard_active"] = False
+        state["start_key_released"] = True
+        _guided_ridge_overlay_tag(state)
+        return True
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        _guided_ridge_stop_draw()
+        return False
+
+
+def _guided_ridge_suspend_editor(context, state):
+    """Suspend route editing before a one-shot native Sculpt operation."""
+    if state is None:
+        return False
+    timer = state.get("timer")
+    if timer is not None:
+        try:
+            state["window_manager"].event_timer_remove(timer)
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            pass
+        state["timer"] = None
+    _guided_ridge_stop_draw()
+    state["curve_sculpt_editor_suspended"] = True
+    return True
+
+
+def _guided_ridge_native_live_context(transaction, state):
+    """Resolve saved UI identities through the current window manager.
+
+    Application timers cannot trust ambient bpy.context.area/region.  Resolve
+    the saved window, View3D area, window region, and active space from the
+    live window manager, then let the caller create one temp override and
+    validate the full launch identity inside it.
+    """
+    if (
+        transaction is None
+        or state is None
+        or _runtime.guided_ridge_state is not state
+        or not state.get("active")
+        or transaction.get("token") != state.get("curve_sculpt_session_token")
+    ):
+        return None
+    launch_identity = transaction.get("launch_identity") or {}
+    identity_pairs = (
+        ("window", "window_key"),
+        ("area", "area_key"),
+        ("region", "region_key"),
+        ("object", "object_pointer"),
+        ("mesh", "mesh_pointer"),
+    )
+    if any(launch_identity.get(left) != state.get(right) for left, right in identity_pairs):
+        return None
+    try:
+        base_context = getattr(bpy, "context", None)
+        window_manager = getattr(base_context, "window_manager", None)
+        if base_context is None or window_manager is None:
+            return None
+        for window in tuple(window_manager.windows):
+            if int(window.as_pointer()) != int(state.get("window_key", 0)):
+                continue
+            screen = window.screen
+            for area in tuple(screen.areas):
+                if int(area.as_pointer()) != int(state.get("area_key", 0)):
+                    continue
+                if getattr(area, "type", None) != "VIEW_3D":
+                    return None
+                space = getattr(area.spaces, "active", None)
+                if space is None or int(space.as_pointer()) != int(state.get("space_key", 0)):
+                    return None
+                for region in tuple(area.regions):
+                    if int(region.as_pointer()) != int(state.get("region_key", 0)):
+                        continue
+                    if getattr(region, "type", None) != "WINDOW":
+                        return None
+                    return base_context, window, area, region, space
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        pass
+    return None
+
+
+def _guided_ridge_native_in_override(transaction, state, callback):
+    """Run one callback inside a freshly resolved launch-context override."""
+    resolved = _guided_ridge_native_live_context(transaction, state)
+    if resolved is None:
+        raise RuntimeError("native transaction launch context is unavailable")
+    base_context, window, area, region, space = resolved
+    with base_context.temp_override(
+        window=window,
+        area=area,
+        region=region,
+        space_data=space,
+    ):
+        context = bpy.context
+        if not _guided_ridge_route_context_matches(context, state):
+            raise RuntimeError("native transaction launch context changed")
+        return callback(context)
+
+
+def _guided_ridge_native_transaction_tick():
+    """Run exactly one native stroke, then re-enter the same editor session."""
+    transaction = _runtime.guided_ridge_native_transaction
+    if not transaction:
+        _runtime.guided_ridge_native_transaction_timer = None
+        return None
+    state = transaction.get("state")
+    if state is None or not state.get("active"):
+        _runtime.guided_ridge_native_transaction = None
+        _runtime.guided_ridge_native_transaction_timer = None
+        return None
+    if _guided_ridge_native_live_context(transaction, state) is None:
+        if state.get("operator") is not None:
+            state["operator"].report(
+                {"WARNING"},
+                "Guided Ridge: native transaction context changed; no stroke was applied",
+            )
+        _guided_ridge_cancel(state, "native-context-changed")
+        _runtime.guided_ridge_native_transaction = None
+        _runtime.guided_ridge_native_transaction_timer = None
+        return None
+    if transaction.get("status") == "pending":
+        transaction["status"] = "running"
+        mode = transaction.get("mode", "RIDGE")
+        try:
+            if not _guided_ridge_native_in_override(
+                transaction,
+                state,
+                lambda live_context: _curve_sculpt.apply(live_context, state, mode=mode),
+            ):
+                transaction["status"] = "failed"
+                if state.get("operator") is not None:
+                    state["operator"].report(
+                        {"WARNING"},
+                        "Guided Ridge: native one-shot application was unavailable",
+                    )
+                state["curve_sculpt_editor_suspended"] = False
+                # The original editor has already returned CANCELLED.  Keep
+                # the transaction alive and route through the same fresh
+                # operator re-entry used after success; reinstalling only the
+                # draw handler/timer would leave the HUD visible with no modal
+                # owner and make the session impossible to Esc-cancel.
+                transaction["status"] = "resume"
+                transaction["resume_warning"] = True
+            state["curve_sculpt_editor_suspended"] = False
+            state["curve_sculpt_native_last_mode"] = mode
+            transaction["status"] = "resume"
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError) as error:
+            transaction["status"] = "failed"
+            if state.get("operator") is not None:
+                state["operator"].report({"WARNING"}, f"Guided Ridge: native transaction failed ({error})")
+            state["curve_sculpt_editor_suspended"] = False
+            transaction["status"] = "resume"
+            transaction["resume_warning"] = True
+    if transaction.get("status") == "resume":
+        # A fresh operator instance owns the resumed modal handler.  The
+        # existing route/session dictionary remains the canonical state.
+        try:
+            result = _guided_ridge_native_in_override(
+                transaction,
+                state,
+                lambda _live_context: bpy.ops.view3d.mesh_focus_guided_ridge("INVOKE_DEFAULT"),
+            )
+            if "RUNNING_MODAL" in result:
+                _runtime.guided_ridge_native_transaction = None
+                _runtime.guided_ridge_native_transaction_timer = None
+                return None
+            raise RuntimeError(f"Guided Ridge resume did not enter modal: {result}")
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError) as error:
+            if state.get("operator") is not None:
+                state["operator"].report({"WARNING"}, f"Guided Ridge: session resume failed ({error})")
+            # Resume can fail after the new event timer has been installed.
+            # Use the canonical cancel path so that timer, native transaction,
+            # draw handlers, and the curve-sculpt restore state all close
+            # together.
+            _guided_ridge_cancel(state, "resume-failed")
+            _runtime.guided_ridge_native_transaction = None
+            _runtime.guided_ridge_native_transaction_timer = None
+            return None
+    return 0.0
+
+
+def _guided_ridge_begin_native_transaction(context, state, mode):
+    """Suspend the editor and schedule one independent native operation."""
+    if state is None or not state.get("active"):
+        return False
+    if _runtime.guided_ridge_native_transaction is not None:
+        return False
+    if not _guided_ridge_suspend_editor(context, state):
+        return False
+    _runtime.guided_ridge_native_transaction = {
+        "kind": "apply",
+        "status": "pending",
+        "mode": "GROOVE" if str(mode).upper() == "GROOVE" else "RIDGE",
+        "state": state,
+        "token": state.get("curve_sculpt_session_token"),
+        "launch_identity": {
+            "window": state.get("window_key"),
+            "area": state.get("area_key"),
+            "region": state.get("region_key"),
+            "object": state.get("object_pointer"),
+            "mesh": state.get("mesh_pointer"),
+            "mode": (state.get("context_signature") or {}).get("mode"),
+        },
+    }
+    try:
+        bpy.app.timers.register(_guided_ridge_native_transaction_tick, first_interval=0.0)
+        _runtime.guided_ridge_native_transaction_timer = _guided_ridge_native_transaction_tick
+        return True
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        _runtime.guided_ridge_native_transaction = None
+        _runtime.guided_ridge_native_transaction_timer = None
+        _guided_ridge_install_session_handlers(context, state)
+        state["curve_sculpt_editor_suspended"] = False
+        return False
+
+
 def _guided_ridge_curve_2d_shader_get():
     if _runtime.guided_ridge_curve_2d_shader is None:
         for shader_name in ("2D_UNIFORM_COLOR", "UNIFORM_COLOR"):
@@ -7933,6 +8177,16 @@ def _guided_ridge_cancel(state=None, reason="cancel"):
     current["prepare_job"] = None
     current["compute_job"] = None
     current["width_frame_job"] = None
+    transaction = _runtime.guided_ridge_native_transaction
+    if transaction is not None and transaction.get("state") is current:
+        _runtime.guided_ridge_native_transaction = None
+        _runtime.guided_ridge_native_transaction_timer = None
+        try:
+            callback = _guided_ridge_native_transaction_tick
+            if bpy.app.timers.is_registered(callback):
+                bpy.app.timers.unregister(callback)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            pass
     _curve_sculpt.cleanup(current)
     _guided_ridge_stop_draw()
     _runtime.guided_ridge_state = None
@@ -8092,7 +8346,7 @@ def _guided_ridge_draw_text():
                 lines = [
                     "GUIDED RIDGE - CURVE SCULPT / ACTIVE",
                     f"Curve Shape: {smoothing:.0f}/100 ({shape_label})   Ridge: {int(state.get('curve_sculpt_ridge_applications', 0))}  Groove: {int(state.get('curve_sculpt_groove_applications', 0))}",
-                    "Enter: Pinch Ridge   Ctrl+Enter: Crease Groove   Backspace: edit route",
+                    "Enter: Pinch Ridge   Ctrl+Enter: Crease Polish Valley   Backspace: edit route",
                     "Tab: finish   Esc/RMB: exit (applied sculpt remains)",
                     str(warning) if warning else "Current-view Paint Curve is ready",
                 ]
@@ -8101,7 +8355,7 @@ def _guided_ridge_draw_text():
                     "GUIDED RIDGE - CURVE SCULPT / CURVE PREVIEW",
                     f"Curve Shape: {smoothing:.0f}/100 ({shape_label})   Wheel: adjust  Shift+Wheel: fine",
                     "Current-view 2D Bezier preview (dense adaptive tessellation)",
-                    "Enter: Pinch Ridge   Ctrl+Enter: Crease Groove",
+                    "Enter: Pinch Ridge   Ctrl+Enter: Crease Polish Valley",
                     "Backspace: edit route   Esc/RMB: cancel" if not warning else str(warning),
                 ]
         else:
@@ -8557,6 +8811,35 @@ class VIEW3D_OT_mesh_focus_guided_ridge(bpy.types.Operator):
 
     def invoke(self, context, event):
         prototype_route = _guided_ridge_prototype_route_enabled()
+        resume_transaction = _runtime.guided_ridge_native_transaction
+        existing_state = _runtime.guided_ridge_state
+        if (
+            resume_transaction is not None
+            and resume_transaction.get("status") == "resume"
+            and existing_state is resume_transaction.get("state")
+            and existing_state is not None
+        ):
+            existing_state["operator"] = self
+            existing_state["active"] = True
+            existing_state["curve_sculpt_editor_suspended"] = False
+            if not _guided_ridge_install_session_handlers(context, existing_state):
+                self.report({"WARNING"}, "Guided Ridge: editor session could not be resumed")
+                _guided_ridge_cancel(existing_state, "resume-install-failed")
+                return {"CANCELLED"}
+            try:
+                context.window_manager.modal_handler_add(self)
+                _lifecycle.modal_register(
+                    self,
+                    "Guided Ridge",
+                    existing_state.get("curve_sculpt_session_token"),
+                    state=existing_state,
+                )
+                _runtime.guided_ridge_native_transaction = None
+                _runtime.guided_ridge_native_transaction_timer = None
+                return {"RUNNING_MODAL"}
+            except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+                _guided_ridge_cancel(existing_state, "resume-modal-failed")
+                return {"CANCELLED"}
         if _runtime.guided_ridge_state is not None and _runtime.guided_ridge_state.get("active"):
             self.report({"WARNING"}, "Guided Ridge is already active")
             return {"CANCELLED"}
@@ -8736,17 +9019,8 @@ class VIEW3D_OT_mesh_focus_guided_ridge(bpy.types.Operator):
             state["curve_route"] = [start_location]
             state["last_cursor"] = start_location
         try:
-            state["draw_handler"] = bpy.types.SpaceView3D.draw_handler_add(_guided_ridge_draw, (), "WINDOW", "POST_VIEW")
-            state["text_draw_handler"] = bpy.types.SpaceView3D.draw_handler_add(_guided_ridge_draw_text, (), "WINDOW", "POST_PIXEL")
-            state["screen_curve_draw_handler"] = bpy.types.SpaceView3D.draw_handler_add(
-                _guided_ridge_draw_curve_screen, (), "WINDOW", "POST_PIXEL"
-            )
-            if prototype_route:
-                # This timer only checks object/mode/area/datablock identity;
-                # it never starts Face Set preparation or scans the mesh.
-                _guided_ridge_route_monitor_start(context, state)
-            else:
-                state["timer"] = context.window_manager.event_timer_add(0.01, window=context.window)
+            if not _guided_ridge_install_session_handlers(context, state):
+                raise RuntimeError("Guided Ridge editor handlers could not be installed")
             context.window_manager.modal_handler_add(self)
             _lifecycle.modal_register(
                 self,
@@ -8776,6 +9050,25 @@ class VIEW3D_OT_mesh_focus_guided_ridge(bpy.types.Operator):
             return {"CANCELLED"}
         event_type = getattr(event, "type", "")
         event_value = getattr(event, "value", None)
+        history_gate = "none"
+        if state.get("phase") in {"curve_preview", "curve_sculpt"}:
+            history_gate = _guided_ridge_history_modal_gate(context, state, event_type)
+            if history_gate == "cancel":
+                self.report({"WARNING"}, "Guided Ridge: Undo/Redo context could not be reacquired")
+                _guided_ridge_request_cancel(state, "history-context-changed")
+                _lifecycle.modal_terminal(operator=self, status="CANCELLED")
+                return {"CANCELLED"}
+            if history_gate == "wait":
+                if event_type in {
+                    "MIDDLEMOUSE",
+                    "WHEELUPMOUSE",
+                    "WHEELDOWNMOUSE",
+                    "NDOF_MOTION",
+                    "MOUSEMOVE",
+                }:
+                    return {"PASS_THROUGH"}
+                if event_type not in {"ESC", "RIGHTMOUSE"}:
+                    return {"RUNNING_MODAL"}
         if (state.get("prototype_route_only") or state.get("phase") in {"curve_preview", "curve_sculpt"}) and not _guided_ridge_route_context_matches(context, state):
             self.report({"WARNING"}, "Guided Ridge: launch object or View3D context changed; no changes applied")
             _guided_ridge_request_cancel(state, "route-context-changed")
@@ -8920,6 +9213,26 @@ class VIEW3D_OT_mesh_focus_guided_ridge(bpy.types.Operator):
                     state["width_rails"] = {"left": [], "right": []}
                 _guided_ridge_overlay_tag(state)
             return {"RUNNING_MODAL"}
+        if (
+            event_type == "Z"
+            and event_value in {None, "PRESS"}
+            and bool(getattr(event, "ctrl", False))
+            and state.get("phase") == "curve_sculpt"
+        ):
+            direction = "redo" if bool(getattr(event, "shift", False)) else "undo"
+            if _curve_sculpt.request_history_change(state, direction):
+                self.report(
+                    {"INFO"},
+                    "Guided Ridge: Blender standard Redo requested"
+                    if direction == "redo"
+                    else "Guided Ridge: Blender standard Undo requested",
+                )
+                # Never call bpy.ops.ed.undo from this long-lived editor
+                # modal.  PASS_THROUGH lets Blender own the native history
+                # operation; depsgraph validation below refreshes or cancels
+                # the session when the resulting signature arrives.
+                return {"PASS_THROUGH"}
+            return {"RUNNING_MODAL"}
         if event_type in {"RET", "NUMPAD_ENTER", "ENTER"} and event_value in {None, "PRESS"}:
             if state.get("phase") in {"curve_preview", "curve_sculpt"}:
                 if not GUIDED_RIDGE_CURVE_SCULPT_STEP2:
@@ -8927,16 +9240,14 @@ class VIEW3D_OT_mesh_focus_guided_ridge(bpy.types.Operator):
                     return {"RUNNING_MODAL"}
                 mode = "GROOVE" if bool(getattr(event, "ctrl", False)) else "RIDGE"
                 _guided_ridge_curve_refresh_projection(context, state)
-                if _curve_sculpt.apply(context, state, mode=mode):
+                if _guided_ridge_begin_native_transaction(context, state, mode):
                     self.report(
                         {"INFO"},
-                        "Guided Ridge: Groove / Crease applied"
-                        if mode == "GROOVE"
-                        else "Guided Ridge: Ridge / Pinch applied",
+                        "Guided Ridge: native one-shot queued; editor will resume after the stroke",
                     )
-                else:
-                    self.report({"WARNING"}, "Guided Ridge: Curve Sculpt application was not available")
-                _guided_ridge_overlay_tag(state)
+                    _lifecycle.modal_terminal(operator=self, status="CANCELLED")
+                    return {"CANCELLED"}
+                self.report({"WARNING"}, "Guided Ridge: native transaction could not be queued")
                 return {"RUNNING_MODAL"}
             if state.get("phase") == "ready" and GUIDED_RIDGE_CURVE_SCULPT_STEP1:
                 _guided_ridge_begin_curve_preview(context, state)
@@ -8958,15 +9269,14 @@ class VIEW3D_OT_mesh_focus_guided_ridge(bpy.types.Operator):
                         return {"RUNNING_MODAL"}
                     mode = "GROOVE" if bool(getattr(event, "ctrl", False)) else "RIDGE"
                     _guided_ridge_curve_refresh_projection(context, state)
-                    if _curve_sculpt.apply(context, state, mode=mode):
+                    if _guided_ridge_begin_native_transaction(context, state, mode):
                         self.report(
                             {"INFO"},
-                            "Guided Ridge: Groove / Crease applied"
-                            if mode == "GROOVE"
-                            else "Guided Ridge: Ridge / Pinch applied",
+                            "Guided Ridge: native one-shot queued; editor will resume after the stroke",
                         )
-                    else:
-                        self.report({"WARNING"}, "Guided Ridge: Curve Sculpt application was not available")
+                        _lifecycle.modal_terminal(operator=self, status="CANCELLED")
+                        return {"CANCELLED"}
+                    self.report({"WARNING"}, "Guided Ridge: native transaction could not be queued")
                     return {"RUNNING_MODAL"}
                 if state.get("phase") == "ready" and GUIDED_RIDGE_CURVE_SCULPT_STEP1:
                     _guided_ridge_begin_curve_preview(context, state)
@@ -9060,6 +9370,86 @@ class VIEW3D_OT_mesh_focus_guided_ridge(bpy.types.Operator):
         return {"RUNNING_MODAL"}
 
 
+def _guided_ridge_history_resolve_live_object(context, state):
+    """Replace a stale saved Object reference with its live RNA object."""
+    try:
+        expected_pointer = int(state.get("object_pointer", 0) or 0)
+        if expected_pointer <= 0:
+            return None
+        active_object = getattr(context, "active_object", None)
+        if active_object is not None and int(active_object.as_pointer()) == expected_pointer:
+            live_object = active_object
+        else:
+            live_object = None
+            data = getattr(bpy, "data", None)
+            for candidate in tuple(getattr(data, "objects", ())):
+                if int(candidate.as_pointer()) == expected_pointer:
+                    live_object = candidate
+                    break
+        if live_object is None or getattr(live_object, "type", "MESH") != "MESH":
+            return None
+        live_mesh = live_object.data
+        if live_mesh is None:
+            return None
+        state["obj"] = live_object
+        state["object_pointer"] = expected_pointer
+        state["mesh_pointer"] = int(live_mesh.as_pointer())
+        return live_object, live_mesh
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _guided_ridge_history_modal_gate(context, state, event_type):
+    """Consume a native Undo/Redo only after Blender's post marker arrives."""
+    transaction = state.get("curve_sculpt_transaction") or {}
+    if transaction.get("pending_history") is None:
+        return "none"
+    live_identity = _guided_ridge_history_resolve_live_object(context, state)
+    if live_identity is None:
+        return "cancel"
+    current_signature = _guided_ridge_mesh_revision_signature(state)
+    history_status = _curve_sculpt.observe_history_change(
+        state,
+        current_signature,
+        advance_wait=(event_type == "TIMER"),
+    )
+    if history_status == "pending":
+        return "wait"
+    if history_status == "external":
+        return "cancel"
+    if history_status not in {"undo", "redo"}:
+        return "none"
+    try:
+        # Reacquire the datablock identity before the ordinary route check.
+        # Undo may restore a different Mesh RNA pointer while preserving the
+        # same launch object and View3D.
+        if context.active_object is not state.get("obj") or str(context.mode) != "SCULPT":
+            return "cancel"
+        signature = _guided_ridge_context_signature(context)
+        obj = context.active_object
+        mesh = obj.data
+        if signature is None or getattr(obj, "type", "MESH") != "MESH":
+            return "cancel"
+        state["object_pointer"] = int(obj.as_pointer())
+        state["mesh_pointer"] = int(mesh.as_pointer())
+        state["curve_sculpt_target_object_pointer"] = state["object_pointer"]
+        state["curve_sculpt_target_mesh_pointer"] = state["mesh_pointer"]
+        state["area_key"] = int(context.area.as_pointer())
+        state["region_key"] = int(context.region.as_pointer())
+        state["window_key"] = int(context.window.as_pointer()) if context.window else 0
+        space = getattr(context, "space_data", None)
+        state["space_key"] = int(space.as_pointer()) if space is not None else 0
+        state["context_signature"] = signature
+        snapshot = state.get("snapshot")
+        if isinstance(snapshot, dict):
+            snapshot["context_signature"] = signature
+        state["curve_sculpt_expected_mesh_signature"] = current_signature
+        state["curve_sculpt_history_reacquire_pending"] = False
+        return "reacquired"
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return "cancel"
+
+
 def _guided_ridge_mesh_revision_signature(state):
     """Return a cheap, bounded signature for the active native stroke.
 
@@ -9069,6 +9459,44 @@ def _guided_ridge_mesh_revision_signature(state):
     cancellation even when Blender reports the same object datablock.
     """
     return _curve_sculpt.mesh_revision_signature(state)
+
+
+def _guided_ridge_history_handler(direction, phase):
+    """Record Blender's native Undo/Redo lifecycle for modal reacquisition."""
+    state = _runtime.guided_ridge_state
+    if state is None or not state.get("active"):
+        return
+    transaction = state.get("curve_sculpt_transaction") or {}
+    pending = transaction.get("pending_history")
+    if pending is None or pending.get("direction") != direction:
+        return
+    transaction[f"history_{phase}_direction"] = direction
+    transaction["history_last_phase"] = phase
+    if phase == "post":
+        # The modal TIMER consumes the expected signature after Blender has
+        # rebuilt the datablock.  This marker distinguishes that reacquisition
+        # from an unrelated mesh update while keeping the callback non-invasive.
+        state["curve_sculpt_history_reacquire_pending"] = True
+
+
+@persistent
+def _on_guided_ridge_undo_pre(_dummy):
+    _guided_ridge_history_handler("undo", "pre")
+
+
+@persistent
+def _on_guided_ridge_undo_post(_dummy):
+    _guided_ridge_history_handler("undo", "post")
+
+
+@persistent
+def _on_guided_ridge_redo_pre(_dummy):
+    _guided_ridge_history_handler("redo", "pre")
+
+
+@persistent
+def _on_guided_ridge_redo_post(_dummy):
+    _guided_ridge_history_handler("redo", "post")
 
 
 @persistent
@@ -9089,6 +9517,21 @@ def _on_guided_ridge_depsgraph_update(_scene, depsgraph):
             int(state["obj"].data.as_pointer()),
         }
         if not pointers.intersection(target_pointers):
+            return
+        # The deferred native transaction owns the target update window.  Its
+        # timer validates the live context before applying and before resume;
+        # a depsgraph callback here must not race that ownership and cancel the
+        # session between the native operator and the fresh modal handler.
+        native_transaction = _runtime.guided_ridge_native_transaction
+        if native_transaction is not None and native_transaction.get("state") is state:
+            return
+        # Ctrl+Z/Ctrl+Shift+Z deliberately pass through to Blender.  Blender
+        # emits the target depsgraph update before the modal TIMER can compare
+        # the expected pre/post signature, so defer all decisions to that
+        # observer while a history request is armed.
+        history_transaction = state.get("curve_sculpt_transaction") or {}
+        if history_transaction.get("pending_history") is not None:
+            state["curve_sculpt_history_depsgraph_pending"] = True
             return
         # The native stroke is synchronous.  Notifications are ignored only
         # while this exact apply generation is active; once the operator and

@@ -1,17 +1,17 @@
 # Mesh Focus Orbit
 
-Current source version: 3.3.97.
+Current source version: 3.4.2.
 
 Blender 5.2 用のリトポロジー支援アドオンです。
 
-アドオンバージョン: **3.3.97**
+アドオンバージョン: **3.4.2**
 
 ## 主な機能
 
 - **通常 MFO**: Object / Edit / Sculpt Mode で、現在の 3D Viewport の中央レイが最初に当たる表示中の MESH 面を一時的な Orbit 中心にします。
 - **Face Set MFO (FSMFO)**: Reference Object の中央レイが当たる Face Set と、対応が明確な Retopo island だけを一時表示します。
-- **Guided Ridge Curve Sculpt (Step 2)**: Sculpt Modeで各クリックを可視mesh面へスナップした3Dルートを滑らかなカーブとしてプレビューし、明示的なEnterでBlender 5.2 ESSENTIALSのPinch/Magnify、Ctrl+EnterでCrease Sharpをbrush.asset_activate経由で選択し、表示中の曲線を同期sculpt.brush_strokeで一度適用します。適用前はメッシュを変更せず、完了後は元のブラシ資産とツールを復元します。
-- **Smart Fill**: Sculpt Mode では Face Set、Vertex Paint ではアクティブな FLOAT_COLOR/BYTE_COLOR の POINT/CORNER 属性を使って、カーソル下の局所領域をプレビューし、確定時に同じシード色を書き込みます。
+- **Guided Ridge Curve Sculpt (Step 2)**: Sculpt Modeで各クリックを可視mesh面へスナップした3Dルートを滑らかなカーブとしてプレビューし、明示的なEnterでBlender 5.2 ESSENTIALSのPinch/Magnify、Ctrl+EnterでCrease Polishをbrush.asset_activate経由で選択し、表示中の曲線を同期sculpt.brush_strokeで一度適用します。適用前はメッシュを変更せず、完了後は元のブラシ資産とツールを復元します。Dyntopo中はBlenderネイティブUndo/BMLogを壊さないため適用せず、警告して無変更で戻ります。
+- **Smart Fill**: Sculpt Mode では Face Set、Vertex Paint ではアクティブな FLOAT_COLOR/BYTE_COLOR の POINT/CORNER 属性を使って、カーソル下の局所領域をプレビューし、確定時に同じシード色を書き込みます。`Shift + E` は隣接面の法線角だけを使う軽量モードで、明確な山・谷を越える距離コストを平面の2倍にして拡大します。
 - **Shadow Analysis View**: `Shift + Alt + E` で現在の View3D だけに独立した解析表示を切り替えます。
 - **Topology Colors**: Edit Mode の選択面に 1〜6 の半透明ガイド色を保存します。
 - **Curved Face Set Tube Shape**: 曲がった Face Set チューブを局所断面に沿って均一化または先細り補正します。
@@ -48,6 +48,7 @@ Tツールバーは、編集可能なAstra Blenderソースから生成した5�
 | Guided Ridge | Sculpt | `Ctrl + G`。カーソル下の面を起点にし、LMBで点を追加、`Enter`でCurve Previewへ | Preview中はWheel/Shift+Wheelで平滑化、LMBはルート編集へ漏れず、`Backspace`で編集へ戻り、`Esc`/右クリックで取消。`Tab`/Scrape仕上げは後続Stepです |
 | Guided Ridge Repeat Last | Sculpt | Blender標準の `Shift + R` | 既存のRepeat Last互換経路。Curve Sculptの反復はPreview中に現在の曲線で`Enter`/`Ctrl+Enter`を使用します。標準Undo境界はBlender側が所有します |
 | Smart Fill | Sculpt / Vertex Paint | `E`、開始キーを離してから `E` または `Enter` | SculptはFace Set、Vertex Paintはアクティブ色属性。ホイールで距離、`Esc` で取消 |
+| Smart Fill Expand Only | Sculpt / Vertex Paint | `Shift + E`、開始キーを離してから `E` または `Enter` | サーフェス／valley／ridge／edge-cost評価を省略し、トポロジー距離だけで拡大。ホイールで段階変更、`Esc` で取消 |
 | Strict Smart Fill | Sculpt / Vertex Paint | `Ctrl + E`、開始キーを離してから `E` または `Enter` | SculptはFace Set、Vertex Paintはアクティブ色属性。ホイールで距離、`Esc` で取消 |
 | Shadow Analysis View | Sculpt | `Shift + Alt + E` | 現在の View3D の表示補助だけを切替 |
 | Topology Colors | Edit | `Ctrl + Alt + 1`〜`6` | `Ctrl + Alt + 0` で選択面の色を解除 |
@@ -71,11 +72,11 @@ Preferences の `RetopoFlow Focus-Island Snap/Weld Filter` を有効にすると
 
 ## Guided Ridge
 
-この節は3.3.97のGuided Ridge Curve Sculpt Step 2動作を説明します。
+この節は3.4.1のGuided Ridge Curve Sculpt Step 2動作を説明します。
 
 負側/初期値のinscribed表示は履歴上の3.3.53構築をそのまま用い、正側Amplified専用のlobe正規化・waveform validatorは通しません。負側はその履歴BezierのC1/端点を保持し、正側の例外や計算量から独立しています。
 
-Guided Ridge Curve Sculpt（3.3.97）は、可視mesh面へスナップした3Dルートを現在ビューの2Dへ再投影し、弧長基準のC1 Bezier波形として非破壊プレビューします。明示的なEnterでESSENTIALSのPinch/Magnify、Ctrl+EnterでCrease Sharpを同期sculpt.brush_strokeで実行します。適用前のプレビューではメッシュを変更せず、各適用後に元のブラシ資産とツールを復元します。BlenderがRUNNING_MODAL/PASS_THROUGHを返す場合は同期適用未完了として警告し、変更を成功扱いにしません。Shape=0はraw折れ線、正側Amplified（強調）はraw基準の波形増幅、負側Attenuated（減衰）は履歴inscribed構築です。
+Guided Ridge Curve Sculpt（3.4.1）は、可視mesh面へスナップした3Dルートを現在ビューの2Dへ再投影し、弧長基準のC1 Bezier波形として非破壊プレビューします。明示的なEnterでESSENTIALSのPinch/Magnify、Ctrl+EnterでCrease Polishを同期sculpt.brush_strokeで実行します。適用前のプレビューではメッシュを変更せず、各適用後に元のブラシ資産とツールを復元します。BlenderがRUNNING_MODAL/PASS_THROUGHを返す場合は同期適用未完了として警告し、変更を成功扱いにしません。Dyntopo中はネイティブBMLog/Undoの破損を避けるため、資産切替やstrokeを開始せず警告して無変更で戻ります。Shape=0はraw折れ線、正側Amplified（強調）はraw基準の波形増幅、負側Attenuated（減衰）は履歴inscribed構築です。
 
 平滑化ターゲットとBezier接線は現在ビューの2Dで計算し、元の3D点列はビュー変更時の再投影にだけ使います。適応サンプル数は画面長に応じて64〜512点に制限し、C1接線連続、端点固定、候補ごとのスケール相対的な進行検証を適用します。Shape=0だけが手動折れ線をそのまま表示し、非ゼロ値はBezier生成された滑らかな表示になります。正側は現行のAmplified waveform（局所振幅を増幅）、負側と初期値は履歴inscribed構築（局所振幅を減衰）として分離され、正側のS字・複数ローブ処理が負側の復元ジオメトリを変更しません。直線ルートはノット密度によらず全Shape値で直線のままです（テストは代表的な平面経路の進行・折返しを検証し、一般3D自己交差は保証しません）。
 
@@ -85,7 +86,7 @@ Guided Ridge Curve Sculpt（3.3.97）は、可視mesh面へスナップした3D�
 2. カーソル下の可視面を起点に、表面へスナップしたルート編集へ直ちに入ります。大きなFace SetやFace Set未設定のmeshでも、surface hitが得られる限り高コストな旧Face Set準備を行わず開始します。`Esc` または右クリックで安全に取消できます。
 3. 準備完了後、可視mesh面を LMB でクリックして、各クリック位置を表面へスナップした3Dガイド点として追加します。点列を現在のビューへ投影し、2D弧長再サンプリングとソフトBezier近似によるプレビューを表示します。クリック間を連続的にsurfaceへ再投影する保証はありません。
 4. `Enter` でルート編集から `Curve Preview` へ移ります。HUDには `GUIDED RIDGE - CURVE SCULPT / PREVIEW`、Curve Shape（-100..+100: 負=Attenuated（局所振幅を減衰） / 0=Raw / 正=Amplified（局所振幅を増幅））、操作説明が表示されます。Preview中の `Wheel` は符号付きゲインを粗く調整し、`Shift + Wheel` は細かく調整します。前回の符号付き値は次のセッションでも使われます。
-5. Preview中の `Backspace` は点列とPreview開始前のsurface guide/rail cacheをそのまま保持してルート編集へ戻ります。`Enter` は専用Pinch Ridge、`Ctrl + Enter` は専用Crease Grooveを現在の表示曲線へ一度適用します。反復入力は同じ曲線を再実行します。`Esc` または右クリックは未適用なら一時表示を片付けてメッシュを変更せず終了し、適用後はブラシ/一時native curve resourcesを片付けて結果をBlender標準Undoへ委ねます。
+5. Preview中の `Backspace` は点列とPreview開始前のsurface guide/rail cacheをそのまま保持してルート編集へ戻ります。`Enter` は専用Pinch Ridge、`Ctrl + Enter` は専用Crease Polish Valleyを現在の表示曲線へ一度適用します。反復入力は同じ曲線を再実行します。`Esc` または右クリックは未適用なら一時表示を片付けてメッシュを変更せず終了し、適用後はブラシ/一時native curve resourcesを片付けて結果をBlender標準Undoへ委ねます。
 6. ビュー回転・パン・ズーム・Navigation Gizmo・領域サイズ変更は既存の透過経路を維持します。保持した3Dルートから表示を更新し、現ビューへ全点を投影できない場合は警告して変更しません。モード・オブジェクト・ファイル・アドオン状態の変更時も一時ハンドラとタイマーを解除します。
 
 Shape 0 から ±1 への切替は、raw折れ線からC1 Bezier族へ入る意図的なモード切替です。HUDでは正側をAmplified（強調）、負側をAttenuated（減衰）と表示します。±1以降の非ゼロ値は全て滑らかなBezier表示で、各波形ローブの振幅を局所的に増減します。
@@ -146,7 +147,7 @@ Edit Mode で面を選択し、`Ctrl + Alt + 1`〜`6` を押すと、表示中�
 - 通常 MFO は Reference Object がなくても、中央レイが表示中の MESH に当たれば起動します。
 - FSMFO は Reference Object、`.sculpt_face_set`、中央レイの Face Set hit が必要です。
 - RetopoFlow 連携は RetopoFlow がインストールされている場合だけ有効です。
-- Guided RidgeのCurve PreviewはMeshへ書き込まず、Enterで初めてESSENTIALS Pinch/Magnifyを同期 sculpt.brush_stroke で1回適用します。Ctrl+EnterはCrease Sharpを適用します。適用前のプレビュー、投影失敗、対象変更ではMeshとUndoを変更しません。Smart Fillのモーダル所有者は終端イベントまで保持し、外部変更時は次のイベントでCANCELLEDを返します。終端後も2回のBlenderメインループ猶予を通過するまでreload/installを安全扱いにしません。通常のreload/disableは登録クラスを完全に解除し、ブラシ復元に失敗した場合は復元記録を保持して再試行または警告します。報告されたモード切替境界のネイティブクラッシュ再現は自動GUI試験から除外しており、実機ネイティブ検証は未完了です。
+- Guided RidgeのCurve PreviewはMeshへ書き込まず、Enterで初めてESSENTIALS Pinch/Magnifyを同期 sculpt.brush_stroke で1回適用します。Ctrl+EnterはCrease Polishを適用します。適用前のプレビュー、投影失敗、対象変更ではMeshとUndoを変更しません。Smart Fillのモーダル所有者は終端イベントまで保持し、外部変更時は次のイベントでCANCELLEDを返します。終端後も2回のBlenderメインループ猶予を通過するまでreload/installを安全扱いにしません。通常のreload/disableは登録クラスを完全に解除し、ブラシ復元に失敗した場合は復元記録を保持して再試行または警告します。報告されたモード切替境界のネイティブクラッシュ再現は自動GUI試験から除外しており、実機ネイティブ検証は未完了です。
 - ファイルロード、Undo による対象変更、モード・オブジェクト・Mesh・可視性・トポロジーの変更、アドオン無効化では一時状態・予測・draw handler・isolation を cleanup します。
 - Esc、右クリック、モード・オブジェクト・Mesh変更はブラシ資産参照とツールを復元します。適用前ならMeshを変更せず、適用後は結果を残してBlender標準Undoへ委ねます。
 
@@ -156,14 +157,14 @@ Edit Mode で面を選択し、`Ctrl + Alt + 1`〜`6` を押すと、表示中�
 
 A Blender 5.2 add-on for manual retopology workflows.
 
-Add-on version: **3.3.97**
+Add-on version: **3.4.2**
 
 ## Main features
 
 - **Normal MFO**: in Object, Edit, or Sculpt Mode, temporarily orbits around the first visible MESH surface hit by the center ray of the current 3D Viewport.
 - **Face Set MFO (FSMFO)**: temporarily shows the Face Set hit on the configured Reference Object and isolates a clearly matching Retopo island when possible.
-- **Guided Ridge Curve Sculpt (Step 2)**: previews a click-snapped 3D route, then activates the Blender 5.2 ESSENTIALS Pinch/Magnify or Crease Sharp brush and applies one synchronous sculpt.brush_stroke from the accepted current-view curve. Before explicit apply it creates no mesh change; the exact prior asset reference and active tool are restored on exit. RUNNING_MODAL/PASS_THROUGH are treated as incomplete.
-- **Smart Fill**: in Sculpt Mode it previews a local Face Set region; in Vertex Paint it samples the active FLOAT_COLOR/BYTE_COLOR POINT/CORNER attribute under the cursor and writes that sampled color only on confirm.
+- **Guided Ridge Curve Sculpt (Step 2)**: previews a click-snapped 3D route, then activates the Blender 5.2 ESSENTIALS Pinch/Magnify or Crease Polish brush and applies one synchronous sculpt.brush_stroke from the accepted current-view curve. Before explicit apply it creates no mesh change; the exact prior asset reference and active tool are restored on exit. RUNNING_MODAL/PASS_THROUGH are treated as incomplete.
+- **Smart Fill**: in Sculpt Mode it previews a local Face Set region; in Vertex Paint it samples the active FLOAT_COLOR/BYTE_COLOR POINT/CORNER attribute under the cursor and writes that sampled color only on confirm. `Shift + E` uses a lightweight adjacent-normal test and makes a clear ridge or valley cost twice as much to cross as flat adjacency.
 - **Shadow Analysis View**: toggles an independent analysis display in the current View3D with `Shift + Alt + E`.
 - **Topology Colors**: stores six translucent topology guide colors on selected Edit Mode faces.
 - **Curved Face Set Tube Shape**: equalizes or tapers a curved Face Set tube while following its local cross-section.
@@ -196,10 +197,11 @@ The `MFO` tab in the right N-sidebar exposes `Reference Object` and compact dail
 | Face Set MFO | Object / Edit | `Ctrl` + Activation Key twice quickly | Press the same combination again to leave |
 | MFO T-tool | Object / Edit / Sculpt | Select in T-toolbar, then left-click a surface (Ctrl uses Face Set in Object/Edit) | Re-click the same entry inside the 3D View region to toggle OFF; while Face Set is ON, use the Face Set entry |
 | Smart Fill T-tool | Sculpt / Vertex Paint | Select in T-toolbar, then left-click (Ctrl for strict) | Release the start click, then use the next LMB to confirm; existing Smart Fill modal controls apply afterward |
-| Guided Ridge / Tube Shape T-tools | Sculpt | Select in T-toolbar, then left-click a target surface (the first Guided Ridge click only sets the start point) | Guided Ridge shows preparation progress; after Ready, LMB adds points and `Enter` opens Curve Preview. In Preview, `Enter` applies Pinch Ridge and `Ctrl + Enter` applies Crease Groove |
+| Guided Ridge / Tube Shape T-tools | Sculpt | Select in T-toolbar, then left-click a target surface (the first Guided Ridge click only sets the start point) | Guided Ridge shows preparation progress; after Ready, LMB adds points and `Enter` opens Curve Preview. In Preview, `Enter` applies Pinch Ridge and `Ctrl + Enter` applies Crease Polish Valley |
 | Guided Ridge | Sculpt | `Ctrl + G`; the cursor hit starts the guide, LMB adds points, `Enter` opens Curve Preview | In Preview, Wheel/Shift+Wheel changes shape, LMB is consumed, `Enter` applies Pinch, `Ctrl + Enter` applies Crease, `Backspace` returns to editing, and `Esc`/right click cleans up. Tab/Scrape finishing is a later step |
 | Guided Ridge Repeat Last | Sculpt | Blender's standard `Shift + R` | The current milestone keeps the existing Repeat Last compatibility path; each explicit Curve Sculpt apply is undone through Blender's standard Undo, whose boundary is owned by Blender |
 | Smart Fill | Sculpt / Vertex Paint | `E`, release it, then press `E` again or `Enter` | Sculpt uses Face Sets; Vertex Paint uses the active color attribute. Wheel changes distance; `Esc` cancels |
+| Smart Fill Expand Only | Sculpt / Vertex Paint | `Shift + E`, release it, then press `E` again or `Enter` | Bypasses surface/valley/ridge/edge-cost evaluation and expands by topology distance only. Wheel changes stages; `Esc` cancels |
 | Strict Smart Fill | Sculpt / Vertex Paint | `Ctrl + E`, release it, then press `E` again or `Enter` | Sculpt uses Face Sets; Vertex Paint uses the active color attribute. Wheel changes distance; `Esc` cancels |
 | Shadow Analysis View | Sculpt | `Shift + Alt + E` | Display helper for the current View3D |
 | Topology Colors | Edit | `Ctrl + Alt + 1`–`6` | `Ctrl + Alt + 0` clears selected faces |
@@ -223,7 +225,7 @@ When `RetopoFlow Focus-Island Snap/Weld Filter` is enabled, PolyPen Snap and Tra
 
 ## Guided Ridge
 
-This section describes the Guided Ridge Curve Sculpt Step 2 application path in version 3.3.97.
+This section describes the Guided Ridge Curve Sculpt Step 2 application path in version 3.4.1.
 
 The initial and negative/inscribed display uses the historical 3.3.53 construction directly; the positive Amplified lobe normalization and waveform validator are not run for it. Its historical Bezier endpoints and C1 construction remain independent of positive-path exceptions and cost.
 
@@ -237,7 +239,7 @@ Nonzero drawing and validation are capped at 512 points. When route, Shape, proj
 2. The visible cursor hit becomes the start point and the add-on enters route editing immediately. Large Face Sets and unpartitioned meshes use the read-only surface hit path without the legacy Face Set snapshot; `Esc` or right-click cancels safely.
 3. After the Ready state, click LMB on a visible mesh surface to add each guide point as a click-snapped 3D control. The route is projected into the current view and displayed through a 2D arc-length-resampled, soft Bezier approximation; continuous surface reprojection between clicks is not guaranteed.
 4. Press `Enter` to switch from route editing to `Curve Preview`. The HUD shows Curve Shape (-100..+100) and the controls. In Preview, `Wheel` adjusts the signed shape in coarse steps and `Shift + Wheel` in fine steps; the last value is remembered for the next session.
-5. In Preview, Enter activates the shipped ESSENTIALS Pinch/Magnify brush and applies the current screen curve synchronously with sculpt.brush_stroke; Ctrl + Enter uses Crease Sharp. Repeating either key repeats the same current curve. RUNNING_MODAL and PASS_THROUGH are not treated as completed. Each apply uses an explicit View3D override and restores the exact prior asset reference and active tool. Backspace returns to route editing without losing points or the pre-preview surface-guide/rail cache. Esc or right click before apply leaves the mesh unchanged; Blender's standard Undo owns completed stroke boundaries.
+5. In Preview, Enter activates the shipped ESSENTIALS Pinch/Magnify brush and applies the current screen curve synchronously with sculpt.brush_stroke; Ctrl + Enter uses Crease Polish. Repeating either key repeats the same current curve. RUNNING_MODAL and PASS_THROUGH are not treated as completed. Each apply uses an explicit View3D override and restores the exact prior asset reference and active tool. Backspace returns to route editing without losing points or the pre-preview surface-guide/rail cache. Esc or right click before apply leaves the mesh unchanged; Blender's standard Undo owns completed stroke boundaries.
 6. View orbit/pan/zoom, the Navigation Gizmo, and region resizing keep the existing pass-through behavior. The retained 3D route is used to refresh the display; if all points cannot be projected in the current view, a warning is shown and no new application is allowed. Mode, object, file, and add-on changes restore the prior asset/tool and clean up handlers and timers.
 
 The transition from Shape 0 to ±1 is an intentional mode switch from the raw polyline into the C1 Bezier families. The HUD labels positive values Amplified and negative values Attenuated. Every nonzero value remains smooth and changes local wave amplitude rather than rejecting S-shaped routes.
@@ -303,6 +305,6 @@ owned by `runtime` and are explicitly unregistered during disable/reload.
 - Normal MFO works without a Reference Object when the center ray hits a visible MESH.
 - FSMFO requires a Reference Object, `.sculpt_face_set`, and a center-ray Face Set hit.
 - RetopoFlow integration is active only when RetopoFlow is installed.
-- Guided Ridge Curve Preview is non-destructive until an explicit Enter/Ctrl+Enter. Those keys activate only Blender 5.2 ESSENTIALS Pinch/Magnify or Crease Sharp through the public brush.asset_activate operator, then synchronously call sculpt.brush_stroke with float screen/3D samples and restore the exact prior asset reference and active tool. Unsupported asset or View3D contexts report an actionable warning and make no change. RUNNING_MODAL/PASS_THROUGH are rejected as incomplete. Smart Fill owns an explicit modal session; mode/object/area/region changes synchronously cancel its visible state while retaining the live handler owner until the next terminal modal event. Reload/install is not considered safe until two separate Blender main-loop grace ticks have elapsed after terminal return. A normal add-on reload/disable performs complete registered-class/keymap/handler teardown. If Blender gives no subsequent modal event during an unload boundary, the exact orphan owner may be retired as idempotent bookkeeping only; this is not a native terminal return, and manual disable while a modal is active remains unsupported. A failed brush/tool restoration remains pending for retry instead of being discarded. Restoration retries only in the exact saved window/workspace/area/region/scene/object context; a mismatched workspace or context is left untouched and remains pending. The reported native mode-switch crash boundary is excluded from automated GUI tests; native verification remains pending.
+- Guided Ridge Curve Preview is non-destructive until an explicit Enter/Ctrl+Enter. Those keys activate only Blender 5.2 ESSENTIALS Pinch/Magnify or Crease Polish through the public brush.asset_activate operator, then synchronously call sculpt.brush_stroke with float screen/3D samples and restore the exact prior asset reference and active tool. Unsupported asset or View3D contexts report an actionable warning and make no change. Dyntopo is an explicit safety boundary: the native stroke is not started while Dyntopo is active, because the long-lived Guided Ridge modal cannot safely own a nested BMLog transaction; this leaves the mesh and Undo stack unchanged. RUNNING_MODAL/PASS_THROUGH are rejected as incomplete. Smart Fill owns an explicit modal session; mode/object/area/region changes synchronously cancel its visible state while retaining the live handler owner until the next terminal modal event. Reload/install is not considered safe until two separate Blender main-loop grace ticks have elapsed after terminal return. A normal add-on reload/disable performs complete registered-class/keymap/handler teardown. If Blender gives no subsequent modal event during an unload boundary, the exact orphan owner may be retired as idempotent bookkeeping only; this is not a native terminal return, and manual disable while a modal is active remains unsupported. A failed brush/tool restoration remains pending for retry instead of being discarded. Restoration retries only in the exact saved window/workspace/area/region/scene/object context; a mismatched workspace or context is left untouched and remains pending. The reported native mode-switch crash boundary is excluded from automated GUI tests; native verification remains pending.
 - File load, Undo-driven target changes, mode/object/mesh/visibility/topology changes, and add-on disable clean up temporary state, predictions, draw handlers, and isolation.
 - Esc, right click, mode/object/mesh changes, and add-on unload restore the user's brush asset reference and active tool. Restoration retries only against the exact saved window/workspace/area/region/scene/object context; a mismatched workspace is left untouched and remains pending. No user or custom MFO brush/paint-curve datablock is created or removed. Before apply the mesh remains unchanged; after apply Blender's standard Undo is authoritative. Blender 5.2 Sculpt brush pointer is read-only, so activation uses the supported public asset operator rather than pointer assignment.
