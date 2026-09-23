@@ -10,7 +10,6 @@ import bmesh
 import blf
 import copy
 import gpu
-import heapq
 import hashlib
 import json
 import math
@@ -60,6 +59,7 @@ from .config import (
     LOCAL_FEATURE_BRUSH_MARKER_PROPERTY,
     LOCAL_FEATURE_BRUSH_MARKER_VALUE,
     OPERATOR_ID,
+    OPEN_BOUNDARY_LOOP_OPERATOR_ID,
     RECOVER_FACE_SET_STATE_OPERATOR_ID,
     TOOL_FACE_SET_OPERATOR_ID,
     TOOL_NORMAL_OPERATOR_ID,
@@ -165,7 +165,10 @@ from .tube_shape import (
     _tube_preview_cancel,
     _tube_preview_request_cancel,
 )
-from .smart_fill.preview import VIEW3D_OT_mesh_focus_shadow_analysis_toggle
+from .smart_fill.preview import (
+    VIEW3D_OT_mesh_focus_display_distance_toggle,
+    VIEW3D_OT_mesh_focus_shadow_analysis_toggle,
+)
 from .smart_fill.geometry import (
     _fill_preview_adjacency_steps,
     _fill_preview_array_fingerprint,
@@ -1244,6 +1247,181 @@ def _sfsf_draw_instrumented():
 _fill_preview_draw = _sfsf_draw_instrumented
 
 
+def _open_boundary_loop_from_seed(seed_edge, *, max_edges=75_000, time_limit=0.35):
+    """Select the seed's simple cycle in the visible-face boundary graph.
+
+    Hidden faces remain in BMesh. Count visible incident faces, then split
+    boundaries at articulation vertices so point-touching openings stay
+    separate. A block containing multiple possible cycles remains ambiguous.
+    """
+    def is_boundary(edge):
+        faces = getattr(edge, "link_faces", ())
+        return (
+            not bool(getattr(edge, "hide", False))
+            and len(faces) in (1, 2)
+            and sum(not bool(getattr(face, "hide", False)) for face in faces) == 1
+        )
+
+    if seed_edge is None or not is_boundary(seed_edge):
+        return None, "Select one visible opening edge (beside a hidden or missing face)"
+
+    started = time.perf_counter()
+    boundary_edges = set()
+    adjacency = {}
+    pending = [seed_edge]
+    while pending:
+        if time.perf_counter() - started > time_limit:
+            return None, "Opening boundary search exceeded its time limit"
+        edge = pending.pop()
+        if edge in boundary_edges:
+            continue
+        if len(boundary_edges) >= max_edges:
+            return None, "Opening boundary search exceeded its edge limit"
+        boundary_edges.add(edge)
+        for vert in edge.verts:
+            if vert in adjacency:
+                continue
+            connected = [candidate for candidate in vert.link_edges
+                         if is_boundary(candidate)]
+            if len(connected) < 2:
+                return None, "Boundary is branched or not a closed loop"
+            adjacency[vert] = connected
+            pending.extend(candidate for candidate in connected
+                           if candidate not in boundary_edges)
+
+    # Iterative Tarjan traversal: each popped edge block is biconnected.
+    # Unlike a shortest path, this identifies the unique cycle containing the
+    # seed and cannot switch to a second hole that only shares one vertex.
+    root = seed_edge.verts[0]
+    order = {root: 0}
+    low = {root: 0}
+    parent_edges = {}
+    edge_stack = []
+    frames = [(root, iter(adjacency[root]))]
+    while frames:
+        if time.perf_counter() - started > time_limit:
+            return None, "Opening boundary search exceeded its time limit"
+        vert, neighbors = frames[-1]
+        edge = next(neighbors, None)
+        if edge is not None:
+            if edge is parent_edges.get(vert):
+                continue
+            other = edge.verts[1] if edge.verts[0] is vert else edge.verts[0]
+            if other not in order:
+                edge_stack.append(edge)
+                parent_edges[other] = edge
+                order[other] = low[other] = len(order)
+                frames.append((other, iter(adjacency[other])))
+            elif order[other] < order[vert]:
+                edge_stack.append(edge)
+                low[vert] = min(low[vert], order[other])
+            continue
+
+        frames.pop()
+        parent_edge = parent_edges.get(vert)
+        if parent_edge is None:
+            continue
+        parent = (parent_edge.verts[1]
+                  if parent_edge.verts[0] is vert else parent_edge.verts[0])
+        low[parent] = min(low[parent], low[vert])
+        if low[vert] < order[parent]:
+            continue
+        block = set()
+        while edge_stack:
+            member = edge_stack.pop()
+            block.add(member)
+            if member is parent_edge:
+                break
+        if seed_edge not in block:
+            continue
+        if len(block) < 3:
+            return None, "Boundary is too short to form a closed loop"
+        degree = {}
+        for member in block:
+            for vertex in member.verts:
+                degree[vertex] = degree.get(vertex, 0) + 1
+        if any(count != 2 for count in degree.values()):
+            return None, "Boundary is branched with multiple possible loops"
+        return block, ""
+
+    return None, "No closed opening boundary contains the selected edge"
+
+
+class MESH_OT_mesh_focus_select_open_boundary_loop(bpy.types.Operator):
+    """Select the complete opening loop containing the active boundary edge."""
+
+    bl_idname = OPEN_BOUNDARY_LOOP_OPERATOR_ID
+    bl_label = "Select Opening Boundary Loop"
+    bl_description = (
+        "Select the complete closed opening boundary containing the active edge"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = getattr(context, "edit_object", None)
+        return (
+            context.mode == "EDIT_MESH"
+            and obj is not None
+            and getattr(obj, "type", None) == "MESH"
+        )
+
+    def execute(self, context):
+        if not self.poll(context):
+            return {"CANCELLED"}
+        obj = context.edit_object
+        try:
+            bm = bmesh.from_edit_mesh(obj.data)
+            active = bm.select_history.active
+            seed_edge = active if isinstance(active, bmesh.types.BMEdge) else None
+            if seed_edge is None:
+                selected_opening_edges = [
+                    edge
+                    for edge in bm.edges
+                    if edge.select and not edge.hide and edge.link_faces
+                ]
+                if len(selected_opening_edges) == 1:
+                    seed_edge = selected_opening_edges[0]
+            loop_edges, reason = _open_boundary_loop_from_seed(seed_edge)
+            if loop_edges is None:
+                self.report({"WARNING"}, reason)
+                return {"CANCELLED"}
+
+            for face in bm.faces:
+                if face.select:
+                    face.select_set(False)
+            for edge in bm.edges:
+                if edge.select:
+                    edge.select_set(False)
+            for vert in bm.verts:
+                if vert.select:
+                    vert.select_set(False)
+            for edge in loop_edges:
+                edge.select_set(True)
+            bm.select_history.clear()
+            bm.select_history.add(seed_edge)
+            context.tool_settings.mesh_select_mode = (False, True, False)
+            bmesh.update_edit_mesh(
+                obj.data,
+                loop_triangles=False,
+                destructive=False,
+            )
+            self.report(
+                {"INFO"},
+                f"Selected opening boundary: {len(loop_edges)} edges",
+            )
+            return {"FINISHED"}
+        except (
+            AttributeError,
+            ReferenceError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as error:
+            self.report({"WARNING"}, f"Opening boundary selection failed: {error}")
+            return {"CANCELLED"}
+
+
 class VIEW3D_OT_mesh_focus_topology_color_assign(bpy.types.Operator):
     """Assign or clear one topology guide color on selected visible faces."""
 
@@ -1340,6 +1518,13 @@ class VIEW3D_PT_mesh_focus_topology_colors(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
+        layout.operator(
+            OPEN_BOUNDARY_LOOP_OPERATOR_ID,
+            text="開口部を一周選択",
+            icon="EDGESEL",
+        )
+        layout.label(text="境界辺を1本選択 → Shift+Alt+L")
+        layout.separator()
         prefs = _addon_preferences()
         if prefs is not None:
             layout.prop(prefs, "topology_colors_enabled", text="表示")
@@ -1715,7 +1900,9 @@ def _remove_keymaps():
             LOCAL_FEATURE_BRUSH_OPERATOR_ID,
             GUIDED_RIDGE_OPERATOR_ID,
             TOPOLOGY_COLOR_ASSIGN_OPERATOR_ID,
+            OPEN_BOUNDARY_LOOP_OPERATOR_ID,
             "view3d.mesh_focus_shadow_analysis_toggle",
+            "view3d.mesh_focus_display_distance_toggle",
         }
         for keymap in keyconfig.keymaps:
             # WorkSpaceTool keymaps are owned by ``register_tool`` and may
@@ -1813,6 +2000,33 @@ def _rebuild_keymaps():
             shift=True,
         )
         _runtime.addon_keymaps.append((keymap, shadow_analysis_item))
+
+        display_distance_item = keymap.keymap_items.new(
+            "view3d.mesh_focus_display_distance_toggle",
+            "V",
+            "PRESS",
+            any=False,
+            alt=True,
+            ctrl=False,
+            shift=True,
+        )
+        _runtime.addon_keymaps.append((keymap, display_distance_item))
+
+        mesh_keymap = keyconfig.keymaps.new(
+            name="Mesh",
+            space_type="EMPTY",
+            region_type="WINDOW",
+        )
+        open_boundary_item = mesh_keymap.keymap_items.new(
+            OPEN_BOUNDARY_LOOP_OPERATOR_ID,
+            "L",
+            "PRESS",
+            any=False,
+            shift=True,
+            ctrl=False,
+            alt=True,
+        )
+        _runtime.addon_keymaps.append((mesh_keymap, open_boundary_item))
 
         tube_shape_item = keymap.keymap_items.new(
             TUBE_SHAPE_OPERATOR_ID,
@@ -2038,10 +2252,12 @@ CLASSES = (
     VIEW3D_OT_mesh_focus_orbit,
     VIEW3D_OT_mesh_focus_guided_ridge,
     VIEW3D_OT_mesh_focus_shadow_analysis_toggle,
+    VIEW3D_OT_mesh_focus_display_distance_toggle,
     VIEW3D_OT_mesh_focus_local_face_set_grow,
     VIEW3D_OT_mesh_focus_tube_shape,
     VIEW3D_OT_mesh_focus_local_feature_brush,
     VIEW3D_OT_mesh_focus_local_feature_brush_stroke,
+    MESH_OT_mesh_focus_select_open_boundary_loop,
     VIEW3D_OT_mesh_focus_topology_color_assign,
     VIEW3D_PT_mesh_focus_local_feature_brush,
     VIEW3D_PT_mesh_focus_guided_ridge,

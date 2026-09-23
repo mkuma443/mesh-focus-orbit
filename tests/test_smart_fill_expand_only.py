@@ -74,7 +74,7 @@ def test_patch_version_is_bumped():
         if isinstance(key, ast.Constant) and key.value == "version"
     )
     assert isinstance(version, ast.Tuple)
-    assert tuple(element.value for element in version.elts) == (3, 4, 3)
+    assert tuple(element.value for element in version.elts) == (3, 4, 7)
 
 
 def test_shift_alt_e_preserves_shading_and_adds_only_faint_wires():

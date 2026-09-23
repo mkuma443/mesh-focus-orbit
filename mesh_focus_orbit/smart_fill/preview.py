@@ -240,12 +240,12 @@ def _fill_preview_apply_visible_selection_floor(state, geometry, local_ids, radi
     return np.unique(candidate).astype(np.int32, copy=False)
 
 class VIEW3D_OT_mesh_focus_shadow_analysis_toggle(bpy.types.Operator):
-    """Toggle a faint wire overlay without changing this View3D's shading."""
+    """Toggle this View3D's wire overlay from its current property value."""
 
     bl_idname = "view3d.mesh_focus_shadow_analysis_toggle"
     bl_label = "Mesh Focus: Toggle Wire Overlay"
     bl_description = (
-        "Overlay faint mesh wires on the normal viewport, or restore this View3D"
+        "Toggle faint mesh wires in the current 3D View without changing its mode"
     )
 
     @classmethod
@@ -254,42 +254,78 @@ class VIEW3D_OT_mesh_focus_shadow_analysis_toggle(bpy.types.Operator):
             context.area is not None
             and context.area.type == "VIEW_3D"
             and context.space_data is not None
-            and context.mode == "SCULPT"
         )
 
     def execute(self, context):
         if not self.poll(context):
             return {"CANCELLED"}
-        key = _fill_preview_shadow_view_key(context)
-        if not key:
-            self.report({"WARNING"}, "Wire overlay: no View3D space")
+        overlay = getattr(context.space_data, "overlay", None)
+        if overlay is None or not hasattr(overlay, "show_wireframes"):
+            self.report({"WARNING"}, "Wire overlay: View3D overlay is unavailable")
             return {"CANCELLED"}
-        token = _runtime.shadow_analysis_view_tokens.get(key)
-        if isinstance(token, dict) and token.get("active"):
-            restored = _fill_preview_restore_visible_analysis_profile(token)
-            _runtime.shadow_analysis_view_tokens.pop(key, None)
-            if restored:
-                self.report(
-                    {"INFO"},
-                    "Wire Overlay: OFF (restored; Shift+Alt+E to enable)",
-                )
-                _tag_redraw(context.area)
-                return {"FINISHED"}
-            self.report({"WARNING"}, "Wire overlay: restore failed")
+
+        wireframes_enabled = not bool(overlay.show_wireframes)
+        try:
+            if wireframes_enabled:
+                # Keep the existing subtle profile when enabling wires. These
+                # settings are left alone when disabling them.
+                for name, value in (
+                    ("show_overlays", True),
+                    ("wireframe_threshold", 1.0),
+                    ("wireframe_opacity", 0.22),
+                ):
+                    if hasattr(overlay, name) and getattr(overlay, name) != value:
+                        setattr(overlay, name, value)
+            overlay.show_wireframes = wireframes_enabled
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError) as error:
+            self.report({"WARNING"}, f"Wire overlay: could not update View3D ({error})")
             return {"CANCELLED"}
-        token = _fill_preview_visible_analysis_profile(context)
-        if not token.get("applied"):
-            self.report(
-                {"WARNING"},
-                "Wire overlay: " + str(token.get("reason", "apply failed")),
-            )
-            return {"CANCELLED"}
-        token["manual"] = True
-        _runtime.shadow_analysis_view_tokens[key] = token
+
+        context.area.tag_redraw()
         self.report(
             {"INFO"},
-            "Wire Overlay: faint wires ON (Shift+Alt+E to restore)",
+            (
+                "Wire Overlay: faint wires ON (Shift+Alt+E to turn off)"
+                if wireframes_enabled
+                else "Wire Overlay: OFF (Shift+Alt+E to turn on)"
+            ),
         )
+        return {"FINISHED"}
+
+
+class VIEW3D_OT_mesh_focus_display_distance_toggle(bpy.types.Operator):
+    """Toggle the current 3D View's far clipping distance."""
+
+    bl_idname = "view3d.mesh_focus_display_distance_toggle"
+    bl_label = "Mesh Focus: Toggle Display Distance"
+    bl_description = "Switch this 3D View's far clip between 0.13 m and 1000 m"
+
+    @classmethod
+    def poll(cls, context):
+        return (
+            context.area is not None
+            and context.area.type == "VIEW_3D"
+            and context.space_data is not None
+            and hasattr(context.space_data, "clip_end")
+        )
+
+    def execute(self, context):
+        if not self.poll(context):
+            return {"CANCELLED"}
+        space = context.space_data
+        try:
+            current = float(space.clip_end)
+            target = 1000.0 if abs(current - 0.13) <= 1.0e-6 else 0.13
+            space.clip_end = target
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError) as error:
+            self.report(
+                {"WARNING"},
+                f"Display distance: could not update View3D ({error})",
+            )
+            return {"CANCELLED"}
+
+        context.area.tag_redraw()
+        self.report({"INFO"}, f"Display distance: far clip = {target:g} m")
         return {"FINISHED"}
 
 

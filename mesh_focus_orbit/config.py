@@ -15,6 +15,7 @@ GUIDED_RIDGE_KEY = "G"
 TOOL_NORMAL_OPERATOR_ID = "view3d.mesh_focus_orbit_tool"
 TOOL_FACE_SET_OPERATOR_ID = "view3d.mesh_focus_face_set_tool"
 TOPOLOGY_COLOR_ASSIGN_OPERATOR_ID = "view3d.mesh_focus_topology_color_assign"
+OPEN_BOUNDARY_LOOP_OPERATOR_ID = "mesh.mesh_focus_select_open_boundary_loop"
 TOPOLOGY_COLOR_ATTRIBUTE_NAME = "mfo_topology_color"
 TOPOLOGY_COLOR_PANEL_CATEGORY = "MFO"
 GUIDED_RIDGE_MAX_CONTROLS = 64
