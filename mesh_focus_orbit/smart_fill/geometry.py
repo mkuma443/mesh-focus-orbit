@@ -1109,6 +1109,7 @@ def _fill_preview_refresh_cached_adjacency(obj, cached):
                 "neighbors": destinations[order].astype(np.int32, copy=False),
                 "neighbor_lengths": np.r_[distance, distance][order],
                 "edge_indices": source_edges[order].astype(np.int32, copy=False),
+                "edge_indices_space": "pair-row",
                 "edge_v0": directed_v0[order].astype(np.int32, copy=False),
                 "edge_v1": directed_v1[order].astype(np.int32, copy=False),
                 "first": first,
@@ -1309,9 +1310,10 @@ def _fill_preview_build_adjacency(obj, prepared=None):
         "offsets": offsets,
         "neighbors": destinations[order].astype(np.int32, copy=False),
         "neighbor_lengths": np.r_[distance, distance][order],
-        # Physical pair id for each directed CSR neighbor.  Boundary-local
-        # passes use this index to gather only a one/two-ring edge band.
+        # Pair-row id for each directed CSR neighbor. Only this full graph
+        # builder tags the namespace for Shift+E boundary localization.
         "edge_indices": source_edges[order].astype(np.int32, copy=False),
+        "edge_indices_space": "pair-row",
         "edge_v0": edge_v0_directed[order].astype(np.int32, copy=False),
         "edge_v1": edge_v1_directed[order].astype(np.int32, copy=False),
         "first": first,
@@ -1530,6 +1532,10 @@ def _fill_preview_progressive_range_step(state, radius):
         "seed_face": seed_face,
         "distances": distances,
         "patch_ids": patch_ids,
+        # `_fill_preview_dijkstra_incremental` returns every row whose finite
+        # distance is within this bound. Confirm-domain callers may filter
+        # this complete reached set locally when their radius stays inside it.
+        "patch_ids_complete_through": float(patch_radius),
         "popped": int(popped),
         "patch_radius": float(patch_radius),
         "newly_processed_faces": int(newly_processed),

@@ -142,6 +142,80 @@ def map_global_faces_to_local(global_face_ids, accepted_global_ids):
     return np.flatnonzero(np.isin(global_ids, accepted)).astype(np.int32, copy=False)
 
 
+_FACE_IDS_IDENTITY_PROVENANCE_KEY = "_face_ids_identity_provenance"
+_FACE_IDS_IDENTITY_SENTINEL = object()
+
+
+def make_mesh_global_identity_face_ids(count):
+    """Create the immutable full-mesh identity mapping and its provenance."""
+    try:
+        count = int(count)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("identity face-id count is invalid") from error
+    if count <= 0:
+        raise ValueError("identity face-id count is invalid")
+    face_ids = np.arange(count, dtype=np.int32)
+    face_ids.flags.writeable = False
+    provenance = (_FACE_IDS_IDENTITY_SENTINEL, face_ids, count)
+    return face_ids, provenance
+
+
+def has_mesh_global_identity_face_ids(graph, expected_count=None):
+    """Check the builder-bound identity mapping without scanning its values."""
+    if not isinstance(graph, dict):
+        return False
+    face_ids = graph.get("face_ids")
+    provenance = graph.get(_FACE_IDS_IDENTITY_PROVENANCE_KEY)
+    try:
+        count = int(graph.get("count", -1))
+        expected = count if expected_count is None else int(expected_count)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return bool(
+        count > 0
+        and expected == count
+        and isinstance(face_ids, np.ndarray)
+        and face_ids.ndim == 1
+        and face_ids.dtype == np.dtype(np.int32)
+        and len(face_ids) == count
+        and not face_ids.flags.writeable
+        and isinstance(provenance, tuple)
+        and len(provenance) == 3
+        and provenance[0] is _FACE_IDS_IDENTITY_SENTINEL
+        and provenance[1] is face_ids
+        and provenance[2] == count
+    )
+
+
+def copy_mesh_global_identity_face_ids_provenance(source, target):
+    """Bind a copied snapshot array to trusted full-mesh identity provenance."""
+    if not has_mesh_global_identity_face_ids(source):
+        return False
+    if not isinstance(target, dict):
+        return False
+    source_ids = source["face_ids"]
+    target_ids = target.get("face_ids")
+    count = int(source["count"])
+    if (
+        not isinstance(target_ids, np.ndarray)
+        or target_ids is source_ids
+        or target_ids.ndim != 1
+        or target_ids.dtype != np.dtype(np.int32)
+        or len(target_ids) != count
+    ):
+        return False
+    try:
+        target_ids.flags.writeable = False
+    except (AttributeError, ValueError):
+        return False
+    target[_FACE_IDS_IDENTITY_PROVENANCE_KEY] = (
+        _FACE_IDS_IDENTITY_SENTINEL,
+        target_ids,
+        count,
+    )
+    return True
+
+
 def accepted_graph_rows_from_result(result):
     """Map one displayed result into immutable confirm-graph row space."""
     if not isinstance(result, dict):
@@ -149,16 +223,28 @@ def accepted_graph_rows_from_result(result):
     confirm = result.get("confirm_geometry")
     if not isinstance(confirm, dict):
         raise ValueError("accepted result has no confirm graph")
-    face_ids = np.asarray(confirm.get("face_ids"), dtype=np.int64).reshape(-1)
+    identity_mapping = has_mesh_global_identity_face_ids(confirm)
+    face_ids = (
+        confirm.get("face_ids")
+        if identity_mapping
+        else np.asarray(confirm.get("face_ids"), dtype=np.int64).reshape(-1)
+    )
     accepted_faces = np.asarray(result.get("faces", ()), dtype=np.int64).reshape(-1)
     expected_count = int(confirm.get("count", len(face_ids)))
     if (
         len(face_ids) == 0
         or len(face_ids) != expected_count
-        or len(np.unique(face_ids)) != len(face_ids)
+        or (not identity_mapping and len(np.unique(face_ids)) != len(face_ids))
     ):
         raise ValueError("confirm graph mapping is invalid")
     accepted_global = np.unique(accepted_faces)
+    if identity_mapping:
+        if len(accepted_global) and (
+            int(accepted_global[0]) < 0
+            or int(accepted_global[-1]) >= expected_count
+        ):
+            raise ValueError("accepted ids are absent from confirm graph")
+        return accepted_global.astype(np.int32, copy=False)
     rows = map_global_faces_to_local(face_ids, accepted_global)
     if len(rows) != len(accepted_global):
         raise ValueError("accepted ids are absent from confirm graph")

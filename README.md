@@ -1,17 +1,17 @@
 # Mesh Focus Orbit
 
-Current source version: 3.4.12.
+Current source version: 3.4.20.
 
 Blender 5.2 用のリトポロジー支援アドオンです。
 
-アドオンバージョン: **3.4.12**
+アドオンバージョン: **3.4.20**
 
 ## 主な機能
 
 - **通常 MFO**: Object / Edit / Sculpt Mode で、現在の 3D Viewport の中央レイが最初に当たる表示中の MESH 面を一時的な Orbit 中心にします。
 - **Face Set MFO (FSMFO)**: Reference Object の中央レイが当たる Face Set と、対応が明確な Retopo island だけを一時表示します。
 - **Guided Ridge Curve Sculpt (Step 2)**: Sculpt Modeで各クリックを可視mesh面へスナップした3Dルートを滑らかなカーブとしてプレビューし、明示的なEnterでBlender 5.2 ESSENTIALSのPinch/Magnify、Ctrl+EnterでCrease Polishをbrush.asset_activate経由で選択し、表示中の曲線を同期sculpt.brush_strokeで一度適用します。適用前はメッシュを変更せず、完了後は元のブラシ資産とツールを復元します。Dyntopo中はBlenderネイティブUndo/BMLogを壊さないため適用せず、警告して無変更で戻ります。
-- **Smart Fill**: Sculpt Mode では Face Set、Vertex Paint ではアクティブな FLOAT_COLOR/BYTE_COLOR の POINT/CORNER 属性を使って、カーソル下の局所領域をプレビューし、確定時に同じシード色を書き込みます。`Shift + E` は隣接面の法線角だけを使う軽量モードで、明確な山・谷を越える距離コストを平面の2倍にして拡大します。
+- **Smart Fill**: Sculpt Mode では Face Set、Vertex Paint ではアクティブな FLOAT_COLOR/BYTE_COLOR の POINT/CORNER 属性を使って、カーソル下の局所領域を半透明でプレビューし、確定時に同じシード色を書き込みます。`Shift + E` は形状境界の判定を省いてトポロジー距離で拡大します。
 - **Wire Overlay View**: どのモードでも `Shift + Alt + E` で対象 View3D のワイヤー表示を現在値から切り替えます。
 - **表示距離集中**: `Shift + Alt + V` で対象 View3D の遠方クリップを 0.13 m と 1000 m の間で切り替えます。
 - **Opening Boundary Loop**: Edit Modeで開口部の辺を1本選択し、`Shift + Alt + L`で同じ開口部の閉じた縁を一周選択します。
@@ -105,7 +105,7 @@ Shape 0 から ±1 への切替は、raw折れ線からC1 Bezier族へ入る意�
 
 Vertex Paint では同じカーソル面からアクティブな FLOAT_COLOR/BYTE_COLOR の色を三角形の補間（判定不能な n-gon は面内平均）でサンプルします。CORNER 属性は対象面の loop だけ、POINT 属性は対象面が参照する共有頂点へサンプル色を書きます。対応属性がない場合やプレビュー中に属性・seed色が変わった場合は警告して無変更で終了します。
 
-通常 E は境界を穏やかに補正し、`Ctrl + E` は geometry-strict な境界だけを採用します。開始 E の release 後に E を再押下するか `Enter` で一度だけ確定します。Sculpt ModeではFace Set属性へ、Vertex Paintではサンプル色をアクティブ色属性へ書き込みます。予測中は外周境界線だけを描画し、実メッシュ座標・色は変更しません。距離をホイールで変更でき、`Esc` で取消できます。
+通常 E は境界を穏やかに補正し、`Ctrl + E` は geometry-strict な境界だけを採用します。開始 E の release 後に E を再押下するか `Enter` で一度だけ確定します。Sculpt ModeではFace Set属性へ、Vertex Paintではサンプル色をアクティブ色属性へ書き込みます。予測中は候補領域を半透明で塗り、外周境界線も描画します。拡大上限では塗りと境界線が緑になり、それ以上の拡大ホイールでは表示を維持します。確定までは実メッシュ座標・色は変更しません。距離をホイールで変更でき、`Esc` で取消できます。
 
 通常Smart Fillは、現在の境界が描画されて確定可能になった後のWheelを1回につき1段だけ受理します。準備中・計算中・描画待ち・短い再開待ちに届いた追加Wheelはキューせず破棄するため、速く回しても遅く回しても同じ段階列になります。初期半径の約8.192倍（最大半径の1/1.25^3）以降の単調な拡大では、最初の完全結果を端点ベースとして保持し、全メッシュcoverageが証明されたグラフ上で、既存の形状境界を越えずにDijkstra frontierから新しい面だけを追加する終端拡張を使います。さらに選択済み面が10万以上の通常モードでは、表示HUDに`frontier-delta`と示し、前回境界のうち新規面に接する辺だけを更新します（描画・確定用の不変配列を世代ごとに一度だけ作成）。証拠が不足・縮小・トポロジー/可視性変更時は完全計算へ安全に戻り、保持した面を縮小結果へ流用しません。Ctrl+Eの厳密経路は従来どおりです。
 
@@ -165,7 +165,7 @@ Edit Mode で面を選択し、`Ctrl + Alt + 1`〜`6` を押すと、表示中�
 
 A Blender 5.2 add-on for manual retopology workflows.
 
-Add-on version: **3.4.12**
+Add-on version: **3.4.20**
 
 ## Main features
 
@@ -266,7 +266,7 @@ Each Smart Fill preview captures an immutable visible-face universe and the visi
 
 In Vertex Paint, the same cursor hit samples the active FLOAT_COLOR/BYTE_COLOR attribute using triangle interpolation (with a face-average fallback for unresolvable n-gons). CORNER attributes write only the candidate face loops; POINT attributes write the referenced shared vertices, preserving Blender's shared-vertex interpolation semantics. Missing attributes or a changed attribute/seed color during preview are reported and leave the mesh unchanged.
 
-Normal E uses a tolerant boundary correction; `Ctrl + E` keeps a geometry-strict boundary. Release the starting E, then press E again or `Enter` to confirm once. Sculpt Mode writes the candidate Face Set; Vertex Paint writes the sampled color through its active CORNER/POINT attribute. Only the outer boundary is drawn during prediction; the mesh coordinates and colors are unchanged until confirmation. The wheel changes the distance and `Esc` cancels.
+Normal E uses a tolerant boundary correction; `Ctrl + E` keeps a geometry-strict boundary. Release the starting E, then press E again or `Enter` to confirm once. Sculpt Mode writes the candidate Face Set; Vertex Paint writes the sampled color through its active CORNER/POINT attribute. Prediction draws a translucent fill and the outer boundary. At the growth limit, both turn green and further upward wheel input preserves the display. Mesh coordinates and colors are unchanged until confirmation. The wheel changes the distance and `Esc` cancels.
 
 Normal Smart Fill accepts one Wheel step only after the current boundary has been successfully drawn and re-armed. Wheel events delivered during preparation, computation, draw wait, or the short re-arm interval are dropped rather than queued, so rapid and slow input produce the same per-step sequence; confirmation remains blocked until the accepted result is ready and drawn. At the final three monotonic growth stages (starting at about 8.192 times the initial radius), the first complete result is retained as an exact base and new faces are added from its Dijkstra frontier only when full mesh coverage is certified, without crossing recorded shape barriers or rerunning the expensive refinement passes. When a normal selection already contains at least 100,000 faces, the HUD labels the eligible growth as `frontier-delta`; only edges incident to newly reached faces are updated, while the current displayed generation owns one compact accepted full-graph ID array. Missing provenance, incomplete coverage, a shrink, or a topology/visibility change safely falls back to a full compute and never reuses additive faces for the smaller radius. Ctrl+E keeps its existing strict-mode behavior.
 

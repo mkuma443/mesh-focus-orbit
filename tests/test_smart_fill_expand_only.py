@@ -74,7 +74,7 @@ def test_patch_version_is_bumped():
         if isinstance(key, ast.Constant) and key.value == "version"
     )
     assert isinstance(version, ast.Tuple)
-    assert tuple(element.value for element in version.elts) == (3, 4, 7)
+    assert tuple(element.value for element in version.elts) == (3, 4, 20)
 
 
 def test_shift_alt_e_preserves_shading_and_adds_only_faint_wires():
@@ -162,7 +162,8 @@ def test_expand_only_uses_only_lightweight_dihedral_surface_cost():
         "_fill_preview_contour_cost",
     }
     assert not (calls & forbidden_calls)
-    assert '"shape_segments": []' in helper_source
+    assert '"shape_segments": shape_segments' in helper_source
+    assert "_fill_preview_materialize_boundary_rows" in calls
     assert '"expand_only_mode": True' in helper_source
     assert '"surface_evaluation_bypassed": False' in helper_source
     assert '"full_surface_analysis_bypassed": True' in helper_source

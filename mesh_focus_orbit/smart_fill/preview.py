@@ -113,6 +113,10 @@ from .geometry import (
     _fill_preview_visible_analysis_profile,
 )
 from .invariants import (
+    copy_mesh_global_identity_face_ids_provenance,
+    has_mesh_global_identity_face_ids,
+)
+from .invariants import (
     monotonic_visible_selection,
     visible_seed_reached_component,
     visible_floor_enabled,
@@ -8916,6 +8920,7 @@ def _fill_preview_terminal_delta_result(
             "progressive_range_reused_faces": int(len(selected)),
             "progressive_range_selected_sort_count": 0,
             "created_generation": int(state.get("generation", 0)),
+            "fill_draw_source_generation": int(state.get("generation", 0)),
         })
         return result
     # A newly reached face can only change ownership on its incident edges.
@@ -9018,6 +9023,13 @@ def _fill_preview_terminal_delta_result(
         "confirm_seed_local": int(seed_matches[0]),
         "confirm_domain_ids": confirm_domain_ids,
         "confirm_signature": state.get("signature"),
+        "fill_draw_source_geometry": geometry,
+        "fill_draw_source_face_ids": np.array(
+            local_selected, dtype=np.int32, copy=True
+        ),
+        "fill_draw_source_generation": int(state.get("generation", 0)),
+        "fill_draw_source_signature": state.get("signature"),
+        "created_generation": int(state.get("generation", 0)),
         "patch_edge_reached": bool(frontier.get("heap")),
         "compute_seconds": 0.0,
         "geometry": geometry,
@@ -9228,6 +9240,12 @@ def _fill_preview_terminal_result(state, radius):
         "patch_edge_reached": bool(len(heap) > 0),
         "compute_seconds": 0.0,
         "geometry": geometry,
+        "fill_draw_source_geometry": geometry,
+        "fill_draw_source_face_ids": np.array(
+            local_selected, dtype=np.int32, copy=True
+        ),
+        "fill_draw_source_generation": int(state.get("generation", 0)),
+        "fill_draw_source_signature": state.get("signature"),
         "progressive_range_cache_hit": False,
         "progressive_range_terminal_expansion": True,
         "progressive_range_terminal_mode": "frontier",
@@ -9270,6 +9288,197 @@ def _fill_preview_expand_only_selection(distances, hidden, radius):
     )
 
 
+def _fill_preview_materialize_boundary_rows(
+    boundary_rows,
+    first,
+    second,
+    pair_v0,
+    pair_v1,
+    world_vertices,
+    face_ids,
+    *,
+    draw_full_geometry=True,
+    analysis_ids=None,
+    shape_boundary_mask=None,
+):
+    """Turn sorted pair rows into the shared preview records and segments."""
+    shape_segments = []
+    distance_segments = []
+    boundary_records = []
+    if (
+        shape_boundary_mask is None
+        and draw_full_geometry
+        and face_ids is not None
+    ):
+        # Shift+E always uses a single distance color group and mesh-global
+        # face rows. Keep its compact comprehension path inside this shared
+        # interface to avoid adding per-row mode branches to the hot path.
+        distance_segments = [
+            (
+                tuple(float(value) for value in world_vertices[int(pair_v0[edge])]),
+                tuple(float(value) for value in world_vertices[int(pair_v1[edge])]),
+            )
+            for edge in boundary_rows
+        ]
+        boundary_records = [
+            {
+                "geometry_face_a": int(first[edge]),
+                "geometry_face_b": int(second[edge]),
+                "mesh_face_a": int(face_ids[int(first[edge])]),
+                "mesh_face_b": int(face_ids[int(second[edge])]),
+                "mesh_edge": -1,
+                "shape": False,
+            }
+            for edge in boundary_rows
+        ]
+        return shape_segments, distance_segments, boundary_records
+    for edge in boundary_rows:
+        edge = int(edge)
+        if (
+            edge < 0
+            or edge >= len(pair_v0)
+            or edge >= len(pair_v1)
+            or int(pair_v0[edge]) < 0
+            or int(pair_v1[edge]) < 0
+            or int(pair_v0[edge]) >= len(world_vertices)
+            or int(pair_v1[edge]) >= len(world_vertices)
+        ):
+            continue
+        v0 = int(pair_v0[edge])
+        v1 = int(pair_v1[edge])
+        segment = (
+            tuple(float(value) for value in world_vertices[v0]),
+            tuple(float(value) for value in world_vertices[v1]),
+        )
+        shape_boundary = (
+            bool(shape_boundary_mask[edge])
+            if shape_boundary_mask is not None
+            else False
+        )
+        geometry_face_a = int(
+            first[edge]
+            if draw_full_geometry
+            else analysis_ids[int(first[edge])]
+        )
+        geometry_face_b = int(
+            second[edge]
+            if draw_full_geometry
+            else analysis_ids[int(second[edge])]
+        )
+        boundary_records.append(
+            {
+                "geometry_face_a": geometry_face_a,
+                "geometry_face_b": geometry_face_b,
+                "mesh_face_a": int(face_ids[geometry_face_a])
+                if face_ids is not None
+                else -1,
+                "mesh_face_b": int(face_ids[geometry_face_b])
+                if face_ids is not None
+                else -1,
+                "mesh_edge": -1,
+                "shape": bool(shape_boundary),
+            }
+        )
+        (shape_segments if shape_boundary else distance_segments).append(segment)
+    return shape_segments, distance_segments, boundary_records
+
+
+def _fill_preview_expand_only_local_boundary_rows(
+    geometry, selected_local, first, second
+):
+    """Collect crossing pair rows through a trusted full-graph CSR mapping.
+
+    Cursor-local graphs and older graph schemas use the caller's full-pair
+    fallback. Pair rows are deduplicated and sorted; distinct rows with equal
+    endpoints remain distinct graph records.
+    """
+    import numpy as np
+
+    if (
+        not isinstance(geometry, dict)
+        or geometry.get("edge_indices_space") != "pair-row"
+    ):
+        return None
+    count = int(geometry.get("count", 0))
+    offsets = geometry.get("offsets")
+    edge_indices = geometry.get("edge_indices")
+    selected_local = np.asarray(selected_local)
+    if (
+        count <= 0
+        or not isinstance(offsets, np.ndarray)
+        or offsets.ndim != 1
+        or offsets.dtype != np.dtype(np.int64)
+        or len(offsets) != count + 1
+        or int(offsets[0]) != 0
+        or not isinstance(edge_indices, np.ndarray)
+        or edge_indices.ndim != 1
+        or edge_indices.dtype != np.dtype(np.int32)
+        or int(offsets[-1]) != len(edge_indices)
+        or not isinstance(selected_local, np.ndarray)
+        or selected_local.ndim != 1
+        or selected_local.dtype != np.dtype(np.int32)
+        or len(selected_local) == 0
+        or len(first) != len(second)
+    ):
+        return None
+    if (
+        int(selected_local[0]) < 0
+        or int(selected_local[-1]) >= count
+        or np.any(selected_local[1:] <= selected_local[:-1])
+    ):
+        return None
+    starts = offsets[selected_local]
+    ends = offsets[selected_local + 1]
+    lengths = ends - starts
+    if (
+        np.any(starts < 0)
+        or np.any(ends < starts)
+        or np.any(ends > len(edge_indices))
+    ):
+        return None
+    incident_count = int(np.sum(lengths, dtype=np.int64))
+    # If the selected faces touch every CSR slot, gathering and uniquing those
+    # slots is no longer a local operation; use the established full-pair path.
+    if incident_count >= len(edge_indices) and len(edge_indices):
+        return None
+    pieces = [
+        edge_indices[int(start) : int(end)]
+        for start, end in zip(starts, ends)
+        if int(end) > int(start)
+    ]
+    if not pieces:
+        return np.empty(0, dtype=np.int32)
+    candidate_rows = np.unique(np.concatenate(pieces)).astype(
+        np.int32, copy=False
+    )
+    if len(candidate_rows) and (
+        int(candidate_rows[0]) < 0
+        or int(candidate_rows[-1]) >= len(first)
+    ):
+        return None
+    row_first = np.asarray(first[candidate_rows], dtype=np.int32)
+    row_second = np.asarray(second[candidate_rows], dtype=np.int32)
+    if (
+        np.any(row_first < 0)
+        or np.any(row_first >= count)
+        or np.any(row_second < 0)
+        or np.any(row_second >= count)
+    ):
+        return None
+
+    def contains(values):
+        positions = np.searchsorted(selected_local, values)
+        present = np.zeros(len(values), dtype=bool)
+        in_range = positions < len(selected_local)
+        present[in_range] = (
+            selected_local[positions[in_range]] == values[in_range]
+        )
+        return present
+
+    crossing = contains(row_first) != contains(row_second)
+    return candidate_rows[crossing]
+
+
 def _fill_preview_make_expand_only_result(state, radius):
     """Build a lightweight feature-cost candidate for Shift+E Smart Fill.
 
@@ -9295,61 +9504,110 @@ def _fill_preview_make_expand_only_result(state, radius):
     seed_local = int(progressive["seed_face"])
     if seed_local < 0 or seed_local >= count or bool(hidden[seed_local]):
         raise RuntimeError("expand-only seed is hidden or outside the graph")
-    selected = _fill_preview_expand_only_selection(
-        distances[:count], hidden, radius
-    )
-    selected_local = np.flatnonzero(selected).astype(np.int32, copy=False)
-    if len(selected_local) == 0 or not bool(selected[seed_local]):
-        raise RuntimeError("expand-only produced no visible candidate")
-    face_ids = np.asarray(
-        geometry.get("face_ids", np.arange(count, dtype=np.int32)),
-        dtype=np.int32,
-    ).reshape(-1)
-    if len(face_ids) != count:
-        raise RuntimeError("expand-only face-id schema is invalid")
-    preview_faces = face_ids[selected_local].astype(np.int32, copy=True)
     first = np.asarray(geometry.get("first", ()), dtype=np.int32).reshape(-1)
     second = np.asarray(geometry.get("second", ()), dtype=np.int32).reshape(-1)
     pair_v0 = np.asarray(geometry.get("pair_v0", ()), dtype=np.int32).reshape(-1)
     pair_v1 = np.asarray(geometry.get("pair_v1", ()), dtype=np.int32).reshape(-1)
     if not (len(first) == len(second) == len(pair_v0) == len(pair_v1)):
         raise RuntimeError("expand-only boundary schema is invalid")
-    selected_mask = selected
-    crossing = selected_mask[first] != selected_mask[second]
+    reached_ids = progressive.get("patch_ids")
+    reached_complete_through = progressive.get("patch_ids_complete_through")
+    selected_local = _fill_preview_confirm_domain_ids_from_reached(
+        distances,
+        hidden,
+        count,
+        radius,
+        reached_ids,
+        reached_complete_through,
+    )
+    local_boundary_rows = (
+        _fill_preview_expand_only_local_boundary_rows(
+            geometry, selected_local, first, second
+        )
+        if selected_local is not None
+        else None
+    )
+    if local_boundary_rows is None:
+        # Old or cursor-local graphs, and incomplete progressive schemas, retain
+        # the exact full-count/full-pair path as a correctness fallback.
+        selected = _fill_preview_expand_only_selection(
+            distances[:count], hidden, radius
+        )
+        selected_local = np.flatnonzero(selected).astype(np.int32, copy=False)
+        if len(selected_local) == 0 or not bool(selected[seed_local]):
+            raise RuntimeError("expand-only produced no visible candidate")
+    elif (
+        len(selected_local) == 0
+        or int(np.searchsorted(selected_local, seed_local)) >= len(selected_local)
+        or int(selected_local[np.searchsorted(selected_local, seed_local)])
+        != seed_local
+    ):
+        raise RuntimeError("expand-only produced no visible candidate")
+    face_ids_value = geometry.get("face_ids")
+    face_ids = (
+        np.arange(count, dtype=np.int32)
+        if face_ids_value is None
+        else np.asarray(face_ids_value, dtype=np.int32).reshape(-1)
+    )
+    if len(face_ids) != count:
+        raise RuntimeError("expand-only face-id schema is invalid")
+    preview_faces = face_ids[selected_local].astype(np.int32, copy=True)
     world_vertices = np.asarray(
         geometry.get("world_vertices", ()), dtype=np.float64
     ).reshape((-1, 3))
-    if len(pair_v0) and (
-        np.any(pair_v0 < 0)
-        or np.any(pair_v1 < 0)
-        or np.any(pair_v0 >= len(world_vertices))
-        or np.any(pair_v1 >= len(world_vertices))
-    ):
-        raise RuntimeError("expand-only edge vertex schema is invalid")
-    distance_segments = [
-        (
-            tuple(float(value) for value in world_vertices[int(pair_v0[index])]),
-            tuple(float(value) for value in world_vertices[int(pair_v1[index])]),
+    if local_boundary_rows is None:
+        selected_mask = np.zeros(count, dtype=bool)
+        selected_mask[selected_local] = True
+        crossing = selected_mask[first] != selected_mask[second]
+        boundary_rows = np.flatnonzero(crossing)
+        if len(pair_v0) and (
+            np.any(pair_v0 < 0)
+            or np.any(pair_v1 < 0)
+            or np.any(pair_v0 >= len(world_vertices))
+            or np.any(pair_v1 >= len(world_vertices))
+        ):
+            raise RuntimeError("expand-only edge vertex schema is invalid")
+    else:
+        boundary_rows = local_boundary_rows
+        if len(boundary_rows) and (
+            np.any(pair_v0[boundary_rows] < 0)
+            or np.any(pair_v1[boundary_rows] < 0)
+            or np.any(pair_v0[boundary_rows] >= len(world_vertices))
+            or np.any(pair_v1[boundary_rows] >= len(world_vertices))
+        ):
+            raise RuntimeError("expand-only edge vertex schema is invalid")
+    shape_segments, distance_segments, boundary_records = (
+        _fill_preview_materialize_boundary_rows(
+            boundary_rows,
+            first,
+            second,
+            pair_v0,
+            pair_v1,
+            world_vertices,
+            face_ids,
         )
-        for index in np.flatnonzero(crossing)
-    ]
-    boundary_records = tuple(
-        {
-            "geometry_face_a": int(first[index]),
-            "geometry_face_b": int(second[index]),
-            "mesh_face_a": int(face_ids[int(first[index])]),
-            "mesh_face_b": int(face_ids[int(second[index])]),
-            "mesh_edge": -1,
-            "shape": False,
-        }
-        for index in np.flatnonzero(crossing)
     )
-    confirm_snapshot, confirm_domain_ids = _fill_preview_confirm_graph_snapshot(
-        geometry, distances, radius
+    confirm_snapshot, confirm_domain_ids = (
+        _fill_preview_confirm_graph_snapshot_for_session(
+            state,
+            geometry,
+            distances,
+            radius,
+            reached_ids=reached_ids,
+            reached_complete_through=reached_complete_through,
+        )
     )
     if confirm_snapshot is None or len(confirm_domain_ids) == 0:
         raise RuntimeError("expand-only confirmation graph is unavailable")
-    seed_matches = np.flatnonzero(face_ids == int(state.get("seed_face", -1)))
+    seed_mesh_face = int(state.get("seed_face", -1))
+    if has_mesh_global_identity_face_ids(confirm_snapshot, count):
+        seed_matches = (
+            np.asarray([seed_mesh_face], dtype=np.int32)
+            if 0 <= seed_mesh_face < count
+            else np.empty(0, dtype=np.int32)
+        )
+    else:
+        seed_matches = np.flatnonzero(face_ids == seed_mesh_face)
     if len(seed_matches) != 1:
         raise RuntimeError("expand-only seed mapping is invalid")
     elapsed = time.perf_counter() - started
@@ -9361,7 +9619,7 @@ def _fill_preview_make_expand_only_result(state, radius):
         "boundary_all_orange": False,
         "analysis_faces": 0,
         "popped_faces": int(progressive.get("popped", 0)),
-        "shape_segments": [],
+        "shape_segments": shape_segments,
         "distance_segments": distance_segments,
         "boundary_records": boundary_records,
         "confirm_geometry": confirm_snapshot,
@@ -9371,6 +9629,12 @@ def _fill_preview_make_expand_only_result(state, radius):
         "patch_edge_reached": bool(progressive.get("patch_ids") is not None),
         "compute_seconds": float(elapsed),
         "geometry": geometry,
+        "fill_draw_source_geometry": geometry,
+        "fill_draw_source_face_ids": np.array(
+            selected_local, dtype=np.int32, copy=True
+        ),
+        "fill_draw_source_generation": int(state["generation"]),
+        "fill_draw_source_signature": state["signature"],
         "partition": None,
         "created_generation": int(state["generation"]),
         "progressive_range_mode": True,
@@ -9384,6 +9648,45 @@ def _fill_preview_make_expand_only_result(state, radius):
         "full_surface_analysis_bypassed": True,
         "surface_analysis": "simple-dihedral-cost",
     }
+
+
+def _fill_preview_compute_geometry_regions(
+    geometry_local, local, seed_local, strict_mode, face_set_prior_enabled
+):
+    """Build geometry and Face Set candidate regions for one preview radius.
+
+    With no active Face Set prior, _fill_preview_region returns a sorted,
+    unique local-row array. The two local graphs then have the same traversal
+    inputs and independent empty partition caches, so a second traversal and a
+    unique of the same rows cannot change the result.
+    """
+    import numpy as np
+
+    geometry_region, geometry_partition = _fill_preview_region(
+        geometry_local, seed_local, strict_mode
+    )
+    if not face_set_prior_enabled:
+        # Face Set prior data is absent or disabled. Reuse both geometry-only
+        # outputs; downstream Face Set diagnostics only read this partition.
+        assisted_region = geometry_region
+        assisted_partition = geometry_partition
+        local_region = geometry_region
+    else:
+        # Keep the original independent traversal when a prior is marked active,
+        # including compatibility with incomplete prior payloads.
+        assisted_region, assisted_partition = _fill_preview_region(
+            local, seed_local, strict_mode
+        )
+        local_region = np.unique(
+            np.r_[geometry_region, assisted_region]
+        ).astype(np.int32, copy=False)
+    return (
+        geometry_region,
+        geometry_partition,
+        assisted_region,
+        assisted_partition,
+        local_region,
+    )
 
 
 def _fill_preview_make_result(state, radius):
@@ -9609,8 +9912,8 @@ def _fill_preview_make_result(state, radius):
         # No screen-overlap edge map is built here; that older map could lose
         # edges outside the current radius and let a later wheel stage differ.
         local["partitions"] = {}
-    # Face Set assistance belongs to the geometry strict initial phase only;
-    # ordinary E is entirely shadow/graph based and never reads the ID layer.
+    # Sculpt Face Set assistance is eligible only on the initial non-shadow
+    # pass; later radius stages and shadow-classifier runs skip the ID layer.
     # Vertex Paint uses only geometry/shading adjacency plus the sampled
     # active color; Sculpt Face Set IDs are never a region prior or seed
     # constraint for that backend.
@@ -9782,15 +10085,19 @@ def _fill_preview_make_result(state, radius):
         }
         assisted_partition = {}
     else:
-        geometry_region, geometry_partition = _fill_preview_region(
-            geometry_local, seed_local, bool(state["strict_mode"])
+        (
+            geometry_region,
+            geometry_partition,
+            assisted_region,
+            assisted_partition,
+            local_region,
+        ) = _fill_preview_compute_geometry_regions(
+            geometry_local,
+            local,
+            seed_local,
+            bool(state["strict_mode"]),
+            bool(local.get("face_set_prior_enabled", False)),
         )
-        assisted_region, assisted_partition = _fill_preview_region(
-            local, seed_local, bool(state["strict_mode"])
-        )
-        local_region = np.unique(
-            np.r_[geometry_region, assisted_region]
-        ).astype(np.int32, copy=False)
         shadow_region_metrics = {}
     # Do not let the Face Set-adjusted graph leak into the boundary resolver.
     local = geometry_local
@@ -10404,56 +10711,37 @@ def _fill_preview_make_result(state, radius):
         len(patch_ids)
         and np.any(distances[patch_ids] >= patch_radius - max(patch_radius * 0.01, 1.e-8))
     )
-    for edge in np.flatnonzero(boundary):
-        edge_index = -1
-        # pair_v0/pair_v1 are generated together with the face pair and
-        # world_vertices.  They remain valid when cursor expansion replaces
-        # the compact graph, while pair_edge_indices can refer to an older
-        # mesh-edge ordering.  Use the physical endpoint arrays for every
-        # preview segment; never draw from an unvalidated mesh edge hint.
-        if (
-            edge >= len(draw_pair_v0)
-            or edge >= len(draw_pair_v1)
-            or int(draw_pair_v0[edge]) < 0
-            or int(draw_pair_v1[edge]) < 0
-            or int(draw_pair_v0[edge]) >= len(draw_world_vertices)
-            or int(draw_pair_v1[edge]) >= len(draw_world_vertices)
-        ):
-            continue
-        v0 = int(draw_pair_v0[edge])
-        v1 = int(draw_pair_v1[edge])
-        segment = (
-            tuple(float(value) for value in draw_world_vertices[v0]),
-            tuple(float(value) for value in draw_world_vertices[v1]),
+    shape_segments, distance_segments, boundary_records = (
+        _fill_preview_materialize_boundary_rows(
+            np.flatnonzero(boundary),
+            draw_first,
+            draw_second,
+            draw_pair_v0,
+            draw_pair_v1,
+            draw_world_vertices,
+            geometry.get("face_ids"),
+            draw_full_geometry=draw_full_geometry,
+            analysis_ids=analysis_ids,
+            shape_boundary_mask=shape_boundary_mask,
         )
-        shape_boundary = bool(shape_boundary_mask[edge])
-        geometry_face_a = int(
-            draw_first[edge]
-            if draw_full_geometry
-            else analysis_ids[int(draw_first[edge])]
+    )
+    confirm_snapshot, confirm_domain_ids = (
+        _fill_preview_confirm_graph_snapshot_for_session(
+            state,
+            geometry,
+            distances,
+            radius,
+            reached_ids=(
+                progressive_step.get("patch_ids")
+                if isinstance(progressive_step, dict)
+                else None
+            ),
+            reached_complete_through=(
+                progressive_step.get("patch_ids_complete_through")
+                if isinstance(progressive_step, dict)
+                else None
+            ),
         )
-        geometry_face_b = int(
-            draw_second[edge]
-            if draw_full_geometry
-            else analysis_ids[int(draw_second[edge])]
-        )
-        boundary_records.append(
-            {
-                "geometry_face_a": geometry_face_a,
-                "geometry_face_b": geometry_face_b,
-                "mesh_face_a": int(
-                    geometry["face_ids"][geometry_face_a]
-                ) if geometry.get("face_ids") is not None else -1,
-                "mesh_face_b": int(
-                    geometry["face_ids"][geometry_face_b]
-                ) if geometry.get("face_ids") is not None else -1,
-                "mesh_edge": int(edge_index),
-                "shape": bool(shape_boundary),
-            }
-        )
-        (shape_segments if shape_boundary else distance_segments).append(segment)
-    confirm_snapshot, confirm_domain_ids = _fill_preview_confirm_graph_snapshot(
-        geometry, distances, radius
     )
     if len(cached_local_ids):
         # Confirmation must retain the same stable cache floor as drawing;
@@ -10503,6 +10791,16 @@ def _fill_preview_make_result(state, radius):
         "patch_edge_reached": patch_edge_reached,
         "compute_seconds": float(elapsed),
         "geometry": local,
+        # Drawing needs the immutable source loop rows.  ``local`` above is
+        # an adjacency-only compact graph and intentionally has no polygon
+        # loop schema; retain the source graph plus the selected source rows
+        # while the result is alive so draw never returns to the live Mesh.
+        "fill_draw_source_geometry": geometry,
+        "fill_draw_source_face_ids": np.array(
+            preview_local_ids, dtype=np.int32, copy=True
+        ),
+        "fill_draw_source_generation": int(state["generation"]),
+        "fill_draw_source_signature": state["signature"],
         "partition": partition,
         "created_generation": int(state["generation"]),
         "valley_fine_reason": valley_fine_reason,
@@ -10527,38 +10825,381 @@ def _fill_preview_make_result(state, radius):
     }
 
 
-def _fill_preview_build_draw_batches(state, result):
-    """Create copied boundary-line vertices and GPU batches once on draw.
+def _fill_preview_tessellate_draw_face(points):
+    """Return a checked Blender tessellation for one non-triangle face."""
+    import numpy as np
 
-    Preview candidates are boundary-first: no face tessellation or face GPU
-    batch is created.  The draw handler may create the two line batches lazily
-    after the compute timer has produced the immutable boundary snapshot.
+    point_count = int(len(points))
+    if point_count < 3:
+        raise ValueError("preview face has fewer than three vertices")
+    point_array = np.asarray(points, dtype=np.float64)
+    if point_array.shape != (point_count, 3) or not np.all(np.isfinite(point_array)):
+        raise ValueError("preview face has non-finite or invalid coordinates")
+    triangles = tessellate_polygon(
+        [[Vector((float(point[0]), float(point[1]), float(point[2]))) for point in point_array]]
+    )
+    expected = point_count - 2
+    if len(triangles) != expected:
+        raise ValueError("preview tessellator returned an incomplete face")
+    indices = np.asarray(triangles, dtype=np.int64).reshape((-1, 3))
+    if np.any(indices < 0) or np.any(indices >= point_count):
+        raise ValueError("preview tessellator returned an invalid vertex index")
+    return np.asarray(points[indices], dtype=np.float32).reshape((-1, 3))
+
+
+def _fill_preview_planar_convex_quad_mask(quad_points):
+    """Classify only finite, non-degenerate, planar convex quads as fast-path safe.
+
+    Derive the reference plane and projection normal from the four vertices.
+    Graph normals can be approximate in Strict mode, so they must not decide
+    whether a quad may bypass Blender's polygon tessellator.
     """
     import numpy as np
 
-    if result.get("line_geometry_ready") and result.get("gpu_batches") is not None:
-        return
-    if not result.get("line_geometry_ready"):
-        result["triangles"] = None
+    points = np.asarray(quad_points, dtype=np.float64)
+    if points.ndim != 3 or points.shape[1:] != (4, 3):
+        return np.zeros(0, dtype=bool)
+    finite = np.all(np.isfinite(points), axis=(1, 2))
+    safe_points = np.where(finite[:, None, None], points, 0.0)
+    edge_vectors = np.roll(safe_points, -1, axis=1) - safe_points
+    edge_lengths = np.linalg.norm(edge_vectors, axis=2)
+    diagonal_lengths = np.stack((
+        np.linalg.norm(safe_points[:, 2] - safe_points[:, 0], axis=1),
+        np.linalg.norm(safe_points[:, 3] - safe_points[:, 1], axis=1),
+    ), axis=1)
+    scale = np.maximum(
+        np.max(edge_lengths, axis=1), np.max(diagonal_lengths, axis=1)
+    )
+    area_vector = (
+        np.cross(safe_points[:, 1] - safe_points[:, 0],
+                 safe_points[:, 2] - safe_points[:, 0])
+        + np.cross(safe_points[:, 2] - safe_points[:, 0],
+                   safe_points[:, 3] - safe_points[:, 0])
+    )
+    normal_length = np.linalg.norm(area_vector, axis=1)
+    valid_normal = (
+        np.isfinite(scale)
+        & np.isfinite(normal_length)
+        & (scale > 0.0)
+        & (normal_length > scale * scale * 1.0e-12)
+    )
+    normal = np.zeros_like(area_vector)
+    np.divide(
+        area_vector,
+        normal_length[:, None],
+        out=normal,
+        where=valid_normal[:, None],
+    )
+    plane_distances = np.abs(np.einsum(
+        "nij,nj->ni", safe_points - safe_points[:, :1], normal
+    ))
+    planar = np.all(
+        plane_distances <= scale[:, None] * 1.0e-6, axis=1
+    )
+
+    dominant_axis = np.argmax(np.abs(normal), axis=1)
+    component_a = (dominant_axis + 1) % 3
+    component_b = (dominant_axis + 2) % 3
+    quad_index = np.arange(len(points), dtype=np.int64)[:, None]
+    corner_index = np.arange(4, dtype=np.int64)[None, :]
+    projected = np.stack((
+        safe_points[quad_index, corner_index, component_a[:, None]],
+        safe_points[quad_index, corner_index, component_b[:, None]],
+    ), axis=2)
+    turns = np.empty((len(points), 4), dtype=np.float64)
+    for corner in range(4):
+        first = projected[:, corner]
+        second = projected[:, (corner + 1) % 4]
+        third = projected[:, (corner + 2) % 4]
+        ax = second[:, 0] - first[:, 0]
+        ay = second[:, 1] - first[:, 1]
+        bx = third[:, 0] - second[:, 0]
+        by = third[:, 1] - second[:, 1]
+        turns[:, corner] = ax * by - ay * bx
+    turn_tolerance = scale * scale * 1.0e-12
+    convex = np.all(turns > turn_tolerance[:, None], axis=1) | np.all(
+        turns < -turn_tolerance[:, None], axis=1
+    )
+    return finite & valid_normal & planar & convex
+
+
+def _fill_preview_build_triangle_positions(result):
+    """Build triangle positions from selected source rows only, never live Mesh.
+
+    The full-graph flat loop schema gets vectorized triangle/quad paths.  All
+    n-gons and concave quads go through Blender's C tessellator so a concave
+    face is never displayed as an invalid fan.
+    """
+    import numpy as np
+
+    source = result.get("fill_draw_source_geometry")
+    selected_rows = np.asarray(
+        result.get("fill_draw_source_face_ids", ()), dtype=np.int64
+    ).reshape(-1)
+    if not isinstance(source, dict) or len(selected_rows) == 0:
+        return np.empty((0, 3), dtype=np.float32)
+    count = int(source.get("count", -1))
+    # Preserve the cached full-mesh arrays in place.  A dtype conversion here
+    # could silently duplicate every source vertex/loop before slicing the
+    # selected rows, defeating the selected-face scaling guarantee.
+    vertices = np.asarray(source.get("world_vertices", ()))
+    if vertices.ndim != 2 or vertices.shape[1] != 3:
+        raise ValueError("preview source vertex schema is invalid")
+    hidden = np.asarray(source.get("hidden", ())).reshape(-1)
+    if count < 0 or len(hidden) != count or np.any(selected_rows < 0) or np.any(selected_rows >= count):
+        raise ValueError("preview source face schema is invalid")
+    # Filter by the selected rows only.  In particular, do not allocate a
+    # boolean mask with one entry per source-mesh face.
+    selected_rows = selected_rows[~hidden[selected_rows].astype(bool, copy=False)]
+    if len(selected_rows) == 0:
+        return np.empty((0, 3), dtype=np.float32)
+
+    flat_value = source.get("face_vertex_flat")
+    offsets_value = source.get("face_vertex_offsets")
+    counts_value = source.get("face_vertex_counts")
+    flat_schema = (
+        flat_value is not None
+        and offsets_value is not None
+        and counts_value is not None
+    )
+    if flat_schema:
+        flat = np.asarray(flat_value).reshape(-1)
+        offsets = np.asarray(offsets_value).reshape(-1)
+        face_counts = np.asarray(counts_value).reshape(-1)
+        if len(offsets) not in (count, count + 1) or len(face_counts) != count:
+            raise ValueError("preview flat face-loop schema is invalid")
+        if (
+            not np.issubdtype(flat.dtype, np.integer)
+            or not np.issubdtype(offsets.dtype, np.integer)
+            or not np.issubdtype(face_counts.dtype, np.integer)
+        ):
+            raise ValueError("preview flat face-loop dtypes are invalid")
+        counts = face_counts[selected_rows].astype(np.int64, copy=False)
+        starts = offsets[selected_rows].astype(np.int64, copy=False)
+        if (
+            np.any(counts < 3)
+            or np.any(starts < 0)
+            or np.any(starts + counts > len(flat))
+        ):
+            raise ValueError("preview selected face-loop row is invalid")
+        total_triangles = int(np.sum(counts - 2, dtype=np.int64))
+        output = np.empty((total_triangles, 3, 3), dtype=np.float32)
+        face_triangle_starts = np.r_[0, np.cumsum(counts[:-1] - 2)].astype(
+            np.int64, copy=False
+        )
+        triangle_rows = np.flatnonzero(counts == 3)
+        if len(triangle_rows):
+            vertex_ids = flat[
+                starts[triangle_rows, None] + np.arange(3, dtype=np.int64)
+            ]
+            if np.any(vertex_ids < 0) or np.any(vertex_ids >= len(vertices)):
+                raise ValueError("preview triangle has an invalid vertex index")
+            output[face_triangle_starts[triangle_rows]] = vertices[vertex_ids]
+
+        quad_rows = np.flatnonzero(counts == 4)
+        fallback_rows = np.flatnonzero(counts >= 5)
+        if len(quad_rows):
+            quad_vertex_ids = flat[
+                starts[quad_rows, None] + np.arange(4, dtype=np.int64)
+            ]
+            if np.any(quad_vertex_ids < 0) or np.any(quad_vertex_ids >= len(vertices)):
+                raise ValueError("preview quad has an invalid vertex index")
+            quad_points = vertices[quad_vertex_ids]
+            convex = _fill_preview_planar_convex_quad_mask(quad_points)
+            convex_rows = quad_rows[convex]
+            if len(convex_rows):
+                points = quad_points[convex]
+                starts_out = face_triangle_starts[convex_rows]
+                output[starts_out] = points[:, (0, 1, 2)]
+                output[starts_out + 1] = points[:, (0, 2, 3)]
+            fallback_rows = np.r_[fallback_rows, quad_rows[~convex]]
+
+        if len(fallback_rows):
+            # The C API interprets multiple polylines as contours of one
+            # polygon, so keep one call per face to prevent triangles from
+            # crossing separate source faces.
+            for row in fallback_rows:
+                vertex_ids = flat[starts[row]:starts[row] + counts[row]]
+                if np.any(vertex_ids < 0) or np.any(vertex_ids >= len(vertices)):
+                    raise ValueError("preview n-gon has an invalid vertex index")
+                face_triangles = _fill_preview_tessellate_draw_face(vertices[vertex_ids])
+                start = int(face_triangle_starts[row])
+                end = start + int(counts[row] - 2)
+                output[start:end] = face_triangles.reshape((-1, 3, 3))
+        return output.reshape((-1, 3)).copy()
+
+    # Cursor-local/compatibility graphs can retain an indexed sequence instead
+    # of the full graph's flat arrays.  Collect only selected loop rows, then
+    # keep triangles and convex quads on the vectorized paths above; only
+    # concave quads and n-gons need one tessellator call per face.
+    face_vertices = _fill_preview_face_vertex_sequence(source)
+    if face_vertices is None:
+        raise ValueError("preview source face-loop sequence is unavailable")
+    counts = np.fromiter(
+        (len(face_vertices[int(row)]) for row in selected_rows),
+        dtype=np.int64,
+        count=len(selected_rows),
+    )
+    if np.any(counts < 3):
+        raise ValueError("preview selected face has fewer than three vertices")
+    total_triangles = int(np.sum(counts - 2, dtype=np.int64))
+    output = np.empty((total_triangles, 3, 3), dtype=np.float32)
+    face_triangle_starts = np.r_[0, np.cumsum(counts[:-1] - 2)].astype(
+        np.int64, copy=False
+    )
+
+    triangle_rows = np.flatnonzero(counts == 3)
+    if len(triangle_rows):
+        triangle_vertex_ids = np.asarray(
+            [face_vertices[int(selected_rows[row])] for row in triangle_rows],
+            dtype=np.int64,
+        ).reshape((-1, 3))
+        if np.any(triangle_vertex_ids < 0) or np.any(triangle_vertex_ids >= len(vertices)):
+            raise ValueError("preview selected triangle has an invalid vertex index")
+        output[face_triangle_starts[triangle_rows]] = vertices[triangle_vertex_ids]
+
+    quad_rows = np.flatnonzero(counts == 4)
+    fallback_rows = np.flatnonzero(counts >= 5)
+    if len(quad_rows):
+        quad_vertex_ids = np.asarray(
+            [face_vertices[int(selected_rows[row])] for row in quad_rows],
+            dtype=np.int64,
+        ).reshape((-1, 4))
+        if np.any(quad_vertex_ids < 0) or np.any(quad_vertex_ids >= len(vertices)):
+            raise ValueError("preview selected quad has an invalid vertex index")
+        quad_points = vertices[quad_vertex_ids]
+        convex = _fill_preview_planar_convex_quad_mask(quad_points)
+        convex_rows = quad_rows[convex]
+        if len(convex_rows):
+            points = quad_points[convex]
+            starts_out = face_triangle_starts[convex_rows]
+            output[starts_out] = points[:, (0, 1, 2)]
+            output[starts_out + 1] = points[:, (0, 2, 3)]
+        fallback_rows = np.r_[fallback_rows, quad_rows[~convex]]
+
+    for row in fallback_rows:
+        source_row = int(selected_rows[row])
+        vertex_ids = np.asarray(
+            face_vertices[source_row], dtype=np.int64
+        ).reshape(-1)
+        if np.any(vertex_ids < 0) or np.any(vertex_ids >= len(vertices)):
+            raise ValueError("preview selected face has an invalid vertex index")
+        face_triangles = _fill_preview_tessellate_draw_face(vertices[vertex_ids])
+        start = int(face_triangle_starts[row])
+        end = start + int(counts[row] - 2)
+        output[start:end] = face_triangles.reshape((-1, 3, 3))
+    return output.reshape((-1, 3)).copy()
+
+
+def _fill_preview_build_draw_batches(state, result):
+    """Build one cached translucent fill batch and the two boundary batches."""
+    import numpy as np
+
+    generation = int(state.get("generation", 0))
+    signature = state.get("signature")
+    if (
+        int(result.get("created_generation", -1)) != generation
+        or int(result.get("fill_draw_source_generation", -1)) != generation
+        or result.get("fill_draw_source_signature") != signature
+    ):
+        return False
+    source = result.get("fill_draw_source_geometry")
+    source_signature = source.get("signature") if isinstance(source, dict) else None
+    if source_signature is not None and source_signature != signature:
+        return False
+    cache_key = (
+        generation,
+        signature,
+        id(result.get("fill_draw_source_face_ids")),
+        id(result.get("shape_segments")),
+        id(result.get("distance_segments")),
+    )
+    if (
+        result.get("draw_cache_key") == cache_key
+        and result.get("gpu_batches") is not None
+        and result.get("line_geometry_ready")
+    ):
+        return True
+    result["gpu_batches"] = None
+    result["line_geometry_ready"] = False
+    try:
+        triangles_started = time.perf_counter()
+        result["triangles_np"] = _fill_preview_build_triangle_positions(result)
+        result["fill_triangle_build_seconds"] = float(
+            time.perf_counter() - triangles_started
+        )
+        result["fill_triangle_vertex_count"] = int(len(result["triangles_np"]))
         result["shape_lines"] = [value for segment in result["shape_segments"] for value in segment]
         result["distance_lines"] = [value for segment in result["distance_segments"] for value in segment]
-        result["triangles_np"] = np.empty((0, 3), dtype=np.float32)
         result["shape_lines_np"] = np.asarray(result["shape_lines"], dtype=np.float32) if result["shape_lines"] else np.empty((0, 3), dtype=np.float32)
         result["distance_lines_np"] = np.asarray(result["distance_lines"], dtype=np.float32) if result["distance_lines"] else np.empty((0, 3), dtype=np.float32)
-        result["line_geometry_ready"] = True
-    if result.get("gpu_batches") is None:
-        shader = _fill_preview_shader_get()
-        batches = {}
-        if shader is not None:
-            if len(result["distance_lines_np"]):
-                batches["distance_lines"] = batch_for_shader(
-                    shader, "LINES", {"pos": result["distance_lines_np"]}
-                )
-            if len(result["shape_lines_np"]):
-                batches["shape_lines"] = batch_for_shader(
-                    shader, "LINES", {"pos": result["shape_lines_np"]}
-                )
-        result["gpu_batches"] = batches
+    except (IndexError, MemoryError, RuntimeError, TypeError, ValueError) as error:
+        # Invalid source schema fails closed for the fill while preserving the
+        # existing boundary overlay.
+        result["triangles_np"] = np.empty((0, 3), dtype=np.float32)
+        result["fill_triangle_vertex_count"] = 0
+        result["fill_triangle_error"] = str(error)
+        result["shape_lines"] = [value for segment in result["shape_segments"] for value in segment]
+        result["distance_lines"] = [value for segment in result["distance_segments"] for value in segment]
+        result["shape_lines_np"] = np.asarray(result["shape_lines"], dtype=np.float32) if result["shape_lines"] else np.empty((0, 3), dtype=np.float32)
+        result["distance_lines_np"] = np.asarray(result["distance_lines"], dtype=np.float32) if result["distance_lines"] else np.empty((0, 3), dtype=np.float32)
+    gpu_started = time.perf_counter()
+    shader = _fill_preview_shader_get()
+    batches = {}
+    if shader is not None:
+        if len(result["triangles_np"]):
+            batches["triangles"] = batch_for_shader(
+                shader, "TRIS", {"pos": result["triangles_np"]}
+            )
+        if len(result["distance_lines_np"]):
+            batches["distance_lines"] = batch_for_shader(
+                shader, "LINES", {"pos": result["distance_lines_np"]}
+            )
+        if len(result["shape_lines_np"]):
+            batches["shape_lines"] = batch_for_shader(
+                shader, "LINES", {"pos": result["shape_lines_np"]}
+            )
+    result["gpu_batches"] = batches
+    result["fill_gpu_batch_build_seconds"] = float(time.perf_counter() - gpu_started)
+    result["fill_gpu_batch_build_count"] = int(
+        result.get("fill_gpu_batch_build_count", 0)
+    ) + (1 if "triangles" in batches else 0)
+    result["line_geometry_ready"] = True
+    result["draw_cache_key"] = cache_key
+    return True
+
+
+def _fill_preview_release_draw_cache(result, release_source=False):
+    """Drop per-result CPU/GPU draw buffers when a preview advances or ends."""
+    if not isinstance(result, dict):
+        return
+    result["gpu_batches"] = None
+    result["draw_cache_key"] = None
+    result["line_geometry_ready"] = False
+    result["triangles_np"] = np.empty((0, 3), dtype=np.float32)
+    result["shape_lines_np"] = np.empty((0, 3), dtype=np.float32)
+    result["distance_lines_np"] = np.empty((0, 3), dtype=np.float32)
+    if release_source:
+        result["fill_draw_source_geometry"] = None
+        result["fill_draw_source_face_ids"] = np.empty(0, dtype=np.int32)
+
+
+def _fill_preview_release_state_draw_caches(state, release_source=False):
+    """Release active and terminal-result copies without dropping frontier state."""
+    if not isinstance(state, dict):
+        return
+    candidates = [state.get("result")]
+    terminal_base = state.get("terminal_base")
+    if isinstance(terminal_base, dict):
+        candidates.append(terminal_base.get("result"))
+    terminal_frontier = state.get("terminal_frontier")
+    if isinstance(terminal_frontier, dict):
+        candidates.append(terminal_frontier.get("last_delta_result"))
+    seen = set()
+    for result in candidates:
+        if isinstance(result, dict) and id(result) not in seen:
+            seen.add(id(result))
+            _fill_preview_release_draw_cache(result, release_source=release_source)
 
 
 def _fill_preview_record_confirm_metrics(result, metrics):
@@ -10739,8 +11380,66 @@ def _fill_preview_confirm_flood(state, result):
     return candidate_ids
 
 
-def _fill_preview_confirm_graph_snapshot(geometry, distances, radius):
-    """Copy only the compact graph arrays needed by a later confirmation."""
+def _fill_preview_confirm_domain_ids_from_reached(
+    distances, hidden, count, radius, reached_ids, complete_through
+):
+    """Filter a Dijkstra-complete reached set without scanning the full graph.
+
+    The caller must supply `patch_ids` returned by the progressive Dijkstra
+    stage plus its `patch_ids_complete_through` bound. That producer guarantees
+    every finite row through the bound is present. If that guarantee or the
+    current array schema is unavailable, return None so the legacy full scan
+    remains the correctness fallback.
+    """
+    import numpy as np
+
+    if (
+        not isinstance(distances, np.ndarray)
+        or distances.ndim != 1
+        or distances.dtype != np.dtype(np.float64)
+        or len(distances) < int(count)
+        or not isinstance(hidden, np.ndarray)
+        or hidden.ndim != 1
+        or hidden.dtype != np.dtype(bool)
+        or len(hidden) != int(count)
+        or not isinstance(reached_ids, np.ndarray)
+        or reached_ids.ndim != 1
+        or reached_ids.dtype != np.dtype(np.int32)
+        or len(reached_ids) > int(count)
+    ):
+        return None
+    if len(reached_ids) and (
+        int(reached_ids[0]) < 0
+        or int(reached_ids[-1]) >= int(count)
+        or np.any(reached_ids[1:] <= reached_ids[:-1])
+    ):
+        return None
+    try:
+        radius_value = float(radius)
+        complete_value = float(complete_through)
+        limit = radius_value + max(radius_value * 1.0e-8, 1.0e-9)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not np.isfinite(limit) or not np.isfinite(complete_value) or limit > complete_value:
+        return None
+    local_distances = distances[reached_ids]
+    keep = (
+        np.isfinite(local_distances)
+        & (local_distances <= limit)
+        & ~hidden[reached_ids]
+    )
+    return reached_ids[keep].astype(np.int32, copy=True)
+
+
+def _fill_preview_confirm_graph_snapshot(
+    geometry,
+    distances,
+    radius,
+    *,
+    reached_ids=None,
+    reached_complete_through=None,
+):
+    """Copy the compact confirm graph and derive its visible domain."""
     import numpy as np
 
     count = int(geometry.get("count", 0))
@@ -10752,14 +11451,23 @@ def _fill_preview_confirm_graph_snapshot(geometry, distances, radius):
     ).reshape(-1)
     if len(hidden) != count:
         return None, np.empty(0, dtype=np.int32)
-    domain_ids = np.flatnonzero(
-        np.isfinite(distances[:count])
-        & (
-            distances[:count]
-            <= float(radius) + max(float(radius) * 1.0e-8, 1.0e-9)
-        )
-        & ~hidden
-    ).astype(np.int32)
+    domain_ids = _fill_preview_confirm_domain_ids_from_reached(
+        distances,
+        hidden,
+        count,
+        radius,
+        reached_ids,
+        reached_complete_through,
+    )
+    if domain_ids is None:
+        domain_ids = np.flatnonzero(
+            np.isfinite(distances[:count])
+            & (
+                distances[:count]
+                <= float(radius) + max(float(radius) * 1.0e-8, 1.0e-9)
+            )
+            & ~hidden
+        ).astype(np.int32)
     face_ids = geometry.get("face_ids")
     if face_ids is None:
         face_ids = np.arange(count, dtype=np.int32)
@@ -10775,6 +11483,216 @@ def _fill_preview_confirm_graph_snapshot(geometry, distances, radius):
         "neighbors": np.array(geometry.get("neighbors"), dtype=np.int32, copy=True),
     }
     return snapshot, np.array(domain_ids, dtype=np.int32, copy=True)
+
+
+_FILL_CONFIRM_GRAPH_CACHE_KEY = "_fill_confirm_graph_snapshot_cache"
+
+
+def _fill_preview_confirm_graph_snapshot_for_session(
+    state,
+    geometry,
+    distances,
+    radius,
+    *,
+    reached_ids=None,
+    reached_complete_through=None,
+):
+    """Share one immutable confirm-graph snapshot across preview strategies."""
+    import numpy as np
+
+    if not isinstance(state, dict):
+        return _fill_preview_confirm_graph_snapshot(geometry, distances, radius)
+
+    def fallback(*, clear_cache=False):
+        if clear_cache:
+            state.pop(_FILL_CONFIRM_GRAPH_CACHE_KEY, None)
+        return _fill_preview_confirm_graph_snapshot(geometry, distances, radius)
+
+    try:
+        mode = (
+            "strict"
+            if bool(state.get("strict_mode", False))
+            else "expand-only"
+            if bool(state.get("expand_only", False))
+            else "normal"
+        )
+        session_id = int(state.get("session_id"))
+        if (
+            not isinstance(geometry, dict)
+            or geometry is not state.get("adjacency")
+            or bool(geometry.get("geometry_dirty", False))
+        ):
+            return fallback(clear_cache=True)
+
+        signature = tuple(state.get("signature") or ())
+        count = int(geometry.get("count", 0))
+        source_arrays = tuple(
+            geometry.get(name)
+            for name in ("face_ids", "hidden", "offsets", "neighbors")
+        )
+        face_ids, hidden, offsets, neighbors = source_arrays
+        distance_array = np.asarray(distances)
+        # Cache hits must stay on the graph's native compact arrays.  Any
+        # conversion, missing field, or malformed shape follows the original
+        # helper path and therefore preserves its exact fallback behavior.
+        schema_valid = (
+            count > 0
+            and signature
+            and isinstance(distance_array, np.ndarray)
+            and distance_array.ndim == 1
+            and distance_array.dtype == np.dtype(np.float64)
+            and len(distance_array) >= count
+            and isinstance(face_ids, np.ndarray)
+            and face_ids.ndim == 1
+            and face_ids.dtype.kind in "iu"
+            and len(face_ids) == count
+            and isinstance(hidden, np.ndarray)
+            and hidden.ndim == 1
+            and hidden.dtype == np.dtype(bool)
+            and len(hidden) == count
+            and isinstance(offsets, np.ndarray)
+            and offsets.ndim == 1
+            and offsets.dtype.kind in "iu"
+            and len(offsets) == count + 1
+            and isinstance(neighbors, np.ndarray)
+            and neighbors.ndim == 1
+            and neighbors.dtype.kind in "iu"
+            and int(offsets[0]) == 0
+            and int(offsets[-1]) == len(neighbors)
+        )
+        if not schema_valid:
+            return fallback(clear_cache=True)
+
+        try:
+            radius_value = float(radius)
+            seed = (
+                int(state.get("seed_face", -1)),
+                None if state.get("seed_local") is None
+                else int(state.get("seed_local")),
+            )
+            refresh_count = int(geometry.get("geometry_refresh_count", 0))
+        except (TypeError, ValueError, OverflowError):
+            return fallback()
+        if session_id < 0:
+            return fallback(clear_cache=True)
+
+        shapes = tuple(tuple(array.shape) for array in source_arrays)
+        dtypes = tuple(array.dtype.str for array in source_arrays)
+        cached = state.get(_FILL_CONFIRM_GRAPH_CACHE_KEY)
+        if (
+            isinstance(cached, dict)
+            and cached.get("session_id") == session_id
+            and cached.get("mode") == mode
+            and cached.get("signature") == signature
+            and cached.get("geometry") is geometry
+            and cached.get("count") == count
+            and cached.get("seed") == seed
+            and cached.get("geometry_refresh_count") == refresh_count
+            and cached.get("source_arrays") is not None
+            and len(cached["source_arrays"]) == len(source_arrays)
+            and all(
+                previous is current
+                for previous, current in zip(
+                    cached["source_arrays"], source_arrays
+                )
+            )
+            and cached.get("source_shapes") == shapes
+            and cached.get("source_dtypes") == dtypes
+        ):
+            snapshot = cached.get("snapshot")
+            snapshot_schema = (
+                isinstance(snapshot, dict)
+                and isinstance(snapshot.get("face_ids"), np.ndarray)
+                and snapshot["face_ids"].shape == (count,)
+                and snapshot["face_ids"].dtype == np.dtype(np.int32)
+                and isinstance(snapshot.get("hidden"), np.ndarray)
+                and snapshot["hidden"].shape == (count,)
+                and snapshot["hidden"].dtype == np.dtype(bool)
+                and isinstance(snapshot.get("offsets"), np.ndarray)
+                and snapshot["offsets"].shape == (count + 1,)
+                and snapshot["offsets"].dtype == np.dtype(np.int64)
+                and isinstance(snapshot.get("neighbors"), np.ndarray)
+                and snapshot["neighbors"].shape == (len(neighbors),)
+                and snapshot["neighbors"].dtype == np.dtype(np.int32)
+                and all(
+                    not snapshot[name].flags.writeable
+                    for name in ("face_ids", "hidden", "offsets", "neighbors")
+                )
+                and (
+                    not has_mesh_global_identity_face_ids(geometry, count)
+                    or has_mesh_global_identity_face_ids(snapshot, count)
+                )
+            )
+            if snapshot_schema:
+                domain_ids = _fill_preview_confirm_domain_ids_from_reached(
+                    distance_array,
+                    hidden,
+                    count,
+                    radius_value,
+                    reached_ids,
+                    reached_complete_through,
+                )
+                if domain_ids is None:
+                    tolerance = max(radius_value * 1.0e-8, 1.0e-9)
+                    domain_ids = np.flatnonzero(
+                        np.isfinite(distance_array[:count])
+                        & (distance_array[:count] <= radius_value + tolerance)
+                        & ~hidden
+                    ).astype(np.int32)
+                return (
+                    dict(snapshot),
+                    np.array(domain_ids, dtype=np.int32, copy=True),
+                )
+            state.pop(_FILL_CONFIRM_GRAPH_CACHE_KEY, None)
+        else:
+            state.pop(_FILL_CONFIRM_GRAPH_CACHE_KEY, None)
+
+        snapshot, domain_ids = _fill_preview_confirm_graph_snapshot(
+            geometry,
+            distances,
+            radius,
+            reached_ids=reached_ids,
+            reached_complete_through=reached_complete_through,
+        )
+        if not isinstance(snapshot, dict):
+            return snapshot, domain_ids
+
+        expected_snapshot = (
+            ("face_ids", (count,), np.dtype(np.int32)),
+            ("hidden", (count,), np.dtype(bool)),
+            ("offsets", (count + 1,), np.dtype(np.int64)),
+            ("neighbors", (len(neighbors),), np.dtype(np.int32)),
+        )
+        try:
+            if not all(
+                isinstance(snapshot.get(name), np.ndarray)
+                and snapshot[name].shape == shape
+                and snapshot[name].dtype == dtype
+                for name, shape, dtype in expected_snapshot
+            ):
+                return snapshot, domain_ids
+            copy_mesh_global_identity_face_ids_provenance(geometry, snapshot)
+            for name, _shape, _dtype in expected_snapshot:
+                snapshot[name].flags.writeable = False
+        except (AttributeError, TypeError, ValueError):
+            return snapshot, domain_ids
+
+        state[_FILL_CONFIRM_GRAPH_CACHE_KEY] = {
+            "session_id": session_id,
+            "mode": mode,
+            "signature": signature,
+            "geometry": geometry,
+            "count": count,
+            "seed": seed,
+            "geometry_refresh_count": refresh_count,
+            "source_arrays": source_arrays,
+            "source_shapes": shapes,
+            "source_dtypes": dtypes,
+            "snapshot": snapshot,
+        }
+        return snapshot, domain_ids
+    except (AttributeError, ReferenceError, TypeError, ValueError, OverflowError):
+        return fallback(clear_cache=True)
 
 
 def _fill_preview_draw_text(state, result):
@@ -11005,6 +11923,42 @@ def _fill_preview_draw_shadow_field_overlay(state, result, shader):
     return True
 
 
+def _fill_preview_result_uses_green_boundary(result):
+    """Return the exact boundary color mode used by the viewport draw."""
+    return isinstance(result, dict) and bool(
+        result.get("boundary_all_orange", False)
+    )
+
+
+def _fill_preview_current_result_uses_green_boundary(state):
+    """Whether the visible, current preview is at its green terminal limit."""
+    if not isinstance(state, dict):
+        return False
+    generation = state.get("generation")
+    return bool(
+        state.get("phase") == "ready"
+        and not state.get("pending")
+        and generation is not None
+        and state.get("drawn_generation") == generation
+        and _fill_preview_result_uses_green_boundary(state.get("result"))
+    )
+
+
+def _fill_preview_green_wheel_up_is_noop(state, event):
+    """One shared green-limit wheel predicate for E, Ctrl+E, and Shift+E."""
+    return bool(
+        getattr(event, "type", None) == "WHEELUPMOUSE"
+        and _fill_preview_current_result_uses_green_boundary(state)
+    )
+
+
+def _fill_preview_fill_color(result):
+    """Use the same RGB as the boundary when the terminal color is green."""
+    if _fill_preview_result_uses_green_boundary(result):
+        return (0.16, 1.0, 0.34, 0.20)
+    return (0.16, 0.72, 0.96, 0.20)
+
+
 def _fill_preview_draw():
     """Draw one session's copied candidate overlay and boundary lines."""
     state = _runtime.fill_preview_state
@@ -11019,7 +11973,8 @@ def _fill_preview_draw():
         if shader is None:
             return
         if result is not None:
-            _fill_preview_build_draw_batches(state, result)
+            if not _fill_preview_build_draw_batches(state, result):
+                return
             current_generation = int(state.get("generation", 0))
             first_draw_for_generation = (
                 state.get("drawn_generation") != current_generation
@@ -11045,15 +12000,15 @@ def _fill_preview_draw():
                 # and draw only the orange/cyan interface; keeping the tone
                 # overlay here would hide the user's Face Set colors and
                 # make the preview differ from the editable scene.
+                green_boundary = _fill_preview_result_uses_green_boundary(result)
                 if len(result["triangles_np"]):
                     shader.bind()
-                    shader.uniform_float("color", (0.16, 0.72, 0.96, 0.20))
+                    shader.uniform_float("color", _fill_preview_fill_color(result))
                     batch = result.get("gpu_batches", {}).get("triangles")
                     if batch is not None:
                         batch.draw(shader)
                     else:
                         draw_succeeded = False
-                green_boundary = bool(result.get("boundary_all_orange", False))
                 for key, color, batch_key in (
                     ("distance_lines_np", (0.20, 0.86, 1.0, 0.95), "distance_lines"),
                     ("shape_lines_np", (1.0, 0.38, 0.08, 0.95), "shape_lines"),
@@ -11225,6 +12180,7 @@ def _fill_preview_cancel(state=None, reason="cancel", terminal=True):
     if current is None:
         return
     current["active"] = False
+    _fill_preview_release_state_draw_caches(current, release_source=True)
     timer = current.get("timer")
     if timer is not None:
         try:
@@ -11273,6 +12229,7 @@ def _fill_preview_cancel(state=None, reason="cancel", terminal=True):
     # Modal ownership is cleared by registration immediately before the
     # owning modal() returns its terminal status.  External callbacks use
     # terminal=False and must leave the registry/handler liveness intact.
+    current.pop(_FILL_CONFIRM_GRAPH_CACHE_KEY, None)
     _runtime.fill_preview_state = None
     _fill_preview_tag_redraw(current)
 
@@ -11924,8 +12881,11 @@ def _fill_preview_accept_normal_wheel(state, event):
     Wheel events arriving during preparation, computation, draw-gating, or the
     short post-draw drain are deliberately dropped.  There is no debounce
     queue: one accepted event produces one radius step, so rapid input and
-    slow input have identical stage semantics.
+    slow input have identical stage semantics.  A green terminal result is
+    already at its maximum; expanding it is consumed without changing state.
     """
+    if _fill_preview_green_wheel_up_is_noop(state, event):
+        return True
     now = time.perf_counter()
     if (
         state.get("initial_radius") is None
@@ -11949,6 +12909,7 @@ def _fill_preview_accept_normal_wheel(state, event):
     state["wheel_gate"] = False
     state["pending"] = True
     state["phase"] = "compute"
+    _fill_preview_release_state_draw_caches(state, release_source=False)
     state["result"] = None
     _fill_preview_tag_redraw(state)
     return True

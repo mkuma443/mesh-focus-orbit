@@ -15,7 +15,7 @@ import types
 bl_info = {
     "name": "Mesh Focus Orbit",
     "author": "OpenAI",
-    "version": (3, 4, 12),
+    "version": (3, 4, 20),
     "blender": (5, 2, 0),
     "location": "3D View",
     "description": "Mesh-centered orbit, Face Set tools, Smart Fill, and Guided Ridge",

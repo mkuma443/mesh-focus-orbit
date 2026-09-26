@@ -75,6 +75,7 @@ from .config import (
 # Keep the timer gate name local to registration while the value remains owned
 # by config; this avoids an implicit facade lookup during Smart Fill dispatch.
 _FILL_PREVIEW_WHEEL_DRAIN_SECONDS = FILL_PREVIEW_WHEEL_DRAIN_SECONDS
+from .smart_fill.invariants import make_mesh_global_identity_face_ids
 from . import lifecycle as _lifecycle
 from . import runtime as _runtime
 from .smart_fill.invariants import (
@@ -187,6 +188,7 @@ from .smart_fill.geometry import (
 )
 from .smart_fill.preview import (
     _fill_preview_accept_normal_wheel,
+    _fill_preview_green_wheel_up_is_noop,
     _fill_preview_cancel,
     _fill_preview_request_cancel,
     _fill_preview_confirm_flood,
@@ -1116,6 +1118,10 @@ class VIEW3D_OT_mesh_focus_local_face_set_grow(bpy.types.Operator):
             # preparation phase must never confirm the old/partial result.
             return {"RUNNING_MODAL"}
         if event.type in {"WHEELUPMOUSE", "WHEELDOWNMOUSE"}:
+            if _fill_preview_green_wheel_up_is_noop(state, event):
+                # Green denotes the terminal zoom limit. Preserve this exact
+                # visible result instead of clearing it for a futile recompute.
+                return {"RUNNING_MODAL"}
             if not bool(state.get("strict_mode", False)):
                 # Ordinary E accepts one step only after the current result
                 # has been drawn.  Events during compute/draw wait
@@ -3001,6 +3007,9 @@ def _fill_preview_build_adjacency_cooperative(obj, prepared=None):
     face_set_fingerprint = None
     yield _fill_preview_prepare_token("cache-fingerprints-ready", 1, 1, phase="prepare-finalize")
     yield _fill_preview_prepare_token("cache-build", phase="prepare-finalize")
+    identity_face_ids, identity_face_ids_provenance = (
+        make_mesh_global_identity_face_ids(face_count)
+    )
     cached = {
         "signature": signature,
         "count": int(face_count),
@@ -3026,7 +3035,8 @@ def _fill_preview_build_adjacency_cooperative(obj, prepared=None):
         "face_vertex_flat": face_vertex_flat,
         "face_vertex_offsets": face_vertex_offsets,
         "face_vertex_counts": totals.astype(np.int32, copy=False),
-        "face_ids": np.arange(face_count, dtype=np.int32),
+        "face_ids": identity_face_ids,
+        "_face_ids_identity_provenance": identity_face_ids_provenance,
         "seam_count": seam_count,
         "vertex_id_space": "mesh-global",
         "topology_fingerprint": topology_fingerprint,
