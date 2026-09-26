@@ -1,10 +1,10 @@
 # Mesh Focus Orbit
 
-Current source version: 3.4.20.
+Current source version: 3.4.21.
 
 Blender 5.2 用のリトポロジー支援アドオンです。
 
-アドオンバージョン: **3.4.20**
+アドオンバージョン: **3.4.21**
 
 ## 主な機能
 
@@ -63,6 +63,8 @@ Tツールバーは、編集可能なAstra Blenderソースから生成した5�
 ## 通常 MFO
 
 Activation Key の初期値は `Right Shift` です。通常 MFO は 3D Viewport の中央座標から一度だけレイキャストし、表示中の MESH のうち最も手前の面を一時的な Orbit 中心にします。Navigation Gizmo や MMB で視点を回転できます。
+
+Sculpt Mode では非表示の面をレイ判定から除外します。隠した Face Set の面は回転中心に選ばれません。
 
 終了時には開始前の `view_location`、`view_distance`、`view_rotation`、`view_perspective` を復元します。メッシュ、選択状態、3D Cursor、Pivot Point、オブジェクト変換、常設の Orbit Around Selection 設定は変更しません。
 

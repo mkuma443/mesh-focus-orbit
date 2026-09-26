@@ -2819,6 +2819,56 @@ def _raycast_object(obj, depsgraph, origin, direction):
         return None
 
 
+def _raycast_sculpt_visible_object(obj, origin, direction):
+    """Skip hidden Sculpt faces when finding the clicked orbit surface.
+
+    Evaluated Mesh polygon hide flags do not reliably reflect Sculpt's live
+    Face Set visibility.  Use the source mesh ray cast, as the Sculpt cursor
+    does, and advance past each hidden face before accepting a hit.
+    """
+    try:
+        matrix_world = obj.matrix_world
+        inverse = matrix_world.inverted_safe()
+        local_origin = inverse @ origin
+        local_direction = inverse.to_3x3() @ direction
+        if local_direction.length_squared == 0.0:
+            return None
+        local_direction.normalize()
+        polygons = obj.data.polygons
+        last_hidden_face = None
+        repeated_hidden_hits = 0
+
+        for _attempt in range(256):
+            hit, local_location, local_normal, face_index = obj.ray_cast(
+                local_origin, local_direction
+            )
+            if not hit or face_index < 0 or face_index >= len(polygons):
+                return None
+            world_location = matrix_world @ local_location
+            distance = _distance_along_ray(origin, direction, world_location)
+            if distance is None:
+                return None
+            if not polygons[int(face_index)].hide:
+                return world_location, distance
+
+            if face_index == last_hidden_face:
+                repeated_hidden_hits += 1
+            else:
+                last_hidden_face = face_index
+                repeated_hidden_hits = 1
+            if repeated_hidden_hits > 8:
+                return None
+            advance = _edit_ray_advance_epsilon(
+                local_location, local_direction, local_normal
+            )
+            if advance is None:
+                return None
+            local_origin = local_location + local_direction * advance
+        return None
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+
+
 def _raycast_edit_object(obj, origin, direction):
     """Ray cast the live BMesh so unsaved Edit Mode changes are included."""
     try:
@@ -2938,6 +2988,8 @@ def _find_mesh_hit(context, ray):
 
         if context.mode == "EDIT_MESH" and obj.mode == "EDIT":
             hit = _raycast_edit_object(obj, origin, direction)
+        elif context.mode == "SCULPT" and obj is context.active_object:
+            hit = _raycast_sculpt_visible_object(obj, origin, direction)
         else:
             hit = _raycast_object(obj, depsgraph, origin, direction)
         if hit is None:
