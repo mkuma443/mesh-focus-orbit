@@ -1,10 +1,10 @@
 # Mesh Focus Orbit
 
-Current source version: 3.4.7.
+Current source version: 3.4.12.
 
 Blender 5.2 用のリトポロジー支援アドオンです。
 
-アドオンバージョン: **3.4.7**
+アドオンバージョン: **3.4.12**
 
 ## 主な機能
 
@@ -53,8 +53,8 @@ Tツールバーは、編集可能なAstra Blenderソースから生成した5�
 | Smart Fill Expand Only | Sculpt / Vertex Paint | `Shift + E`、開始キーを離してから `E` または `Enter` | サーフェス／valley／ridge／edge-cost評価を省略し、トポロジー距離だけで拡大。ホイールで段階変更、`Esc` で取消 |
 | Strict Smart Fill | Sculpt / Vertex Paint | `Ctrl + E`、開始キーを離してから `E` または `Enter` | SculptはFace Set、Vertex Paintはアクティブ色属性。ホイールで距離、`Esc` で取消 |
 | Wire Overlay View | 3D View（全モード） | `Shift + Alt + E` | 対象 View3D の現在の wire 状態を反転。ON時は薄い表示、OFF時は他のoverlay設定を変更しない |
-| 表示距離集中 | 3D View（全モード） | `Shift + Alt + V` | 対象 View3D の clip_end を 0.13 m / 1000 m で切替。clip_start とズーム距離は維持 |
-| Opening Boundary Loop | Edit（辺選択） | 開口部の辺を1本選択して `Shift + Alt + L` | 同じ開口部の閉じた縁だけに選択を置換 |
+| 表示距離集中 | 3D View（全モード） | `Shift + Alt + V` | 初回は0.13 mで調整開始。ホイール調整後にLMB/Enterで確定し、作業後に再押下で1000 mへ復元。Esc/右クリックは1000 mへ取消。保存ファイルは1000 mで保存し、完了/失敗後は現在画面の調整値へ戻します |
+| Opening Boundary Loop | Edit（辺選択） | 開口部の辺を1本または2本選択して `Shift + Alt + L` | 1本なら一周、2本なら短区間。選択を変えず再実行すると反対区間へ交互に切替 |
 | Topology Colors | Edit | `Ctrl + Alt + 1`〜`6` | `Ctrl + Alt + 0` で選択面の色を解除 |
 | Curved Face Set Tube Shape | Sculpt | `Ctrl + Alt + T`、`T`、LMB、または `Enter` | `Esc` または右クリックで取消。ホイールで半径・先細り、`Shift + ホイール`で補正強度 |
 
@@ -115,7 +115,7 @@ Smart Fill 自身の確定直後は surface adjacency / cursor cache を再利�
 
 `Shift + Alt + E` はモードに依存しない表示操作です。対象 View3D の `show_wireframes` を毎回現在値から反転し、ON時は通常の薄い wire 設定を適用します。OFF時は wire 表示だけをOFFにし、他のoverlay設定は復元・変更しません。保存後に再起動しても、その View3D の現在の wire 状態から切り替わります。
 
-`Shift + Alt + V` は対象 View3D の遠方クリップ `clip_end` を 0.13 m と 1000 m で切り替えます。`clip_start`、視点のズーム距離、他の View3D の値は変更しません。
+`Shift + Alt + V` の初回押下で対象 View3D の遠方クリップ `clip_end` を0.13 mにし、調整中はホイールで距離を変更します。LMBまたはEnterで距離を確定するとモーダルを終了し、通常のホイール操作へ戻ります。作業後に再押下すると1000 mへ復元し、Esc/右クリックは調整を取消して1000 mへ戻します。`clip_start`、視点のズーム距離、他の View3D の値は変更しません。
 
 非表示面、非多様体 edge、未接続 seam、別 sheet、メッシュ境界を越える候補は保護します。大規模メッシュでは局所 graph の準備に時間がかかることがあります。形状上区別できない境界や有効な連結領域がない場合は、無変更で終了します。
 
@@ -127,7 +127,7 @@ Smart Fill 自身の確定直後は surface adjacency / cursor cache を再利�
 
 ## Topology Colors
 
-`Shift + Alt + L` は、Edit Modeで最後に選択した可視エッジを起点として、その辺を含む開口部の縁を一周選択します。Face Setなどで面を非表示にしてできた開口では、表示面と非表示面の境界を追跡します。面が欠けている実境界にも対応します。画面外の辺も含め、同じ開口の閉じた縁だけに選択を置き換えます。視点や面の色には依存しません。別の開口と1つの頂点で接している場合は閉路を分離し、起点のある開口だけを選びます。境界にない起点、同じ辺を共有する複数閉路、途切れ、探索上限により一周を確定できない場合は選択を変更しません。面の生成、非表示面の再表示、メッシュ形状の変更は行いません。同じ操作は `MFO > Topology Colors > 開口部を一周選択` からも実行できます。
+`Shift + Alt + L` は、Edit Modeで可視開口部辺を1本選択するとその開口の縁を一周選び、同じ開口の辺を2本選択すると両端の辺を含む2区間のうち幾何学的に短い区間を選びます。2辺モードで選択を変えず再実行すると反対側の区間へ切り替わり、再実行ごとに交互に選択します。Face Setなどで面を非表示にしてできた開口では、表示面と非表示面の境界を追跡し、面が欠けている実境界にも対応します。画面外の辺も含み、視点や面の色には依存しません。別の開口と1つの頂点で接している場合は閉路を分離します。別開口の辺、境界でない辺、曖昧または途切れた閉路、探索上限超過、再実行tokenと選択・対象・局所形状や可視性が一致しない場合は安全に扱い、失敗時は選択を変更しません。Undo/Redo、ファイル読み込み、アドオン再読み込みも再実行状態を破棄します。面の生成、非表示面の再表示、メッシュ形状の変更は行いません。同じ操作は `MFO > Topology Colors > 開口部を一周選択` からも実行できます。
 
 Edit Mode で面を選択し、`Ctrl + Alt + 1`〜`6` を押すと、表示中の選択面へ色番号を保存して半透明ガイドを表示します。`Ctrl + Alt + 0` は色を解除します。色はマテリアルではなく、active Edit Mesh の FACE 整数属性 `mfo_topology_color` (0=解除、1〜6=色) へ保存され、.blend と Undo/Redo に含まれます。
 
@@ -165,7 +165,7 @@ Edit Mode で面を選択し、`Ctrl + Alt + 1`〜`6` を押すと、表示中�
 
 A Blender 5.2 add-on for manual retopology workflows.
 
-Add-on version: **3.4.7**
+Add-on version: **3.4.12**
 
 ## Main features
 
@@ -174,8 +174,8 @@ Add-on version: **3.4.7**
 - **Guided Ridge Curve Sculpt (Step 2)**: previews a click-snapped 3D route, then activates the Blender 5.2 ESSENTIALS Pinch/Magnify or Crease Polish brush and applies one synchronous sculpt.brush_stroke from the accepted current-view curve. Before explicit apply it creates no mesh change; the exact prior asset reference and active tool are restored on exit. RUNNING_MODAL/PASS_THROUGH are treated as incomplete.
 - **Smart Fill**: in Sculpt Mode it previews a local Face Set region; in Vertex Paint it samples the active FLOAT_COLOR/BYTE_COLOR POINT/CORNER attribute under the cursor and writes that sampled color only on confirm. `Shift + E` uses a lightweight adjacent-normal test and makes a clear ridge or valley cost twice as much to cross as flat adjacency.
 - **Wire Overlay View**: in any mode, `Shift + Alt + E` toggles wire display from the current value of that View3D.
-- **Display Distance Focus**: `Shift + Alt + V` switches that View3D's far clip between 0.13 m and 1000 m.
-- **Opening Boundary Loop**: select one opening-rim edge in Edit Mode, then press `Shift + Alt + L` to select the complete closed rim of that opening.
+- **Display Distance Focus**: `Shift + Alt + V` starts at 0.13 m and captures the wheel only while adjusting. Click or Enter keeps the distance and ends the modal; a later press restores 1000 m. Esc/right click cancels to 1000 m.
+- **Opening Boundary Loop**: select one opening-rim edge in Edit Mode and press `Shift + Alt + L` to select its complete closed rim. With two edges on the same opening, the first press selects the shorter inclusive arc; pressing again without changing the selection alternates to the opposite arc.
 - **Topology Colors**: stores six translucent topology guide colors on selected Edit Mode faces.
 - **Curved Face Set Tube Shape**: equalizes or tapers a curved Face Set tube while following its local cross-section.
 
@@ -214,8 +214,8 @@ The `MFO` tab in the right N-sidebar exposes `Reference Object` and compact dail
 | Smart Fill Expand Only | Sculpt / Vertex Paint | `Shift + E`, release it, then press `E` again or `Enter` | Bypasses surface/valley/ridge/edge-cost evaluation and expands by topology distance only. Wheel changes stages; `Esc` cancels |
 | Strict Smart Fill | Sculpt / Vertex Paint | `Ctrl + E`, release it, then press `E` again or `Enter` | Sculpt uses Face Sets; Vertex Paint uses the active color attribute. Wheel changes distance; `Esc` cancels |
 | Wire Overlay View | 3D View (any mode) | `Shift + Alt + E` | Toggles the current View3D wire state; turning it OFF leaves other overlay settings unchanged |
-| Display Distance Focus | 3D View (any mode) | `Shift + Alt + V` | Switches `clip_end` between 0.13 m and 1000 m; preserves `clip_start` and zoom distance |
-| Opening Boundary Loop | Edit (Edge Select) | Select one opening-rim edge, then `Shift + Alt + L` | Replaces selection with only that opening's closed rim |
+| Display Distance Focus | 3D View (any mode) | `Shift + Alt + V` | Starts adjustment at 0.13 m; wheel adjusts, LMB/Enter keeps it and ends the modal, later press restores 1000 m; Esc/right click cancels. The file stores 1000 m and the live viewport value is restored after save success/failure |
+| Opening Boundary Loop | Edit (Edge Select) | Select one or two opening-rim edges, then `Shift + Alt + L` | One edge selects the full rim; two select the shorter inclusive arc, and an unchanged repeat alternates to the opposite arc |
 | Topology Colors | Edit | `Ctrl + Alt + 1`–`6` | `Ctrl + Alt + 0` clears selected faces |
 | Curved Face Set Tube Shape | Sculpt | `Ctrl + Alt + T`; confirm with `T`, LMB, or `Enter` | `Esc` or right click cancels; wheel changes radius/taper, `Shift + wheel` changes correction strength |
 
@@ -276,7 +276,7 @@ Immediately after a Smart Fill confirmation, the surface adjacency/cursor caches
 
 `Shift + Alt + E` works in any mode. Each press inverts the current View3D's `show_wireframes` value; enabling wires applies the usual faint wire settings, while disabling them changes only the wire flag. The current property remains authoritative after saving and reopening a file.
 
-`Shift + Alt + V` switches the current View3D's far clipping distance, `clip_end`, between 0.13 m and 1000 m. It does not change `clip_start`, view distance, or another View3D.
+`Shift + Alt + V` starts a short adjustment modal at 0.13 m. The wheel adjusts only `clip_end`; LMB or Enter keeps the selected distance and ends the modal, so normal wheel zoom resumes. Pressing `Shift + Alt + V` after the work restores 1000 m. Esc or right click cancels to 1000 m. It does not change `clip_start`, view distance, or another View3D.
 
 Hidden faces, non-manifold edges, disconnected seams, separate sheets, and mesh boundaries are protected. Initial local graph preparation can take time on large meshes. Vertex Paint Smart Fill currently rejects enabled viewport modifiers/deform geometry and non-basis shape keys because evaluated hit triangles do not yet have a guaranteed source-color mapping; unmodified meshes remain supported. Ambiguous boundaries and regions without a valid connected area are rejected without a write.
 
@@ -288,7 +288,7 @@ Prediction does not write the mesh. Confirmation writes only safe vertices in th
 
 ## Topology Colors
 
-`Shift + Alt + L` follows the closed opening rim containing the last selected visible edge in Edit Mode. It follows the border between visible and hidden faces, including openings made by hiding Face Sets, and also supports true mesh boundaries. Selection is replaced with that opening's complete rim, including off-screen edges, independently of the view or face colors. Openings touching at a single vertex are separated, selecting only the cycle containing the seed. An invalid seed, multiple cycles sharing edges, a broken rim, or a search limit leaves the selection unchanged. The command only selects edges; it does not create faces, reveal hidden geometry, or modify the mesh shape. It is also available from `MFO > Topology Colors > Select Opening Boundary Loop`.
+`Shift + Alt + L` follows an opening rim in Edit Mode, including borders between visible and hidden faces (such as hidden Face Sets) and true mesh boundaries. One selected visible rim edge selects the complete closed rim. Exactly two edges on the same unique rim select the shorter continuous arc, including both anchor edges; repeating the command without changing selection or local geometry/visibility alternates to the opposite arc. Openings touching at a single vertex are separated, selecting only the cycle containing the seed. Invalid or ambiguous edges, a broken/branched rim, or a search limit leaves selection unchanged. The command only selects edges; it does not create faces, reveal hidden geometry, or modify the mesh shape. It is also available from `MFO > Topology Colors > Select Opening Boundary Loop`.
 
 In Edit Mode, select faces and press `Ctrl + Alt + 1`–`6` to store a color number and show a translucent guide. `Ctrl + Alt + 0` clears it. The value is stored as the FACE integer attribute `mfo_topology_color` (0=clear, 1–6=color) on the active Edit Mesh, not as a material, and is included in .blend and Undo/Redo.
 

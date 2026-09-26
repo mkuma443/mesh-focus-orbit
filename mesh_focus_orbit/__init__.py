@@ -15,7 +15,7 @@ import types
 bl_info = {
     "name": "Mesh Focus Orbit",
     "author": "OpenAI",
-    "version": (3, 4, 7),
+    "version": (3, 4, 12),
     "blender": (5, 2, 0),
     "location": "3D View",
     "description": "Mesh-centered orbit, Face Set tools, Smart Fill, and Guided Ridge",
@@ -52,6 +52,17 @@ def _load_components():
     previous_registration = sys.modules.get(package + ".registration")
     previous_runtime = getattr(previous_registration, "_runtime", None)
     previous_lifecycle = getattr(previous_registration, "_lifecycle", None)
+    if previous_runtime is not None:
+        # The retained runtime singleton can predate display-distance sessions.
+        # Backfill only a missing attribute before calling old teardown code;
+        # replacing an existing value could orphan active viewport sessions.
+        if not hasattr(previous_runtime, "display_distance_sessions"):
+            previous_runtime.display_distance_sessions = {}
+        elif not isinstance(previous_runtime.display_distance_sessions, dict):
+            raise TypeError(
+                "Mesh Focus Orbit reload refused: runtime.display_distance_sessions "
+                "must be a dict"
+            )
     if previous_registration is not None:
         # Reload safety is independent of the registration flag. A retired
         # modal can still be inside Blender's RNA callback after unregister,

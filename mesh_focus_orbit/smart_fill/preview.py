@@ -71,6 +71,20 @@ from ..config import (
     WATCHER_OPERATOR_ID,
 )
 from .. import runtime as _runtime
+from .. import lifecycle as _lifecycle
+
+
+def _display_distance_ensure_runtime():
+    """Backfill distance state when an older runtime singleton survives reload."""
+    if not hasattr(_runtime, "display_distance_sessions"):
+        _runtime.display_distance_sessions = {}
+    sessions = _runtime.display_distance_sessions
+    if not isinstance(sessions, dict):
+        raise TypeError("runtime.display_distance_sessions must be a dict")
+    return sessions
+
+
+_display_distance_ensure_runtime()
 from ..foundation import (
     _FILL_PREVIEW_BOUNDARY_ROUTE_COMPONENT_BUDGET,
     _FILL_PREVIEW_BOUNDARY_ROUTE_COMPONENT_PAIR_BUDGET,
@@ -293,12 +307,175 @@ class VIEW3D_OT_mesh_focus_shadow_analysis_toggle(bpy.types.Operator):
         return {"FINISHED"}
 
 
+_DISPLAY_DISTANCE_INITIAL = 0.13
+_DISPLAY_DISTANCE_RESET = 1000.0
+_DISPLAY_DISTANCE_MIN = 0.001
+_DISPLAY_DISTANCE_MAX = 1000.0
+_DISPLAY_DISTANCE_STEP = 1.15
+
+
+def _display_distance_pointer(value):
+    try:
+        pointer = int(value.as_pointer())
+        if pointer:
+            return pointer
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        pass
+    return id(value)
+
+
+def _display_distance_clamp(value, fallback=_DISPLAY_DISTANCE_INITIAL):
+    try:
+        value = float(value)
+    except (TypeError, ValueError, OverflowError):
+        value = float(fallback)
+    if not math.isfinite(value) or value <= 0.0:
+        value = float(fallback)
+    return max(_DISPLAY_DISTANCE_MIN, min(_DISPLAY_DISTANCE_MAX, value))
+
+
+def _display_distance_write(session, value):
+    """Write only the owned SpaceView3D far clip, keeping state finite."""
+    target = _display_distance_clamp(value)
+    try:
+        space = session["space"]
+        space.clip_end = target
+        actual = _display_distance_clamp(space.clip_end)
+    except (
+        AttributeError,
+        ReferenceError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+        OverflowError,
+    ):
+        return False
+    session["value"] = actual
+    try:
+        area = session.get("area")
+        if area is not None:
+            area.tag_redraw()
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        pass
+    return True
+
+
+def _display_distance_area_is_live(session):
+    """Check that the exact target space is still owned by its original area."""
+    try:
+        area = session["area"]
+        screen = session["screen"]
+        area_pointer = int(session["area_pointer"])
+        space_pointer = int(session["space_pointer"])
+        matching_area = next(
+            (
+                candidate
+                for candidate in screen.areas
+                if _display_distance_pointer(candidate) == area_pointer
+            ),
+            None,
+        )
+        if matching_area is None or matching_area.type != "VIEW_3D":
+            return False
+        return any(
+            space.type == "VIEW_3D"
+            and _display_distance_pointer(space) == space_pointer
+            for space in matching_area.spaces
+        )
+    except (
+        AttributeError,
+        ReferenceError,
+        RuntimeError,
+        StopIteration,
+        TypeError,
+        ValueError,
+    ):
+        return False
+
+
+def _display_distance_unlink(session):
+    key = session.get("space_pointer")
+    if _runtime.display_distance_sessions.get(key) is session:
+        _runtime.display_distance_sessions.pop(key, None)
+    session["active"] = False
+    session["phase"] = "idle"
+    session["save_pending"] = False
+
+
+def _display_distance_end_session(session, *, request_modal_cancel=False):
+    """Return one owned view to 1000 m and retire its process-local state."""
+    _display_distance_write(session, _DISPLAY_DISTANCE_RESET)
+    operator = session.get("operator")
+    token = session.get("modal_token")
+    _display_distance_unlink(session)
+    if request_modal_cancel and operator is not None and token is not None:
+        _lifecycle.modal_request_cancel(
+            operator=operator, token=token, reason="display-distance-ended"
+        )
+        _lifecycle.modal_schedule_terminal_event(
+            operator=operator, token=token, state=session
+        )
+    session["operator"] = None
+    session["modal_token"] = None
+
+
+def _display_distance_prune_sessions():
+    """Restore stale view records when a later activation observes them."""
+    for session in tuple(_runtime.display_distance_sessions.values()):
+        if not _display_distance_area_is_live(session):
+            _display_distance_end_session(session, request_modal_cancel=True)
+
+
+def _display_distance_cancel_all(*_args):
+    """Restore active display-distance sessions during load or add-on teardown."""
+    for session in tuple(_runtime.display_distance_sessions.values()):
+        _display_distance_end_session(session, request_modal_cancel=True)
+
+
+@persistent
+def _display_distance_save_pre(*_args):
+    """Keep the temporary working distance out of the saved screen state."""
+    for session in tuple(_runtime.display_distance_sessions.values()):
+        if session.get("save_pending"):
+            continue
+        try:
+            current = _display_distance_clamp(session["space"].clip_end)
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            current = _display_distance_clamp(session.get("value"))
+        session["save_value"] = current
+        session["save_pending"] = True
+        _display_distance_write(session, _DISPLAY_DISTANCE_RESET)
+
+
+def _display_distance_restore_after_save(session):
+    if not session.get("save_pending"):
+        return
+    value = session.pop("save_value", session.get("value", _DISPLAY_DISTANCE_INITIAL))
+    if session.get("active"):
+        _display_distance_write(session, value)
+    session["save_pending"] = False
+
+
+@persistent
+def _display_distance_save_post(*_args):
+    for session in tuple(_runtime.display_distance_sessions.values()):
+        _display_distance_restore_after_save(session)
+
+
+@persistent
+def _display_distance_load_pre(*_args):
+    _display_distance_cancel_all()
+
+
 class VIEW3D_OT_mesh_focus_display_distance_toggle(bpy.types.Operator):
-    """Toggle the current 3D View's far clipping distance."""
+    """Adjust this View3D's far clipping distance, then keep it for work."""
 
     bl_idname = "view3d.mesh_focus_display_distance_toggle"
-    bl_label = "Mesh Focus: Toggle Display Distance"
-    bl_description = "Switch this 3D View's far clip between 0.13 m and 1000 m"
+    bl_label = "Mesh Focus: Adjust Display Distance"
+    bl_description = (
+        "Wheel-adjust this View3D's far clip, click or press Enter to keep it, "
+        "then press again to restore 1000 m"
+    )
 
     @classmethod
     def poll(cls, context):
@@ -309,24 +486,152 @@ class VIEW3D_OT_mesh_focus_display_distance_toggle(bpy.types.Operator):
             and hasattr(context.space_data, "clip_end")
         )
 
-    def execute(self, context):
+    def _terminal(self, status):
+        token = getattr(self, "_display_distance_modal_token", None)
+        _lifecycle.modal_terminal(
+            operator=self,
+            token=token,
+            status="FINISHED" if status == "FINISHED" else "CANCELLED",
+        )
+        self._display_distance_modal_token = None
+        self._display_distance_session = None
+        return {status}
+
+    def invoke(self, context, event):
         if not self.poll(context):
             return {"CANCELLED"}
+
+        _display_distance_prune_sessions()
         space = context.space_data
-        try:
-            current = float(space.clip_end)
-            target = 1000.0 if abs(current - 0.13) <= 1.0e-6 else 0.13
-            space.clip_end = target
-        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError) as error:
+        key = _display_distance_pointer(space)
+        existing = _runtime.display_distance_sessions.get(key)
+        if existing is not None:
+            _display_distance_end_session(
+                existing,
+                request_modal_cancel=existing.get("phase") == "adjusting",
+            )
+            context.area.tag_redraw()
             self.report(
-                {"WARNING"},
-                f"Display distance: could not update View3D ({error})",
+                {"INFO"}, "Display distance: far clip = 1000 m (restored)"
+            )
+            return {"FINISHED"}
+
+        session = {
+            "space": space,
+            "space_pointer": key,
+            "area": context.area,
+            "area_pointer": _display_distance_pointer(context.area),
+            "screen": context.screen,
+            "phase": "adjusting",
+            "active": True,
+            "value": _DISPLAY_DISTANCE_INITIAL,
+            "save_pending": False,
+            "operator": self,
+            "modal_token": None,
+        }
+        _runtime.display_distance_sessions[key] = session
+        if not _display_distance_write(session, _DISPLAY_DISTANCE_INITIAL):
+            _display_distance_unlink(session)
+            self.report({"WARNING"}, "Display distance: could not update View3D")
+            return {"CANCELLED"}
+
+        self._display_distance_session = session
+        try:
+            self._display_distance_modal_token = _lifecycle.modal_register(
+                self, "Display Distance", state=session
+            )
+            context.window_manager.modal_handler_add(self)
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError) as error:
+            _display_distance_end_session(session)
+            self._terminal("CANCELLED")
+            self.report(
+                {"WARNING"}, f"Display distance: could not start adjustment ({error})"
             )
             return {"CANCELLED"}
 
-        context.area.tag_redraw()
-        self.report({"INFO"}, f"Display distance: far clip = {target:g} m")
-        return {"FINISHED"}
+        self.report(
+            {"INFO"},
+            "Display distance: 0.13 m | wheel adjusts, click/Enter keeps, Esc/right-click resets",
+        )
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        return self.invoke(context, None)
+
+    def modal(self, context, event):
+        session = getattr(self, "_display_distance_session", None)
+        if session is None or not session.get("active"):
+            return self._terminal("CANCELLED")
+        _display_distance_restore_after_save(session)
+        if not _display_distance_area_is_live(session):
+            _display_distance_end_session(session)
+            return self._terminal("CANCELLED")
+
+        current_space = getattr(context, "space_data", None)
+        if (
+            current_space is None
+            or _display_distance_pointer(current_space) != session["space_pointer"]
+        ):
+            return {"PASS_THROUGH"}
+
+        event_type = getattr(event, "type", "")
+        event_value = getattr(event, "value", None)
+        if event_type == "V" and event_value in {None, "PRESS"}:
+            if (
+                bool(getattr(event, "shift", False))
+                and bool(getattr(event, "alt", False))
+                and not bool(getattr(event, "ctrl", False))
+            ):
+                _display_distance_end_session(session)
+                self.report(
+                    {"INFO"}, "Display distance: cancelled; far clip = 1000 m"
+                )
+                return self._terminal("FINISHED")
+
+        if event_type in {"ESC", "RIGHTMOUSE"} and event_value in {None, "PRESS"}:
+            _display_distance_end_session(session)
+            self.report({"INFO"}, "Display distance: cancelled; far clip = 1000 m")
+            return self._terminal("CANCELLED")
+
+        if event_type in {"LEFTMOUSE", "RET", "NUMPAD_ENTER"} and event_value in {
+            None,
+            "PRESS",
+        }:
+            try:
+                value = _display_distance_clamp(session["space"].clip_end)
+            except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+                value = _display_distance_clamp(session.get("value"))
+            _display_distance_write(session, value)
+            session["phase"] = "working"
+            session["operator"] = None
+            session["modal_token"] = None
+            self.report(
+                {"INFO"},
+                f"Display distance kept at {value:g} m; Shift+Alt+V restores 1000 m",
+            )
+            return self._terminal("FINISHED")
+
+        if event_type in {"WHEELUPMOUSE", "WHEELDOWNMOUSE"} and event_value in {
+            None,
+            "PRESS",
+        }:
+            value = _display_distance_clamp(session.get("value"))
+            factor = (
+                _DISPLAY_DISTANCE_STEP
+                if event_type == "WHEELUPMOUSE"
+                else 1.0 / _DISPLAY_DISTANCE_STEP
+            )
+            value = _display_distance_clamp(value * factor)
+            if not _display_distance_write(session, value):
+                _display_distance_end_session(session)
+                return self._terminal("CANCELLED")
+            self.report(
+                {"INFO"},
+                f"Display distance: {value:g} m | wheel adjusts, click/Enter keeps, Esc/right-click resets",
+            )
+            return {"RUNNING_MODAL"}
+
+        return {"PASS_THROUGH"}
 
 
 def _fill_preview_shadow_pair_signal(state, local, pair_index, with_reason=False):

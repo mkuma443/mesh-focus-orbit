@@ -166,6 +166,10 @@ from .tube_shape import (
     _tube_preview_request_cancel,
 )
 from .smart_fill.preview import (
+    _display_distance_cancel_all,
+    _display_distance_load_pre,
+    _display_distance_save_post,
+    _display_distance_save_pre,
     VIEW3D_OT_mesh_focus_display_distance_toggle,
     VIEW3D_OT_mesh_focus_shadow_analysis_toggle,
 )
@@ -1347,13 +1351,229 @@ def _open_boundary_loop_from_seed(seed_edge, *, max_edges=75_000, time_limit=0.3
     return None, "No closed opening boundary contains the selected edge"
 
 
+_OPEN_BOUNDARY_LOOP_REPEAT_TOKEN = None
+
+
+def _open_boundary_loop_clear_repeat_token(*_args):
+    """Forget the process-local arc toggle after state-restoring operations."""
+    global _OPEN_BOUNDARY_LOOP_REPEAT_TOKEN
+    _OPEN_BOUNDARY_LOOP_REPEAT_TOKEN = None
+
+
+def _open_boundary_loop_edge_order_key(edge):
+    """Return a stable tie-break key for one live BMesh edge."""
+    try:
+        index = int(edge.index)
+    except (AttributeError, ReferenceError, TypeError, ValueError):
+        index = -1
+    if index >= 0:
+        return (0, index)
+    try:
+        pointer = int(edge.as_pointer())
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        pointer = id(edge)
+    return (1, pointer)
+
+
+def _open_boundary_loop_ordered_cycle(loop_edges, first_edge):
+    """Order a proven simple cycle without revisiting the boundary graph."""
+    if first_edge not in loop_edges or len(loop_edges) < 3:
+        return None
+    incident = {}
+    for edge in loop_edges:
+        if len(edge.verts) != 2:
+            return None
+        for vert in edge.verts:
+            incident.setdefault(vert, []).append(edge)
+    if any(len(edges) != 2 for edges in incident.values()):
+        return None
+    start = first_edge.verts[0]
+    current = first_edge.verts[1]
+    ordered = [first_edge]
+    visited_edges = {first_edge}
+    previous = first_edge
+    while current is not start and len(ordered) <= len(loop_edges):
+        next_edges = [edge for edge in incident.get(current, ()) if edge is not previous]
+        if len(next_edges) != 1:
+            return None
+        edge = next_edges[0]
+        if edge in visited_edges:
+            return None
+        ordered.append(edge)
+        visited_edges.add(edge)
+        current = edge.verts[1] if edge.verts[0] is current else edge.verts[0]
+        previous = edge
+    if current is not start or len(ordered) != len(loop_edges):
+        return None
+    if visited_edges != loop_edges:
+        return None
+    return tuple(ordered)
+
+
+def _open_boundary_loop_arc_options(loop_edges, anchor_edges, edge_length):
+    """Return the shorter and longer inclusive arcs between two rim edges."""
+    if len(anchor_edges) != 2:
+        return None, None, None, "Select exactly two distinct opening edges"
+    first_edge, second_edge = sorted(anchor_edges, key=_open_boundary_loop_edge_order_key)
+    if first_edge not in loop_edges or second_edge not in loop_edges:
+        return None, None, None, "Selected edges are not on the same unique opening loop"
+    ordered = _open_boundary_loop_ordered_cycle(loop_edges, first_edge)
+    if ordered is None:
+        return None, None, None, "Opening boundary is not one continuous closed loop"
+    try:
+        second_index = ordered.index(second_edge)
+    except ValueError:
+        return None, None, None, "Selected edges are not on the same unique opening loop"
+    if second_index <= 0:
+        return None, None, None, "Select two distinct opening edges"
+
+    first_arc = tuple(ordered[:second_index + 1])
+    second_arc = (ordered[0],) + tuple(ordered[second_index:])
+    try:
+        first_length = sum(float(edge_length(edge)) for edge in first_arc)
+        second_length = sum(float(edge_length(edge)) for edge in second_arc)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError, OverflowError):
+        return None, None, None, "Could not measure the opening boundary edges"
+    if not math.isfinite(first_length) or not math.isfinite(second_length):
+        return None, None, None, "Could not measure the opening boundary edges"
+
+    lengths_equal = math.isclose(
+        first_length, second_length, rel_tol=1.0e-9, abs_tol=1.0e-12
+    )
+    if first_length < second_length and not lengths_equal:
+        short_arc, long_arc = first_arc, second_arc
+    elif second_length < first_length and not lengths_equal:
+        short_arc, long_arc = second_arc, first_arc
+    else:
+        first_key = tuple(sorted(_open_boundary_loop_edge_order_key(edge)
+                                 for edge in first_arc))
+        second_key = tuple(sorted(_open_boundary_loop_edge_order_key(edge)
+                                  for edge in second_arc))
+        if first_key <= second_key:
+            short_arc, long_arc = first_arc, second_arc
+        else:
+            short_arc, long_arc = second_arc, first_arc
+    return short_arc, long_arc, ordered, ""
+
+
+def _open_boundary_loop_identity(value):
+    try:
+        return int(value.as_pointer())
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return id(value)
+
+
+def _open_boundary_loop_state_signature(bm, obj, ordered_edges):
+    """Fingerprint only the chosen ring, its local visibility and its owner."""
+    matrix = getattr(obj, "matrix_world", ())
+    try:
+        matrix_signature = tuple(
+            tuple(float(component) for component in row) for row in matrix
+        )
+    except (TypeError, ValueError):
+        matrix_signature = ()
+    ring_signature = tuple(
+        (
+            edge,
+            bool(edge.hide),
+            tuple(
+                (vert, tuple(float(component) for component in getattr(vert, "co", ())))
+                for vert in edge.verts
+            ),
+            tuple(
+                (face, bool(face.hide), tuple(getattr(face, "verts", ())))
+                for face in edge.link_faces
+            ),
+        )
+        for edge in ordered_edges
+    )
+    mesh = obj.data
+    counts = (len(bm.verts), len(bm.edges), len(bm.faces))
+    return (
+        _open_boundary_loop_identity(obj),
+        _open_boundary_loop_identity(mesh),
+        counts,
+        matrix_signature,
+        ring_signature,
+    )
+
+
+def _open_boundary_loop_repeat_edges(token, bm, obj, selected_edges):
+    """Use a repeat token only while its exact output and ring remain live."""
+    if not isinstance(token, dict):
+        return None
+    try:
+        if frozenset(selected_edges) != token["output_edges"]:
+            return None
+        if frozenset(token["anchors"]) - frozenset(token["loop_edges"]):
+            return None
+        if frozenset(token["alternate_edges"]) - frozenset(token["loop_edges"]):
+            return None
+        signature = _open_boundary_loop_state_signature(bm, obj, token["loop_edges"])
+        if signature != token["state_signature"]:
+            return None
+        anchors = tuple(sorted(
+            token["anchors"], key=_open_boundary_loop_edge_order_key
+        ))
+        if len(anchors) != 2:
+            return None
+        current_loop, reason = _open_boundary_loop_from_seed(anchors[0])
+        if current_loop is None or frozenset(current_loop) != frozenset(token["loop_edges"]):
+            return None
+        return frozenset(token["alternate_edges"])
+    except (AttributeError, KeyError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _open_boundary_loop_resolve_selection(bm, obj, selected_edges, token, edge_length):
+    """Resolve a fresh one/two-edge input or alternate a valid two-edge token."""
+    selected_edges = tuple(selected_edges)
+    repeated_edges = _open_boundary_loop_repeat_edges(token, bm, obj, selected_edges)
+    if repeated_edges is not None:
+        next_token = dict(token)
+        next_token["output_edges"] = repeated_edges
+        next_token["alternate_edges"] = frozenset(token["output_edges"])
+        return repeated_edges, next_token, ""
+
+    if len(selected_edges) == 1:
+        loop_edges, reason = _open_boundary_loop_from_seed(selected_edges[0])
+        if loop_edges is None:
+            return None, None, reason
+        return frozenset(loop_edges), None, ""
+    if len(selected_edges) != 2 or selected_edges[0] is selected_edges[1]:
+        return None, None, "Select one or two visible opening edges"
+
+    anchors = tuple(sorted(selected_edges, key=_open_boundary_loop_edge_order_key))
+    loop_edges, reason = _open_boundary_loop_from_seed(anchors[0])
+    if loop_edges is None:
+        return None, None, reason
+    short_arc, long_arc, ordered, reason = _open_boundary_loop_arc_options(
+        loop_edges, anchors, edge_length
+    )
+    if short_arc is None:
+        return None, None, reason
+    next_token = {
+        "anchors": frozenset(anchors),
+        "loop_edges": ordered,
+        "output_edges": frozenset(short_arc),
+        "alternate_edges": frozenset(long_arc),
+        "state_signature": _open_boundary_loop_state_signature(bm, obj, ordered),
+    }
+    return frozenset(short_arc), next_token, ""
+
+
+@persistent
+def _open_boundary_loop_invalidate_repeat_token(*_args):
+    _open_boundary_loop_clear_repeat_token()
+
+
 class MESH_OT_mesh_focus_select_open_boundary_loop(bpy.types.Operator):
-    """Select the complete opening loop containing the active boundary edge."""
+    """Select one opening loop or the arc between two selected rim edges."""
 
     bl_idname = OPEN_BOUNDARY_LOOP_OPERATOR_ID
     bl_label = "Select Opening Boundary Loop"
     bl_description = (
-        "Select the complete closed opening boundary containing the active edge"
+        "Select an opening loop, or the shorter arc between two selected rim edges"
     )
     bl_options = {"REGISTER", "UNDO"}
 
@@ -1368,22 +1588,31 @@ class MESH_OT_mesh_focus_select_open_boundary_loop(bpy.types.Operator):
 
     def execute(self, context):
         if not self.poll(context):
+            _open_boundary_loop_clear_repeat_token()
             return {"CANCELLED"}
+        global _OPEN_BOUNDARY_LOOP_REPEAT_TOKEN
         obj = context.edit_object
         try:
             bm = bmesh.from_edit_mesh(obj.data)
-            active = bm.select_history.active
-            seed_edge = active if isinstance(active, bmesh.types.BMEdge) else None
-            if seed_edge is None:
-                selected_opening_edges = [
-                    edge
-                    for edge in bm.edges
-                    if edge.select and not edge.hide and edge.link_faces
-                ]
-                if len(selected_opening_edges) == 1:
-                    seed_edge = selected_opening_edges[0]
-            loop_edges, reason = _open_boundary_loop_from_seed(seed_edge)
-            if loop_edges is None:
+            selected_opening_edges = tuple(
+                edge for edge in bm.edges if edge.select and not edge.hide
+            )
+
+            def world_edge_length(edge):
+                matrix = obj.matrix_world
+                first = matrix @ edge.verts[0].co
+                second = matrix @ edge.verts[1].co
+                return (first - second).length
+
+            result_edges, next_token, reason = _open_boundary_loop_resolve_selection(
+                bm,
+                obj,
+                selected_opening_edges,
+                _OPEN_BOUNDARY_LOOP_REPEAT_TOKEN,
+                world_edge_length,
+            )
+            if result_edges is None:
+                _open_boundary_loop_clear_repeat_token()
                 self.report({"WARNING"}, reason)
                 return {"CANCELLED"}
 
@@ -1396,19 +1625,24 @@ class MESH_OT_mesh_focus_select_open_boundary_loop(bpy.types.Operator):
             for vert in bm.verts:
                 if vert.select:
                     vert.select_set(False)
-            for edge in loop_edges:
+            for edge in result_edges:
                 edge.select_set(True)
             bm.select_history.clear()
-            bm.select_history.add(seed_edge)
+            anchor = next(
+                (edge for edge in selected_opening_edges if edge in result_edges),
+                next(iter(result_edges)),
+            )
+            bm.select_history.add(anchor)
             context.tool_settings.mesh_select_mode = (False, True, False)
             bmesh.update_edit_mesh(
                 obj.data,
                 loop_triangles=False,
                 destructive=False,
             )
+            _OPEN_BOUNDARY_LOOP_REPEAT_TOKEN = next_token
             self.report(
                 {"INFO"},
-                f"Selected opening boundary: {len(loop_edges)} edges",
+                f"Selected opening boundary segment: {len(result_edges)} edges",
             )
             return {"FINISHED"}
         except (
@@ -1418,6 +1652,7 @@ class MESH_OT_mesh_focus_select_open_boundary_loop(bpy.types.Operator):
             TypeError,
             ValueError,
         ) as error:
+            _open_boundary_loop_clear_repeat_token()
             self.report({"WARNING"}, f"Opening boundary selection failed: {error}")
             return {"CANCELLED"}
 
@@ -2272,6 +2507,12 @@ def _remove_registered_handlers():
     specs = (
         (bpy.app.handlers.load_pre, _on_load_pre),
         (bpy.app.handlers.load_post, _on_load_post),
+        (bpy.app.handlers.load_pre, _display_distance_load_pre),
+        (bpy.app.handlers.save_pre, _display_distance_save_pre),
+        (bpy.app.handlers.save_post, _display_distance_save_post),
+        (bpy.app.handlers.load_pre, _open_boundary_loop_invalidate_repeat_token),
+        (bpy.app.handlers.undo_post, _open_boundary_loop_invalidate_repeat_token),
+        (bpy.app.handlers.redo_post, _open_boundary_loop_invalidate_repeat_token),
         (bpy.app.handlers.undo_post, _on_undo_post),
         (bpy.app.handlers.redo_post, _on_fill_preview_redo_post),
         (bpy.app.handlers.depsgraph_update_post, _on_topology_color_depsgraph_update),
@@ -2294,6 +2535,9 @@ def _remove_registered_handlers():
         (bpy.app.handlers.load_pre, _on_local_feature_brush_load_pre),
         (bpy.app.handlers.load_post, _on_local_feature_brush_load_post),
     )
+    save_post_fail_handlers = getattr(bpy.app.handlers, "save_post_fail", None)
+    if save_post_fail_handlers is not None:
+        specs += ((save_post_fail_handlers, _display_distance_save_post),)
     return _lifecycle.remove_registered_handlers(specs)
 
 
@@ -2326,6 +2570,13 @@ def register():
         bpy.app.handlers.load_pre.append(_on_load_pre)
     if _on_load_post not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_on_load_post)
+    for handlers in (
+        bpy.app.handlers.load_pre,
+        bpy.app.handlers.undo_post,
+        bpy.app.handlers.redo_post,
+    ):
+        if _open_boundary_loop_invalidate_repeat_token not in handlers:
+            handlers.append(_open_boundary_loop_invalidate_repeat_token)
     if _on_undo_post not in bpy.app.handlers.undo_post:
         bpy.app.handlers.undo_post.append(_on_undo_post)
     if _on_fill_preview_redo_post not in bpy.app.handlers.redo_post:
@@ -2370,6 +2621,18 @@ def register():
         bpy.app.handlers.load_pre.append(_on_local_feature_brush_load_pre)
     if _on_local_feature_brush_load_post not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_on_local_feature_brush_load_post)
+    if _display_distance_load_pre not in bpy.app.handlers.load_pre:
+        bpy.app.handlers.load_pre.append(_display_distance_load_pre)
+    if _display_distance_save_pre not in bpy.app.handlers.save_pre:
+        bpy.app.handlers.save_pre.append(_display_distance_save_pre)
+    if _display_distance_save_post not in bpy.app.handlers.save_post:
+        bpy.app.handlers.save_post.append(_display_distance_save_post)
+    save_post_fail_handlers = getattr(bpy.app.handlers, "save_post_fail", None)
+    if (
+        save_post_fail_handlers is not None
+        and _display_distance_save_post not in save_post_fail_handlers
+    ):
+        save_post_fail_handlers.append(_display_distance_save_post)
     _rebuild_keymaps()
 
 
@@ -2436,6 +2699,8 @@ def _fill_preview_invoke_failure_checkpoint(stage):
 
 
 def unregister():
+    _display_distance_cancel_all()
+    _open_boundary_loop_clear_repeat_token()
     _runtime.fill_preview_reload_blocked = False
     _runtime.fill_preview_reload_warning = ""
     # A public unregister cannot remove a Python modal handler.  Mark its

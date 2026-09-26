@@ -7,6 +7,7 @@ session state.
 
 addon_keymaps = []
 shadow_analysis_view_tokens = {}
+display_distance_sessions = {}
 active_states = {}
 last_tap_times = {}
 session_cleanup_areas = set()
