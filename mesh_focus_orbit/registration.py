@@ -31,6 +31,7 @@ from mathutils.bvhtree import BVHTree
 
 from .config import (
     FACE_SET_ACTIVATION_OPERATOR_ID,
+    EXPOSED_BACKFACE_SELECT_OPERATOR_ID,
     FILL_PREVIEW_TERMINAL_DELTA_FACE_THRESHOLD,
     FILL_PREVIEW_TERMINAL_GROWTH_STAGES,
     FILL_PREVIEW_TERMINAL_MAX_RADIUS_FACTOR,
@@ -149,6 +150,7 @@ from .guided_ridge.core import (
     _vertex_paint_geometry_compatibility,
     _vertex_paint_sample_color,
 )
+from .backface_select import VIEW3D_OT_mesh_focus_select_exposed_backface
 from .local_feature import (
     VIEW3D_OT_mesh_focus_local_feature_brush,
     VIEW3D_OT_mesh_focus_local_feature_brush_stroke,
@@ -1932,6 +1934,9 @@ _MFO_ICON_GUIDED_RIDGE = _mfo_toolbar_icon(
     "mfo-guided-ridge", "ops.sculpt.border_mask"
 )
 _MFO_ICON_TUBE = _mfo_toolbar_icon("mfo-tube-shape", "ops.sculpt.box_trim")
+_MFO_ICON_BACKFACE_SELECT = _mfo_toolbar_icon(
+    "mfo-select-back-faces", "ops.generic.select_box"
+)
 
 
 class VIEW3D_WST_mesh_focus_normal_object(bpy.types.WorkSpaceTool):
@@ -2030,6 +2035,16 @@ class VIEW3D_WST_mesh_focus_tube_sculpt(bpy.types.WorkSpaceTool):
     bl_keymap = ((TUBE_SHAPE_OPERATOR_ID, {"type": "LEFTMOUSE", "value": "PRESS"}, {}),)
 
 
+class VIEW3D_WST_mesh_focus_backface_select_edit(bpy.types.WorkSpaceTool):
+    bl_idname = "mfo.backface_select_edit"
+    bl_label = "MFO: Select Back Faces"
+    bl_description = "Click a damaged surface or nearby rim to select local back faces"
+    bl_space_type = "VIEW_3D"
+    bl_context_mode = "EDIT_MESH"
+    bl_icon = _MFO_ICON_BACKFACE_SELECT
+    bl_keymap = ((EXPOSED_BACKFACE_SELECT_OPERATOR_ID, {"type": "LEFTMOUSE", "value": "PRESS"}, {}),)
+
+
 _TOOL_CLASSES = (
     VIEW3D_WST_mesh_focus_normal_object,
     VIEW3D_WST_mesh_focus_normal_edit,
@@ -2040,6 +2055,7 @@ _TOOL_CLASSES = (
     VIEW3D_WST_mesh_focus_smart_fill_vertex,
     VIEW3D_WST_mesh_focus_guided_ridge_sculpt,
     VIEW3D_WST_mesh_focus_tube_sculpt,
+    VIEW3D_WST_mesh_focus_backface_select_edit,
 )
 _MFO_TOOL_CONTEXT_LABELS = {
     "OBJECT": "Object",
@@ -2056,7 +2072,7 @@ _MFO_TOOL_KEYMAP_NAMES = frozenset(
         label=str(tool_cls.bl_label),
     )
     for tool_cls in _TOOL_CLASSES
-)
+) | {"3D View Tool: Sculpt, MFO: Select Back Faces"}
 
 
 def _remove_stale_tool_keymaps():
@@ -2067,8 +2083,8 @@ def _remove_stale_tool_keymaps():
     so empty or partial ``3D View Tool: ..., MFO: ...`` keymaps can survive.
     They are owned exclusively by this add-on and are safe to rebuild before
     registering the current tool classes.  Match only the exact names Blender
-    generates from the current mode and tool labels so an unrelated add-on's
-    similarly named keymap is not swept up.
+    generates from the current mode and tool labels, plus the exact retired
+    Sculpt binding for Select Back Faces.
     """
     try:
         keyconfigs = bpy.context.window_manager.keyconfigs
@@ -2485,6 +2501,7 @@ class MESH_FOCUS_ORBIT_AddonPreferences(bpy.types.AddonPreferences):
 
 
 CLASSES = (
+    VIEW3D_OT_mesh_focus_select_exposed_backface,
     VIEW3D_OT_mesh_focus_orbit_recover_face_set_state,
     VIEW3D_OT_mesh_focus_orbit_watcher,
     VIEW3D_OT_mesh_focus_orbit_tool,

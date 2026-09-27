@@ -15,7 +15,7 @@ import types
 bl_info = {
     "name": "Mesh Focus Orbit",
     "author": "OpenAI",
-    "version": (3, 4, 21),
+    "version": (3, 4, 28),
     "blender": (5, 2, 0),
     "location": "3D View",
     "description": "Mesh-centered orbit, Face Set tools, Smart Fill, and Guided Ridge",
@@ -40,6 +40,7 @@ def _load_components():
         "foundation",
         "guided_ridge.curve_sculpt",
         "guided_ridge.core",
+        "backface_select",
         "local_feature",
         # Pure Smart Fill policy helpers must reload before geometry/preview;
         # those modules import their functions by name during a root reload.

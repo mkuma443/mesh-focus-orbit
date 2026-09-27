@@ -1,10 +1,10 @@
 # Mesh Focus Orbit
 
-Current source version: 3.4.21.
+Current source version: 3.4.28.
 
 Blender 5.2 用のリトポロジー支援アドオンです。
 
-アドオンバージョン: **3.4.21**
+アドオンバージョン: **3.4.28**
 
 ## 主な機能
 
@@ -16,6 +16,7 @@ Blender 5.2 用のリトポロジー支援アドオンです。
 - **表示距離集中**: `Shift + Alt + V` で対象 View3D の遠方クリップを 0.13 m と 1000 m の間で切り替えます。
 - **Opening Boundary Loop**: Edit Modeで開口部の辺を1本選択し、`Shift + Alt + L`で同じ開口部の閉じた縁を一周選択します。
 - **Topology Colors**: Edit Mode の選択面に 1〜6 の半透明ガイド色を保存します。
+- **Exposed Back Face Select**: Edit Mode の T ツールで崩れた面や穴の縁をクリックし、そこから連結した近傍の裏向き面と根元を選択します。穴越しに見える遠い裏面を避け、処理中は進捗を表示します。形状は変更しません。
 - **Curved Face Set Tube Shape**: 曲がった Face Set チューブを局所断面に沿って均一化または先細り補正します。
 
 ## インストール
@@ -28,7 +29,7 @@ Blender 5.2 用のリトポロジー支援アドオンです。
 
 アドオンはユーザー設定以外のシーンを自動保存しません。Reference Object は FSMFO 専用です。通常 MFO は現在の View3D で表示中の MESH 群を中央レイで調べ、最前面の hit を対象にします。Guided Ridge は現在のアクティブな MESH を対象にします。
 
-Tツールバーは、編集可能なAstra Blenderソースから生成した5種のBlender VCO `.dat` ジオメトリアイコンを使用します。`assets/mfo-toolbar-icons-astra/` をアドオンの相対パスへ保持してください。欠落時は機能ごとにBlender標準アイコンへ安全にフォールバックします。
+Tツールバーは、Astraが作成した6種のBlender VCO `.dat` ジオメトリアイコンを使用します。既存5種の編集用Blenderソースに加え、裏面選択用の生成元は `work/astra-icon-modeling/generate_backface_icon.py` です。裏面選択は灰色のメッシュからめくれたオレンジの面と白い選択カーソルで示し、SVG・透過PNGも付属します。`assets/mfo-toolbar-icons-astra/` をアドオンの相対パスへ保持してください。欠落時は機能ごとにBlender標準アイコンへ安全にフォールバックします。
 
 内部実装は `mesh_focus_orbit/` パッケージへ分割されています。`foundation.py` が共有のBlender依存・基礎機能、`guided_ridge/core.py` がGuided Ridge、`local_feature.py` と `tube_shape.py` が補助機能、`smart_fill/geometry.py` と `smart_fill/preview.py` がSmart Fill/Vertex Paint、`registration.py` が登録・ツール・アイコンを担当します。`config.py` は不変設定、`runtime.py` は共有実行時状態、`lifecycle.py` は明示的な登録解除とcallback identity cleanupを担当します。`__init__.py` は依存順loaderと公開登録入口だけを持ち、既存のoperator ID・keymap・互換参照を意図的にre-exportします。配布時は単一pyへ平坦化せず、パッケージ内の全モジュールを含めてください。
 
@@ -47,6 +48,7 @@ Tツールバーは、編集可能なAstra Blenderソースから生成した5�
 | MFO Tツール | Object / Edit / Sculpt | Tツールで選択後、面を左クリック（Object/EditはCtrlでFace Set） | 同種入口を3D View region内で再クリックしてトグルOFF。Face Set ON中はFace Set入口を使う |
 | Smart Fill Tツール | Sculpt / Vertex Paint | ツールで選択後、面を左クリック（Ctrlで厳格） | 開始クリックを離した後、次のLMBで確定。以降は既存Smart Fillモーダルの操作 |
 | Guided Ridge / Tube Shape Tツール | Sculpt | ツールで選択後、対象面を左クリック（Guided Ridgeの最初のクリックは起点設定のみ） | Guided Ridgeは準備進捗を表示。準備完了後にLMBで点追加、`Enter`でCurve Previewへ。Preview中の`Enter`はPinch、`Ctrl+Enter`はCreaseを適用 |
+| Select Back Faces Tツール | Edit Mesh | ツールで選択後、崩れた面や穴の縁を左クリック | 連結した近傍の裏向き面と根元3列を選ぶ。進捗表示中は Esc で中止できる。Relaxや形状変更は行わない |
 | Guided Ridge | Sculpt | `Ctrl + G`。カーソル下の面を起点にし、LMBで点を追加、`Enter`でCurve Previewへ | Preview中はWheel/Shift+Wheelで平滑化、LMBはルート編集へ漏れず、`Backspace`で編集へ戻り、`Esc`/右クリックで取消。`Tab`/Scrape仕上げは後続Stepです |
 | Guided Ridge Repeat Last | Sculpt | Blender標準の `Shift + R` | 既存のRepeat Last互換経路。Curve Sculptの反復はPreview中に現在の曲線で`Enter`/`Ctrl+Enter`を使用します。標準Undo境界はBlender側が所有します |
 | Smart Fill | Sculpt / Vertex Paint | `E`、開始キーを離してから `E` または `Enter` | SculptはFace Set、Vertex Paintはアクティブ色属性。ホイールで距離、`Esc` で取消 |
@@ -208,6 +210,7 @@ The `MFO` tab in the right N-sidebar exposes `Reference Object` and compact dail
 | Normal MFO | Object / Edit / Sculpt | Press the configured Activation Key twice quickly | Press it twice again to leave |
 | Face Set MFO | Object / Edit | `Ctrl` + Activation Key twice quickly | Press the same combination again to leave |
 | MFO T-tool | Object / Edit / Sculpt | Select in T-toolbar, then left-click a surface (Ctrl uses Face Set in Object/Edit) | Re-click the same entry inside the 3D View region to toggle OFF; while Face Set is ON, use the Face Set entry |
+| Select Back Faces T-tool | Edit Mesh | Select in T-toolbar, then click a damaged surface or opening rim | Selects nearby connected back-facing faces and three root rings. Progress is shown; Esc cancels without deforming the mesh |
 | Smart Fill T-tool | Sculpt / Vertex Paint | Select in T-toolbar, then left-click (Ctrl for strict) | Release the start click, then use the next LMB to confirm; existing Smart Fill modal controls apply afterward |
 | Guided Ridge / Tube Shape T-tools | Sculpt | Select in T-toolbar, then left-click a target surface (the first Guided Ridge click only sets the start point) | Guided Ridge shows preparation progress; after Ready, LMB adds points and `Enter` opens Curve Preview. In Preview, `Enter` applies Pinch Ridge and `Ctrl + Enter` applies Crease Polish Valley |
 | Guided Ridge | Sculpt | `Ctrl + G`; the cursor hit starts the guide, LMB adds points, `Enter` opens Curve Preview | In Preview, Wheel/Shift+Wheel changes shape, LMB is consumed, `Enter` applies Pinch, `Ctrl + Enter` applies Crease, `Backspace` returns to editing, and `Esc`/right click cleans up. Tab/Scrape finishing is a later step |
