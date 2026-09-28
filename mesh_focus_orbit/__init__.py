@@ -15,7 +15,7 @@ import types
 bl_info = {
     "name": "Mesh Focus Orbit",
     "author": "OpenAI",
-    "version": (3, 4, 28),
+    "version": (3, 4, 32),
     "blender": (5, 2, 0),
     "location": "3D View",
     "description": "Mesh-centered orbit, Face Set tools, Smart Fill, and Guided Ridge",
@@ -42,6 +42,7 @@ def _load_components():
         "guided_ridge.core",
         "backface_select",
         "local_feature",
+        "local_remesh",
         # Pure Smart Fill policy helpers must reload before geometry/preview;
         # those modules import their functions by name during a root reload.
         "smart_fill.invariants",
@@ -134,6 +135,7 @@ foundation = _loaded["foundation"]
 guided_ridge_curve_sculpt = _loaded["guided_ridge.curve_sculpt"]
 guided_ridge = _loaded["guided_ridge.core"]
 local_feature = _loaded["local_feature"]
+local_remesh = _loaded["local_remesh"]
 tube_shape = _loaded["tube_shape"]
 smart_fill_geometry = _loaded["smart_fill.geometry"]
 smart_fill_preview = _loaded["smart_fill.preview"]
@@ -145,6 +147,7 @@ _MFO_COMPONENT_FILES = (
     "guided_ridge/curve_sculpt.py",
     "guided_ridge/core.py",
     "local_feature.py",
+    "local_remesh.py",
     "tube_shape.py",
     "smart_fill/geometry.py",
     "smart_fill/preview.py",
@@ -172,6 +175,7 @@ _COMPONENT_MODULES = (
     guided_ridge_curve_sculpt,
     foundation,
     local_feature,
+    local_remesh,
     tube_shape,
     smart_fill_geometry,
     smart_fill_preview,

@@ -79,6 +79,7 @@ _FILL_PREVIEW_WHEEL_DRAIN_SECONDS = FILL_PREVIEW_WHEEL_DRAIN_SECONDS
 from .smart_fill.invariants import make_mesh_global_identity_face_ids
 from . import lifecycle as _lifecycle
 from . import runtime as _runtime
+from .local_remesh import MESH_OT_mesh_focus_local_remesh
 from .smart_fill.invariants import (
     accepted_graph_rows_from_result,
     normal_cache_hit_allowed,
@@ -1899,6 +1900,8 @@ class VIEW3D_PT_mesh_focus_orbit_tools(bpy.types.Panel):
             layout.label(text="MFO: OFF", icon="X")
         layout.separator()
         layout.label(text="Tツール: クリックで対象面を指定")
+        if context.mode == "EDIT_MESH":
+            layout.operator("mesh.mesh_focus_local_remesh", text="Local Remesh")
         if context.mode in {"OBJECT", "EDIT_MESH"}:
             layout.label(text="Ctrl + クリック: Face Set (厳密)")
         elif context.mode == "SCULPT":
@@ -2516,6 +2519,7 @@ CLASSES = (
     VIEW3D_OT_mesh_focus_local_feature_brush,
     VIEW3D_OT_mesh_focus_local_feature_brush_stroke,
     MESH_OT_mesh_focus_select_open_boundary_loop,
+    MESH_OT_mesh_focus_local_remesh,
     VIEW3D_OT_mesh_focus_topology_color_assign,
     VIEW3D_PT_mesh_focus_local_feature_brush,
     VIEW3D_PT_mesh_focus_guided_ridge,
