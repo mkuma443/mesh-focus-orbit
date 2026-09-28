@@ -11099,7 +11099,6 @@ def _fill_preview_build_draw_batches(state, result):
     signature = state.get("signature")
     if (
         int(result.get("created_generation", -1)) != generation
-        or int(result.get("fill_draw_source_generation", -1)) != generation
         or result.get("fill_draw_source_signature") != signature
     ):
         return False

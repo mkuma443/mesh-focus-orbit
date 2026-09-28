@@ -1,10 +1,10 @@
 # Mesh Focus Orbit
 
-Current source version: 3.4.28.
+Current source version: 3.4.33.
 
 Blender 5.2 用のリトポロジー支援アドオンです。
 
-アドオンバージョン: **3.4.28**
+アドオンバージョン: **3.4.33**
 
 ## 主な機能
 

@@ -507,6 +507,172 @@ def test_full_terminal_frontier_result_reaches_draw_with_current_source_rows():
     assert (0.16, 1.0, 0.34, 0.95) in drawn_colors
 
 
+def test_cached_radius_revisit_draws_and_releases_current_generation_gates():
+    preview = _load_preview_module()
+    package_name = preview.__package__.split(".")[0]
+    registration = sys.modules[f"{package_name}.registration"]
+    graph = _fixture_graph()
+    signature = graph["signature"]
+
+    class _Area:
+        def as_pointer(self):
+            return 123
+
+    area = _Area()
+    runtime = preview._runtime
+    previous_state = runtime.fill_preview_state
+    previous_shader = runtime.fill_preview_shader
+    shader = mock.Mock()
+    batch = mock.Mock()
+    proxy = SimpleNamespace(
+        report=lambda *_args, **_kwargs: None,
+    )
+    modes = (
+        ("normal", False, False, ("progressive-range", 1.25)),
+        ("shift", False, True, ("expand-only", 1.25)),
+        ("ctrl", True, False, ("geometry-strict", 1.25)),
+    )
+
+    try:
+        with mock.patch.object(registration, "_fill_preview_valid", return_value=True):
+            with mock.patch.object(registration, "_fill_preview_tag_redraw"):
+                with mock.patch.object(
+                    registration,
+                    "_fill_preview_make_result",
+                    side_effect=AssertionError("a valid radius hit must not recompute"),
+                ):
+                    with mock.patch.object(
+                        registration, "_fill_preview_write_vertex_paint",
+                        return_value=((1, 1, "POINT"), None),
+                    ):
+                        with mock.patch.object(registration, "_fill_preview_cancel"):
+                            for _name, strict_mode, expand_only, cache_key in modes:
+                                cached = {
+                                    "radius": 1.25,
+                                    "faces": np.asarray([501], dtype=np.int32),
+                                    "candidate_count": 1,
+                                    "shape_segments": [],
+                                    "distance_segments": [],
+                                    "created_generation": 1,
+                                    "fill_draw_source_generation": 1,
+                                    "fill_draw_source_signature": signature,
+                                    "fill_draw_source_geometry": graph,
+                                    "fill_draw_source_face_ids": np.asarray(
+                                        [0], dtype=np.int32
+                                    ),
+                                    "confirm_geometry": graph,
+                                    "confirm_seed_local": 0,
+                                    "confirm_domain_ids": np.asarray(
+                                        [0], dtype=np.int32
+                                    ),
+                                    "confirm_signature": signature,
+                                    "compute_seconds": 0.001,
+                                }
+                                state = {
+                                    "active": True,
+                                    "phase": "compute",
+                                    "pending": True,
+                                    "generation": 2,
+                                    "drawn_generation": 1,
+                                    "signature": signature,
+                                    "strict_mode": strict_mode,
+                                    "expand_only": expand_only,
+                                    "initial_radius": 1.0,
+                                    "desired_radius": 1.25,
+                                    "processed_radius": 1.0,
+                                    "accepted_visible_ids": np.empty(0, dtype=np.int32),
+                                    "seed_face": 501,
+                                    "results": {cache_key: cached},
+                                    "result": {"radius": 1.0, "created_generation": 2},
+                                    "backend": "PAINT_VERTEX",
+                                    "obj": SimpleNamespace(),
+                                    "metrics": {"make_result_seconds": 0.0},
+                                    "last_tick_seconds": 0.0,
+                                    "max_tick_seconds": 0.0,
+                                    "area_key": 123,
+                                    "area": area,
+                                }
+
+                                assert registration.VIEW3D_OT_mesh_focus_local_face_set_grow._process_timer(
+                                    proxy, SimpleNamespace(), state
+                                )
+                                result = state["result"]
+                                assert result is not cached
+                                assert result["created_generation"] == 3
+                                assert result["fill_draw_source_generation"] == 1
+                                assert result["fill_draw_source_geometry"] is graph
+                                assert result["fill_draw_source_face_ids"] is cached[
+                                    "fill_draw_source_face_ids"
+                                ]
+                                assert result["progressive_range_cache_hit"] is True
+                                assert state["phase"] == "ready"
+                                assert state["pending"] is False
+
+                                if not strict_mode:
+                                    assert registration.VIEW3D_OT_mesh_focus_local_face_set_grow._finish_confirm(
+                                        proxy, SimpleNamespace(), state
+                                    ) == {"RUNNING_MODAL"}
+
+                                runtime.fill_preview_state = state
+                                runtime.fill_preview_shader = shader
+                                batch.reset_mock()
+                                with mock.patch.object(
+                                    preview,
+                                    "bpy",
+                                    SimpleNamespace(
+                                        context=SimpleNamespace(area=area)
+                                    ),
+                                ):
+                                    with mock.patch.object(
+                                        preview,
+                                        "gpu",
+                                        SimpleNamespace(state=mock.Mock()),
+                                    ):
+                                        with mock.patch.object(
+                                            preview,
+                                            "_fill_preview_shader_get",
+                                            return_value=shader,
+                                        ):
+                                            with mock.patch.object(
+                                                preview,
+                                                "batch_for_shader",
+                                                return_value=batch,
+                                            ) as build_batch:
+                                                preview._fill_preview_draw()
+
+                                assert state["drawn_generation"] == 3
+                                assert build_batch.call_count == 1
+                                assert batch.draw.call_count == 1
+                                assert registration.VIEW3D_OT_mesh_focus_local_face_set_grow._finish_confirm(
+                                    proxy, SimpleNamespace(), state
+                                ) == {"FINISHED"}
+
+                                wheel_state = dict(state)
+                                wheel_state.update({
+                                    "wheel_armed": True,
+                                    "wheel_gate": False,
+                                    "wheel_drain_until": 0.0,
+                                    "pending": False,
+                                    "phase": "ready",
+                                })
+                                with mock.patch.object(
+                                    preview, "_fill_preview_release_state_draw_caches"
+                                ):
+                                    with mock.patch.object(
+                                        preview, "_fill_preview_tag_redraw"
+                                    ):
+                                        assert preview._fill_preview_accept_normal_wheel(
+                                            wheel_state,
+                                            SimpleNamespace(type="WHEELUPMOUSE"),
+                                        )
+                                assert wheel_state["phase"] == "compute"
+                                assert wheel_state["pending"] is True
+                                assert wheel_state["desired_radius"] == 1.25 * 1.25
+    finally:
+        runtime.fill_preview_state = previous_state
+        runtime.fill_preview_shader = previous_shader
+
+
 def test_stale_generation_does_not_build_or_draw_batches():
     preview = _load_preview_module()
     graph = _fixture_graph()
@@ -541,8 +707,9 @@ def run():
     test_green_terminal_wheel_down_still_uses_normal_step()
     test_green_wheel_up_predicate_covers_strict_and_expand_only_modes()
     test_full_terminal_frontier_result_reaches_draw_with_current_source_rows()
+    test_cached_radius_revisit_draws_and_releases_current_generation_gates()
     test_stale_generation_does_not_build_or_draw_batches()
-    return {"passed": True, "fixtures": 14}
+    return {"passed": True, "fixtures": 15}
 
 
 if __name__ == "__main__":
