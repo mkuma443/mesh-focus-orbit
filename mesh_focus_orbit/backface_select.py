@@ -1,4 +1,4 @@
-"""Select local exposed back faces from a nearby edit-mesh click."""
+"""Select locally inverted faces from a nearby edit-mesh click."""
 
 from collections import deque
 from math import cos, sin, tau
@@ -64,12 +64,23 @@ def _include_root_faces(patch, *, rings=ROOT_RINGS):
     return selected
 
 
+def _local_inverted_faces(front_faces, back_faces, anchor):
+    """Choose the minority orientation so either viewing side finds the fold."""
+    if not front_faces or not back_faces:
+        return set()
+    if len(front_faces) < len(back_faces):
+        return front_faces
+    if len(back_faces) < len(front_faces):
+        return back_faces
+    return front_faces if anchor in front_faces else back_faces
+
+
 class VIEW3D_OT_mesh_focus_select_exposed_backface(bpy.types.Operator):
     """Select nearby inverted faces by clicking the damaged surface or its rim."""
 
     bl_idname = EXPOSED_BACKFACE_SELECT_OPERATOR_ID
     bl_label = "Select Exposed Back Faces"
-    bl_description = "Select local back-facing faces and roots from a nearby surface click"
+    bl_description = "Select locally inverted faces and roots from either viewing side"
     bl_options = {"REGISTER", "UNDO"}
 
     region_x: IntProperty(default=-1, options={"HIDDEN", "SKIP_SAVE"})
@@ -115,6 +126,10 @@ class VIEW3D_OT_mesh_focus_select_exposed_backface(bpy.types.Operator):
         self._workspace = context.workspace
         self._wm = context.window_manager
         self._coordinate = coordinate
+        addon = context.preferences.addons.get(__package__)
+        self._auto_relax = bool(
+            addon and getattr(addon.preferences, "backface_auto_relax", False)
+        )
         self._bm = None
         self._original_faces = set()
         self._original_history = ()
@@ -165,7 +180,8 @@ class VIEW3D_OT_mesh_focus_select_exposed_backface(bpy.types.Operator):
         self._local_direction = local_direction
         self._queue = deque([(face, 0)])
         self._visited = {face}
-        self._backfaces = set()
+        self._front_faces = set()
+        self._back_faces = set()
         self._max_depth = 0
         self._truncated = False
         self._phase = "TRACE"
@@ -213,7 +229,9 @@ class VIEW3D_OT_mesh_focus_select_exposed_backface(bpy.types.Operator):
             processed += 1
             self._max_depth = max(self._max_depth, depth)
             if face.normal.dot(self._local_direction) > 0.0:
-                self._backfaces.add(face)
+                self._back_faces.add(face)
+            else:
+                self._front_faces.add(face)
             if depth >= LOCAL_SEARCH_STEPS:
                 continue
             for edge in face.edges:
@@ -236,13 +254,16 @@ class VIEW3D_OT_mesh_focus_select_exposed_backface(bpy.types.Operator):
                 " (Esc to cancel)"
             )
             return {"RUNNING_MODAL"}
+        self._inverted_faces = _local_inverted_faces(
+            self._front_faces, self._back_faces, self._anchor
+        )
         self._phase = "SELECT"
         self._wm.progress_update(90)
         self._workspace.status_text_set("MFO: selecting nearby faces 90%")
         return {"RUNNING_MODAL"}
 
     def _select_step(self, context):
-        patch = self._backfaces or {self._anchor}
+        patch = self._inverted_faces or {self._anchor}
         selected = _include_root_faces(patch)
         self._selection_started = True
         with context.temp_override(area=self._area, region=self._region):
@@ -251,19 +272,51 @@ class VIEW3D_OT_mesh_focus_select_exposed_backface(bpy.types.Operator):
             face.select_set(True)
         self._bm.select_flush_mode()
         bmesh.update_edit_mesh(self._obj.data, loop_triangles=False, destructive=False)
-        self._wm.progress_update(100)
-        if self._backfaces:
+        if self._inverted_faces:
             message = (
                 f"MFO: selected {len(selected)} faces around "
-                f"{len(self._backfaces)} local back faces"
+                f"{len(self._inverted_faces)} locally inverted faces"
             )
         else:
-            message = f"MFO: no local back faces; selected {len(selected)} nearby faces"
+            message = f"MFO: no locally inverted faces; selected {len(selected)} nearby faces"
         if self._truncated:
             message += " (local search limit reached)"
+        if self._auto_relax:
+            self._selection_message = message
+            self._phase = "RELAX"
+            self._wm.progress_update(95)
+            self._workspace.status_text_set("MFO: applying LoopTools Relax 95%")
+            return {"RUNNING_MODAL"}
+        self._wm.progress_update(100)
         return self._finish(True, message)
 
-    def _finish(self, success, message):
+    def _relax_step(self, context):
+        message = self._selection_message
+        if context.active_object is not self._obj:
+            return self._finish(True, message + "; Relax skipped: active object changed", warning=True)
+        try:
+            with context.temp_override(area=self._area, region=self._region):
+                relax = bpy.ops.mesh.looptools_relax
+                relax.get_rna_type()
+                if not relax.poll():
+                    return self._finish(
+                        True, message + "; LoopTools Relax unavailable (selection kept)", warning=True
+                    )
+                outcome = relax(input="selected")
+        except Exception as error:
+            return self._finish(
+                True,
+                message + f"; LoopTools Relax failed: {error} (selection kept)",
+                warning=True,
+            )
+        if "FINISHED" not in outcome:
+            return self._finish(
+                True, message + "; LoopTools Relax did not finish (selection kept)", warning=True
+            )
+        self._wm.progress_update(100)
+        return self._finish(True, message + "; LoopTools Relax applied")
+
+    def _finish(self, success, message, *, warning=False):
         if not success and self._bm is not None:
             try:
                 if self._obj.mode == "EDIT":
@@ -294,7 +347,7 @@ class VIEW3D_OT_mesh_focus_select_exposed_backface(bpy.types.Operator):
             self._wm.progress_end()
             self._progress_started = False
         self._workspace.status_text_set(None)
-        self.report({"INFO"} if success else {"WARNING"}, message)
+        self.report({"WARNING"} if warning or not success else {"INFO"}, message)
         return {"FINISHED"} if success else {"CANCELLED"}
 
     def modal(self, context, event):
@@ -311,6 +364,8 @@ class VIEW3D_OT_mesh_focus_select_exposed_backface(bpy.types.Operator):
                 return self._probe_step(context)
             if self._phase == "TRACE":
                 return self._trace_step()
-            return self._select_step(context)
+            if self._phase == "SELECT":
+                return self._select_step(context)
+            return self._relax_step(context)
         except Exception as error:
             return self._finish(False, f"MFO: selection failed: {error}")

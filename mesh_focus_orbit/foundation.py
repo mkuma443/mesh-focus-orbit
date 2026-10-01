@@ -26,7 +26,7 @@ from bpy.app.handlers import persistent
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, PointerProperty
 from bpy_extras import view3d_utils
 from gpu_extras.batch import batch_for_shader
-from mathutils import Vector
+from mathutils import Matrix, Vector
 from mathutils.geometry import tessellate_polygon
 from mathutils.bvhtree import BVHTree
 
@@ -203,8 +203,19 @@ _topology_color_fallback_shader = None
 _TOPOLOGY_COLOR_DEPTH_VERTEX_SOURCE = """
 void main()
 {
-    vec4 clip = ModelViewProjectionMatrix * vec4(pos, 1.0);
-    clip.z -= depth_bias * clip.w;
+    vec4 view_pos = ModelViewMatrix * vec4(pos, 1.0);
+    vec4 clip = ProjectionMatrix * view_pos;
+    if (retopology_offset > 0.0) {
+        if (ProjectionMatrix[3][3] == 0.0) {
+            float offset = min(retopology_offset, -view_pos.z * 0.5);
+            clip.z += ProjectionMatrix[3][2]
+                * (offset / (view_pos.z * (view_pos.z + offset)))
+                * clip.w;
+        }
+        else {
+            clip.z += ProjectionMatrix[2][2] * retopology_offset * clip.w;
+        }
+    }
     gl_Position = clip;
 }
 """
@@ -5587,20 +5598,8 @@ def _topology_color_overlay_offset():
         return 0.0
 
 
-def _topology_color_depth_bias(overlay_offset):
-    """Map Blender's overlay setting to a small clip-space depth bias."""
-    try:
-        configured = max(0.0, float(overlay_offset))
-    except (TypeError, ValueError):
-        configured = 0.0
-    # Keep the same shared vertex positions for every face.  The configured
-    # retopology offset is a display-depth hint, so apply it in clip space and
-    # preserve clip X/Y/W rather than translating each face along its normal.
-    return max(1.0e-5, min(2.0e-2, configured + 1.0e-3))
-
-
 def _topology_color_depth_shader():
-    """Create one cached shader that biases only clip-space Z."""
+    """Create one cached shader matching Retopology overlay depth offset."""
     global _topology_color_depth_shader_cache
     if _topology_color_depth_shader_cache is not None:
         return _topology_color_depth_shader_cache
@@ -5608,8 +5607,9 @@ def _topology_color_depth_shader():
         from gpu.types import GPUShaderCreateInfo
 
         info = GPUShaderCreateInfo()
-        info.push_constant("MAT4", "ModelViewProjectionMatrix")
-        info.push_constant("FLOAT", "depth_bias")
+        info.push_constant("MAT4", "ModelViewMatrix")
+        info.push_constant("MAT4", "ProjectionMatrix")
+        info.push_constant("FLOAT", "retopology_offset")
         info.push_constant("VEC4", "color")
         info.vertex_in(0, "VEC3", "pos")
         info.fragment_out(0, "VEC4", "fragColor")
@@ -5656,24 +5656,549 @@ def _topology_color_batch(shader, primitive, vertices, custom_shader):
     return gpu.types.GPUBatch(type=primitive, buf=vertex_buffer)
 
 
-def _build_topology_color_cache(obj, overlay_offset=None):
+def _topology_color_canonical_cycle(vertex_slots):
+    """Normalize a face cycle's start slot without changing its winding."""
+    vertex_slots = tuple(vertex_slots)
+    if not vertex_slots:
+        return ()
+    start = min(range(len(vertex_slots)), key=vertex_slots.__getitem__)
+    return vertex_slots[start:] + vertex_slots[:start]
+
+
+def _topology_color_face_slots(face, expected_cycle, bm_vertices):
+    """Resolve a cached face cycle through BMesh sequence slots only."""
+    try:
+        face_vertices = tuple(face.verts)
+        if len(face_vertices) != len(expected_cycle):
+            return None
+        current_cycle = []
+        for vertex in face_vertices:
+            matched_slot = None
+            for slot in expected_cycle:
+                if slot < 0 or slot >= len(bm_vertices):
+                    return None
+                if bm_vertices[slot] == vertex:
+                    matched_slot = slot
+                    break
+            if matched_slot is None:
+                return None
+            current_cycle.append(matched_slot)
+        current_cycle = tuple(current_cycle)
+        if _topology_color_canonical_cycle(current_cycle) != tuple(expected_cycle):
+            return None
+        return current_cycle
+    except (AttributeError, IndexError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _topology_color_face_triangle_slots(
+    face,
+    face_vertex_slots,
+    coordinate_overrides=None,
+):
+    """Tessellate one colored face into copied BMesh sequence slots."""
+    try:
+        face_vertices = tuple(face.verts)
+        if len(face_vertices) != len(face_vertex_slots):
+            return None
+        if len(face_vertices) == 4:
+            # Match Blender's native fast quad tessellation in the original
+            # BMesh loop order. Keep the strict predicate so diagonal choice
+            # follows the same rule as the edit-mesh depth prepass.
+            if coordinate_overrides is None:
+                v0, v1, v2, v3 = face_vertices
+                coordinates = (v0.co, v1.co, v2.co, v3.co)
+            else:
+                coordinates = tuple(
+                    Vector(coordinate_overrides[slot])
+                    for slot in face_vertex_slots
+                )
+            v0, v1, v2, v3 = coordinates
+            a = v1 - v0
+            b = v2 - v0
+            c = v3 - v0
+            if a.cross(b).dot(c.cross(b)) > 0.0:
+                triangle_indices = ((0, 1, 3), (1, 2, 3))
+            else:
+                triangle_indices = ((0, 1, 2), (0, 2, 3))
+            return tuple(
+                tuple(face_vertex_slots[index] for index in triangle)
+                for triangle in triangle_indices
+            )
+        vertex_slots = {
+            vertex: slot
+            for vertex, slot in zip(face_vertices, face_vertex_slots)
+        }
+        try:
+            tessellation = face.calc_tessellation()
+            tessellation_vertices = None
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            tessellation_vertices = [
+                vertex.co.copy()
+                for vertex in face_vertices
+            ]
+            tessellation = tessellate_polygon([tessellation_vertices])
+
+        triangles = []
+        for triangle in tessellation:
+            if len(triangle) != 3:
+                continue
+            triangle_slots = []
+            for vertex in triangle:
+                if isinstance(vertex, int):
+                    if vertex < 0 or vertex >= len(face_vertex_slots):
+                        return None
+                    slot = face_vertex_slots[vertex]
+                else:
+                    slot = vertex_slots.get(vertex)
+                    if slot is None:
+                        return None
+                triangle_slots.append(slot)
+            triangles.append(tuple(triangle_slots))
+        return tuple(triangles)
+    except (AttributeError, IndexError, KeyError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _topology_color_cache_face_states(cache, bm):
+    """Check only copied colored faces, including hidden faces, for layout changes."""
+    if (
+        cache.get("vert_count") != len(bm.verts)
+        or cache.get("edge_count") != len(bm.edges)
+        or cache.get("face_count") != len(bm.faces)
+    ):
+        return None
+
+    layer = bm.faces.layers.int.get(TOPOLOGY_COLOR_ATTRIBUTE_NAME)
+    if bool(cache.get("topology_color_layer_present")) != (layer is not None):
+        return None
+    face_layout = cache.get("colored_face_layout")
+    if face_layout is None:
+        return None
+    if layer is None:
+        return [] if not face_layout else None
+
+    try:
+        bm.verts.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+        face_states = []
+        for record in face_layout:
+            face_slot = int(record["face_slot"])
+            if face_slot < 0 or face_slot >= len(bm.faces):
+                return None
+            face = bm.faces[face_slot]
+            if (
+                int(face[layer]) != record["color_index"]
+                or bool(face.hide) != record["hidden"]
+            ):
+                return None
+            face_vertex_slots = _topology_color_face_slots(
+                face,
+                record["vertex_cycle"],
+                bm.verts,
+            )
+            if face_vertex_slots is None:
+                return None
+            if tuple(face_vertex_slots) != tuple(
+                record.get("ordered_vertex_cycle", ())
+            ):
+                return None
+            face_states.append((record, face, face_vertex_slots))
+        return face_states
+    except (AttributeError, IndexError, KeyError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _topology_color_cache_current_coordinates(cache, bm):
+    """Copy coordinates for cached colored vertices without visiting uncolored vertices."""
+    try:
+        bm.verts.ensure_lookup_table()
+        coordinates = {}
+        for slot in cache.get("colored_vertex_slots", ()):
+            if slot < 0 or slot >= len(bm.verts):
+                return None
+            coordinates[slot] = tuple(
+                float(value)
+                for value in bm.verts[slot].co
+            )
+        return coordinates
+    except (AttributeError, IndexError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _topology_color_cache_geometry_matches(cache, bm):
+    """Check colored-face layout and coordinates without full-mesh walks or index writes."""
+    if _topology_color_cache_face_states(cache, bm) is None:
+        return False
+    coordinates = _topology_color_cache_current_coordinates(cache, bm)
+    return (
+        coordinates is not None
+        and coordinates == cache.get("colored_vertex_snapshot")
+    )
+
+
+def _topology_color_mirror_configuration(obj, include_transforms=True):
+    """Return a value-only Mirror signature and supported raw-copy settings."""
+    modifiers = tuple(obj.modifiers)
+    signature = []
+    visible_mirrors = []
+    for index, modifier in enumerate(modifiers):
+        try:
+            modifier_type = str(modifier.type)
+            show_viewport = bool(modifier.show_viewport)
+            show_in_editmode = bool(getattr(modifier, "show_in_editmode", False))
+            show_on_cage = bool(getattr(modifier, "show_on_cage", False))
+            modifier_pointer = int(modifier.as_pointer())
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            return None, None
+
+        row = (
+            index,
+            modifier_pointer,
+            str(getattr(modifier, "name", "")),
+            modifier_type,
+            show_viewport,
+            show_in_editmode,
+            show_on_cage,
+        )
+        if modifier_type == "MIRROR":
+            try:
+                mirror_object = modifier.mirror_object
+                axes = tuple(bool(value) for value in modifier.use_axis)
+                bisect_axes = tuple(bool(value) for value in modifier.use_bisect_axis)
+                bisect_flips = tuple(bool(value) for value in modifier.use_bisect_flip_axis)
+                mirror_object_pointer = (
+                    int(mirror_object.as_pointer()) if mirror_object is not None else 0
+                )
+                mirror_object_matrix = (
+                    _topology_color_matrix_key(mirror_object)
+                    if mirror_object is not None
+                    else None
+                )
+                use_clip = bool(modifier.use_clip)
+                use_merge = bool(modifier.use_mirror_merge)
+                merge_threshold = float(modifier.merge_threshold)
+            except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+                return None, None
+            row += (
+                axes,
+                bisect_axes,
+                bisect_flips,
+                use_clip,
+                use_merge,
+                merge_threshold,
+                mirror_object_pointer,
+                mirror_object_matrix,
+            )
+            if show_viewport and show_in_editmode:
+                visible_mirrors.append((index, modifier, mirror_object, axes, bisect_axes))
+        signature.append(row)
+
+    signature = tuple(signature)
+    # Multiple visible Mirrors and bisected/pre-deformed inputs need a fuller
+    # evaluated topology map. Keep the raw source guide and fail closed here.
+    if len(visible_mirrors) != 1:
+        return signature, None
+    mirror_index, modifier, mirror_object, axes, bisect_axes = visible_mirrors[0]
+    if any(bisect_axes) or any(
+        bool(getattr(previous, "show_viewport", False))
+        for previous in modifiers[:mirror_index]
+    ):
+        return signature, None
+    active_axes = tuple(index for index, enabled in enumerate(axes) if enabled)
+    if not active_axes:
+        return signature, None
+
+    try:
+        copy_masks = tuple(
+            sum(1 << axis for bit, axis in enumerate(active_axes) if subset & (1 << bit))
+            for subset in range(1, 1 << len(active_axes))
+        )
+        configuration = {
+            "axes": active_axes,
+            "copy_masks": copy_masks,
+            "use_merge": use_merge,
+            "merge_threshold": merge_threshold,
+        }
+        if not include_transforms:
+            return signature, configuration
+        object_matrix = obj.matrix_world.copy()
+        object_inverse = object_matrix.inverted()
+        mirror_basis = (
+            mirror_object.matrix_world.copy()
+            if mirror_object is not None
+            else object_matrix.copy()
+        )
+        mirror_basis_inverse = mirror_basis.inverted()
+        axis_transforms = []
+        for axis in active_axes:
+            reflection = Matrix.Identity(4)
+            reflection[axis][axis] = -1.0
+            local_reflection = (
+                object_inverse
+                @ mirror_basis
+                @ reflection
+                @ mirror_basis_inverse
+                @ object_matrix
+            )
+            axis_transforms.append(
+                (
+                    axis,
+                    tuple(tuple(float(value) for value in row) for row in local_reflection),
+                )
+            )
+        configuration["axis_transforms"] = tuple(axis_transforms)
+        return signature, configuration
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return signature, None
+
+
+def _topology_color_mirror_positions_equal(first, second):
+    """Compare copied mirror points within transform round-off only."""
+    try:
+        scale = max(1.0, *(abs(float(value)) for point in (first, second) for value in point))
+        tolerance = scale * 1.0e-7
+        return all(abs(float(a) - float(b)) <= tolerance for a, b in zip(first, second))
+    except (TypeError, ValueError):
+        return False
+
+
+def _topology_color_mirror_face_positions_equal(first, second):
+    """Compare the small vertex sets of two generated faces without ordering."""
+    if len(first) != len(second):
+        return False
+    unmatched = list(second)
+    for point in first:
+        for index, candidate in enumerate(unmatched):
+            if _topology_color_mirror_positions_equal(point, candidate):
+                del unmatched[index]
+                break
+        else:
+            return False
+    return not unmatched
+
+
+def _topology_color_cache_refresh_geometry(
+    cache,
+    obj,
+    bm,
+    face_states,
+    coordinates,
+    mirror_configuration=None,
+):
+    """Refresh copied draw positions for the cached colored region only."""
+    try:
+        matrix = obj.matrix_world
+        world_coordinates = {}
+        variants = {}
+        local_variants = {}
+        if mirror_configuration is not None:
+            object_matrix = matrix.copy()
+            axis_transforms = {
+                axis: Matrix(matrix_values)
+                for axis, matrix_values in mirror_configuration["axis_transforms"]
+            }
+            for copy_mask in (0, *mirror_configuration["copy_masks"]):
+                variant = {}
+                local_variant = {}
+                for slot in cache.get("colored_vertex_slots", ()):
+                    local = Vector(coordinates[slot])
+                    for axis in mirror_configuration["axes"]:
+                        reflected = axis_transforms[axis] @ local
+                        if copy_mask & (1 << axis):
+                            if (
+                                mirror_configuration["use_merge"]
+                                and (reflected - local).length
+                                < mirror_configuration["merge_threshold"]
+                            ):
+                                local = (local + reflected) * 0.5
+                            else:
+                                local = reflected
+                        elif (
+                            mirror_configuration["use_merge"]
+                            and (reflected - local).length
+                            < mirror_configuration["merge_threshold"]
+                        ):
+                            local = (local + reflected) * 0.5
+                    local_variant[slot] = tuple(local)
+                    variant[slot] = tuple(object_matrix @ local)
+                variants[copy_mask] = variant
+                local_variants[copy_mask] = local_variant
+            world_coordinates = variants.pop(0)
+            source_local_coordinates = local_variants.pop(0)
+        else:
+            world_coordinates = {
+                slot: tuple(matrix @ bm.verts[slot].co)
+                for slot in cache.get("colored_vertex_slots", ())
+            }
+            source_local_coordinates = coordinates
+        triangles = {index: [] for index in range(1, 7)}
+        for record, face, face_vertex_slots in face_states:
+            if record["hidden"]:
+                continue
+            if len(record["vertex_cycle"]) >= 4:
+                triangle_slots = _topology_color_face_triangle_slots(
+                    face,
+                    face_vertex_slots,
+                    source_local_coordinates
+                    if mirror_configuration is not None
+                    else None,
+                )
+                if triangle_slots is None:
+                    return False
+                record["triangle_slots"] = triangle_slots
+            for triangle in record["triangle_slots"]:
+                triangles[record["color_index"]].extend(
+                    world_coordinates[slot]
+                    for slot in triangle
+                )
+
+        wire = []
+        for first_slot, second_slot in cache.get("wire_layout", ()):
+            wire.extend(
+                (
+                    world_coordinates[first_slot],
+                    world_coordinates[second_slot],
+                )
+            )
+
+        cache["colored_vertex_snapshot"] = dict(coordinates)
+        cache["triangles"] = triangles
+        cache["wire"] = wire
+        mirror_triangles = {index: [] for index in range(1, 7)}
+        mirror_wire = []
+        if mirror_configuration is not None:
+            object_matrix = obj.matrix_world.copy()
+            for record, _face, face_vertex_slots in face_states:
+                if record["hidden"] or not record["triangle_slots"]:
+                    continue
+                seen_face_positions = [tuple(
+                    world_coordinates[slot] for slot in face_vertex_slots
+                )]
+                for copy_mask, variant in variants.items():
+                    face_positions = tuple(
+                        variant[slot] for slot in face_vertex_slots
+                    )
+                    duplicate_face = any(
+                        _topology_color_mirror_face_positions_equal(
+                            face_positions,
+                            previous,
+                        )
+                        for previous in seen_face_positions
+                    )
+                    if duplicate_face:
+                        continue
+                    seen_face_positions.append(face_positions)
+                    reversed_winding = bool(copy_mask.bit_count() % 2)
+                    copy_triangle_slots = record["triangle_slots"]
+                    if len(face_vertex_slots) == 4:
+                        copy_face_slots = (
+                            tuple(face_vertex_slots[:1])
+                            + tuple(reversed(face_vertex_slots[1:]))
+                            if reversed_winding
+                            else face_vertex_slots
+                        )
+                        copy_triangle_slots = _topology_color_face_triangle_slots(
+                            _face,
+                            copy_face_slots,
+                            local_variants[copy_mask],
+                        )
+                        if copy_triangle_slots is None:
+                            return False
+                    for triangle in copy_triangle_slots:
+                        slots = (
+                            (triangle[0], triangle[2], triangle[1])
+                            if reversed_winding and len(face_vertex_slots) != 4
+                            else triangle
+                        )
+                        mirror_triangles[record["color_index"]].extend(
+                            variant[slot] for slot in slots
+                        )
+
+            for first_slot, second_slot in cache.get("wire_layout", ()):
+                original_edge = (
+                    world_coordinates[first_slot],
+                    world_coordinates[second_slot],
+                )
+                seen_edges = [original_edge]
+                for variant in variants.values():
+                    edge = (
+                        variant[first_slot],
+                        variant[second_slot],
+                    )
+                    duplicate = any(
+                        (
+                            _topology_color_mirror_positions_equal(edge[0], prior[0])
+                            and _topology_color_mirror_positions_equal(edge[1], prior[1])
+                        )
+                        or (
+                            _topology_color_mirror_positions_equal(edge[0], prior[1])
+                            and _topology_color_mirror_positions_equal(edge[1], prior[0])
+                        )
+                        for prior in seen_edges
+                    )
+                    if duplicate:
+                        continue
+                    seen_edges.append(edge)
+                    mirror_wire.extend(
+                        (
+                            variant[first_slot],
+                            variant[second_slot],
+                        )
+                    )
+
+        cache["mirror_triangles"] = mirror_triangles
+        cache["mirror_wire"] = mirror_wire
+        cache["mirror_configuration"] = mirror_configuration
+        cache["gpu_batches"] = None
+        cache["gpu_wire_batch"] = None
+        cache["gpu_mirror_batches"] = None
+        cache["gpu_mirror_wire_batch"] = None
+        cache["layout_valid"] = True
+        return True
+    except (AttributeError, IndexError, KeyError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def _build_topology_color_cache(
+    obj,
+    overlay_offset=None,
+    mirror_signature=None,
+    mirror_configuration=None,
+):
     """Copy only visible colored Edit BMesh faces into draw-ready buffers."""
     cache = {
         "object_pointer": 0,
         "mesh_pointer": 0,
         "matrix_key": None,
         "overlay_offset": 0.0,
+        "mirror_signature": mirror_signature,
+        "mirror_configuration": mirror_configuration,
         "face_count": 0,
         "vert_count": 0,
+        "edge_count": 0,
+        "topology_color_layer_present": False,
+        "layout_valid": False,
+        "colored_vertex_slots": (),
+        "colored_face_layout": (),
+        "wire_layout": (),
+        "colored_vertex_snapshot": {},
         "triangles": {index: [] for index in range(1, 7)},
         "wire": [],
+        "mirror_triangles": {index: [] for index in range(1, 7)},
+        "mirror_wire": [],
         "gpu_batches": None,
         "gpu_wire_batch": None,
+        "gpu_mirror_batches": None,
+        "gpu_mirror_wire_batch": None,
         "gpu_shader": None,
     }
     try:
         bm = bmesh.from_edit_mesh(obj.data)
+        bm.verts.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
         layer = bm.faces.layers.int.get(TOPOLOGY_COLOR_ATTRIBUTE_NAME)
+        cache["topology_color_layer_present"] = layer is not None
         cache["object_pointer"] = int(obj.as_pointer())
         cache["mesh_pointer"] = int(obj.data.as_pointer())
         cache["matrix_key"] = _topology_color_matrix_key(obj)
@@ -5684,83 +6209,69 @@ def _build_topology_color_cache(obj, overlay_offset=None):
         )
         cache["face_count"] = len(bm.faces)
         cache["vert_count"] = len(bm.verts)
+        cache["edge_count"] = len(bm.edges)
         if layer is None:
+            cache["layout_valid"] = True
             return cache
 
-        matrix = obj.matrix_world
-        seen_edges = set()
-        for face in bm.faces:
-            if face.hide:
-                continue
+        vertex_slots = {
+            vertex: slot
+            for slot, vertex in enumerate(bm.verts)
+        }
+        colored_vertex_slots = set()
+        colored_face_layout = []
+        wire_layout = set()
+        for face_slot, face in enumerate(bm.faces):
             try:
                 color_index = int(face[layer])
             except (ReferenceError, RuntimeError, TypeError, ValueError):
                 continue
             if color_index < 1 or color_index > 6:
                 continue
-
-            # ``BMFace.calc_tessellation`` returns BMVerts on Blender 5.2.
-            # Keep a fallback for polygon APIs that return plain Vectors.
-            try:
-                tessellation = face.calc_tessellation()
-                tessellation_vertices = None
-            except (AttributeError, RuntimeError, TypeError, ValueError):
-                tessellation_vertices = [
-                    vertex.co.copy()
-                    for vertex in face.verts
-                ]
-                tessellation = tessellate_polygon(
-                    [tessellation_vertices]
+            face_vertices = tuple(face.verts)
+            face_vertex_slots = tuple(vertex_slots[vertex] for vertex in face_vertices)
+            vertex_cycle = _topology_color_canonical_cycle(face_vertex_slots)
+            hidden = bool(face.hide)
+            triangle_slots = ()
+            if not hidden:
+                triangle_slots = _topology_color_face_triangle_slots(
+                    face,
+                    face_vertex_slots,
                 )
-            for triangle in tessellation:
-                if len(triangle) != 3:
-                    continue
-                triangle_points = []
-                for vertex in triangle:
-                    if (
-                        tessellation_vertices is not None
-                        and isinstance(vertex, int)
-                    ):
-                        coordinate = tessellation_vertices[vertex]
-                    else:
-                        coordinate = getattr(vertex, "co", vertex)
-                    triangle_points.append(tuple(matrix @ coordinate))
-                cache["triangles"][color_index].extend(triangle_points)
+                if triangle_slots is None:
+                    return cache
+                for edge in face.edges:
+                    edge_slots = tuple(vertex_slots[vertex] for vertex in edge.verts)
+                    if len(edge_slots) == 2:
+                        wire_layout.add(tuple(sorted(edge_slots)))
+            colored_vertex_slots.update(face_vertex_slots)
+            colored_face_layout.append(
+                {
+                    "face_slot": face_slot,
+                    "color_index": color_index,
+                    "hidden": hidden,
+                    "vertex_cycle": vertex_cycle,
+                    "ordered_vertex_cycle": tuple(face_vertex_slots),
+                    "triangle_slots": triangle_slots,
+                }
+            )
 
-            for edge in face.edges:
-                try:
-                    edge_index = int(edge.index)
-                except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
-                    edge_index = -1
-                if edge_index >= 0:
-                    edge_key = ("index", edge_index)
-                else:
-                    fallback_vertices = []
-                    for vertex in edge.verts:
-                        try:
-                            vertex_index = int(vertex.index)
-                        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
-                            vertex_index = -1
-                        if vertex_index >= 0:
-                            fallback_vertices.append(("index", vertex_index))
-                        else:
-                            # ``id(BMVert)`` is stable for this one build and
-                            # avoids collapsing every unindexed edge together.
-                            fallback_vertices.append(("identity", id(vertex)))
-                    edge_key = (
-                        "verts",
-                        tuple(sorted(fallback_vertices, key=repr)),
-                    )
-                if edge_key in seen_edges:
-                    continue
-                seen_edges.add(edge_key)
-                first, second = edge.verts
-                line = (
-                    tuple(matrix @ first.co),
-                    tuple(matrix @ second.co),
-                )
-                cache["wire"].extend(line)
-    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        cache["colored_vertex_slots"] = tuple(sorted(colored_vertex_slots))
+        cache["colored_face_layout"] = tuple(colored_face_layout)
+        cache["wire_layout"] = tuple(sorted(wire_layout))
+        face_states = _topology_color_cache_face_states(cache, bm)
+        coordinates = _topology_color_cache_current_coordinates(cache, bm)
+        if face_states is None or coordinates is None:
+            return cache
+        _topology_color_cache_refresh_geometry(
+            cache,
+            obj,
+            bm,
+            face_states,
+            coordinates,
+            mirror_configuration,
+        )
+    except (AttributeError, IndexError, KeyError, ReferenceError, RuntimeError, TypeError, ValueError):
         # A mode switch or Undo can invalidate the Edit BMesh between the draw
         # callback and this read.  The next redraw will retry from scratch.
         return cache
@@ -5776,15 +6287,52 @@ def _topology_color_cache_for(obj):
     cache = _topology_color_cache.get(object_pointer)
     matrix_key = _topology_color_matrix_key(obj)
     overlay_offset = _topology_color_overlay_offset()
+    mirror_signature, mirror_configuration = _topology_color_mirror_configuration(
+        obj,
+        include_transforms=False,
+    )
     stale = (
         cache is None
         or object_pointer in _topology_color_cache_dirty
         or cache.get("mesh_pointer") != mesh_pointer
         or cache.get("matrix_key") != matrix_key
         or cache.get("overlay_offset") != overlay_offset
+        or cache.get("mirror_signature") != mirror_signature
+        or not cache.get("layout_valid", False)
     )
+    if not stale:
+        try:
+            bm = bmesh.from_edit_mesh(obj.data)
+            face_states = _topology_color_cache_face_states(cache, bm)
+            if face_states is None:
+                stale = True
+            else:
+                coordinates = _topology_color_cache_current_coordinates(cache, bm)
+                if coordinates is None:
+                    stale = True
+                elif coordinates != cache.get("colored_vertex_snapshot"):
+                    stale = not _topology_color_cache_refresh_geometry(
+                        cache,
+                        obj,
+                        bm,
+                        face_states,
+                        coordinates,
+                        cache.get("mirror_configuration"),
+                    )
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            stale = True
     if stale:
-        cache = _build_topology_color_cache(obj, overlay_offset)
+        if mirror_configuration is not None:
+            mirror_signature, mirror_configuration = _topology_color_mirror_configuration(
+                obj,
+                include_transforms=True,
+            )
+        cache = _build_topology_color_cache(
+            obj,
+            overlay_offset,
+            mirror_signature,
+            mirror_configuration,
+        )
         _topology_color_cache[object_pointer] = cache
         _topology_color_cache_dirty.discard(object_pointer)
     return cache
@@ -5812,16 +6360,21 @@ def _draw_topology_colors():
             return
         obj = _topology_color_object(context)
         if obj is None:
+            if _topology_color_cache:
+                _clear_topology_color_draw_cache()
             return
         cache = _topology_color_cache_for(obj)
         if cache is None:
             return
         opacity = float(prefs.topology_color_opacity) if prefs else 0.35
         opacity = max(0.0, min(1.0, opacity))
-        shader, uses_depth_bias = _topology_color_draw_shader()
+        shader, uses_depth_shader = _topology_color_draw_shader()
         if shader is None:
             return
-        depth_bias = _topology_color_depth_bias(cache.get("overlay_offset", 0.0))
+        retopology_offset = max(
+            0.0,
+            float(cache.get("overlay_offset", 0.0)),
+        )
         depth_set = False
         depth_mask_changed = False
         gpu.state.blend_set("ALPHA")
@@ -5836,18 +6389,23 @@ def _draw_topology_colors():
                 depth_mask_changed = True
             except (AttributeError, RuntimeError, TypeError, ValueError):
                 pass
-            if uses_depth_bias:
+            if uses_depth_shader:
                 shader.bind()
                 shader.uniform_float(
-                    "ModelViewProjectionMatrix",
-                    gpu.matrix.get_projection_matrix()
-                    @ gpu.matrix.get_model_view_matrix(),
+                    "ModelViewMatrix",
+                    gpu.matrix.get_model_view_matrix(),
                 )
-                shader.uniform_float("depth_bias", depth_bias)
+                shader.uniform_float(
+                    "ProjectionMatrix",
+                    gpu.matrix.get_projection_matrix(),
+                )
+                shader.uniform_float("retopology_offset", retopology_offset)
             gpu_batches = cache.get("gpu_batches")
             if cache.get("gpu_shader") is not shader:
                 gpu_batches = None
                 cache["gpu_wire_batch"] = None
+                cache["gpu_mirror_batches"] = None
+                cache["gpu_mirror_wire_batch"] = None
                 cache["gpu_shader"] = shader
             if gpu_batches is None:
                 gpu_batches = {
@@ -5855,7 +6413,7 @@ def _draw_topology_colors():
                         shader,
                         "TRIS",
                         vertices,
-                        uses_depth_bias,
+                        uses_depth_shader,
                     )
                     for color_index, vertices in cache["triangles"].items()
                     if vertices
@@ -5872,6 +6430,30 @@ def _draw_topology_colors():
                 )
                 batch.draw(shader)
 
+            gpu_mirror_batches = cache.get("gpu_mirror_batches")
+            if gpu_mirror_batches is None:
+                gpu_mirror_batches = {
+                    color_index: _topology_color_batch(
+                        shader,
+                        "TRIS",
+                        vertices,
+                        uses_depth_shader,
+                    )
+                    for color_index, vertices in cache["mirror_triangles"].items()
+                    if vertices
+                }
+                cache["gpu_mirror_batches"] = gpu_mirror_batches
+            for color_index, vertices in cache["mirror_triangles"].items():
+                if not vertices:
+                    continue
+                batch = gpu_mirror_batches[color_index]
+                shader.bind()
+                shader.uniform_float(
+                    "color",
+                    (*TOPOLOGY_COLOR_PALETTE[color_index - 1], opacity),
+                )
+                batch.draw(shader)
+
             if cache["wire"]:
                 wire_batch = cache.get("gpu_wire_batch")
                 if wire_batch is None:
@@ -5879,12 +6461,25 @@ def _draw_topology_colors():
                         shader,
                         "LINES",
                         cache["wire"],
-                        uses_depth_bias,
+                        uses_depth_shader,
                     )
                     cache["gpu_wire_batch"] = wire_batch
                 shader.bind()
                 shader.uniform_float("color", (0.01, 0.01, 0.01, 0.45))
                 wire_batch.draw(shader)
+            if cache["mirror_wire"]:
+                mirror_wire_batch = cache.get("gpu_mirror_wire_batch")
+                if mirror_wire_batch is None:
+                    mirror_wire_batch = _topology_color_batch(
+                        shader,
+                        "LINES",
+                        cache["mirror_wire"],
+                        uses_depth_shader,
+                    )
+                    cache["gpu_mirror_wire_batch"] = mirror_wire_batch
+                shader.bind()
+                shader.uniform_float("color", (0.01, 0.01, 0.01, 0.45))
+                mirror_wire_batch.draw(shader)
         finally:
             if depth_mask_changed:
                 try:
@@ -6817,19 +7412,81 @@ def _clear_topology_color_draw_cache():
     _topology_color_tag_redraw_all()
 
 
+def _topology_color_id_chain(data):
+    """Return an evaluated ID and its original without retaining either."""
+    chain = []
+    seen = set()
+    current = data
+    for _index in range(4):
+        try:
+            pointer = int(current.as_pointer())
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            break
+        if pointer in seen:
+            break
+        seen.add(pointer)
+        chain.append(current)
+        try:
+            original = getattr(current, "original", None)
+        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+            break
+        if original is None or original is current:
+            break
+        current = original
+    return chain
+
+
+def _topology_color_update_requires_forced_invalidation(update):
+    """Use region snapshots for geometry/transform updates when available."""
+    try:
+        return not (
+            bool(update.is_updated_geometry)
+            or bool(update.is_updated_transform)
+        )
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return True
+
+
 @persistent
 def _on_topology_color_depsgraph_update(_scene, depsgraph):
-    """Invalidate only meshes/objects changed by the dependency graph."""
+    """Resolve original IDs, redraw matches, and invalidate unknown updates."""
     try:
+        matched_cache = False
         for update in depsgraph.updates:
-            data = update.id
-            if isinstance(data, bpy.types.Mesh):
-                data_pointer = int(data.as_pointer())
-                for object_pointer, cache in _topology_color_cache.items():
-                    if cache.get("mesh_pointer") == data_pointer:
+            id_chain = _topology_color_id_chain(update.id)
+            force_cache_invalidation = (
+                _topology_color_update_requires_forced_invalidation(update)
+            )
+            object_pointers = set()
+            mesh_pointers = set()
+            for data in id_chain:
+                try:
+                    data_pointer = int(data.as_pointer())
+                except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+                    continue
+                if isinstance(data, bpy.types.Mesh):
+                    mesh_pointers.add(data_pointer)
+                elif isinstance(data, bpy.types.Object) and data.type == "MESH":
+                    object_pointers.add(data_pointer)
+                    mesh_chain = _topology_color_id_chain(data.data)
+                    for mesh in mesh_chain:
+                        try:
+                            mesh_pointers.add(int(mesh.as_pointer()))
+                        except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+                            continue
+
+            if not object_pointers and not mesh_pointers:
+                continue
+            for object_pointer, cache in tuple(_topology_color_cache.items()):
+                if (
+                    object_pointer in object_pointers
+                    or cache.get("mesh_pointer") in mesh_pointers
+                ):
+                    if force_cache_invalidation:
                         _topology_color_cache_dirty.add(object_pointer)
-            elif isinstance(data, bpy.types.Object) and data.type == "MESH":
-                _topology_color_cache_dirty.add(int(data.as_pointer()))
+                    matched_cache = True
+        if matched_cache:
+            _topology_color_tag_redraw_all()
     except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
         pass
 

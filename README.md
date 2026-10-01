@@ -1,10 +1,10 @@
 # Mesh Focus Orbit
 
-Current source version: 3.4.33.
+Current source version: 3.4.41.
 
 Blender 5.2 用のリトポロジー支援アドオンです。
 
-アドオンバージョン: **3.4.33**
+アドオンバージョン: **3.4.41**
 
 ## 主な機能
 
@@ -15,8 +15,8 @@ Blender 5.2 用のリトポロジー支援アドオンです。
 - **Wire Overlay View**: どのモードでも `Shift + Alt + E` で対象 View3D のワイヤー表示を現在値から切り替えます。
 - **表示距離集中**: `Shift + Alt + V` で対象 View3D の遠方クリップを 0.13 m と 1000 m の間で切り替えます。
 - **Opening Boundary Loop**: Edit Modeで開口部の辺を1本選択し、`Shift + Alt + L`で同じ開口部の閉じた縁を一周選択します。
-- **Topology Colors**: Edit Mode の選択面に 1〜6 の半透明ガイド色を保存します。
-- **Exposed Back Face Select**: Edit Mode の T ツールで崩れた面や穴の縁をクリックし、そこから連結した近傍の裏向き面と根元を選択します。穴越しに見える遠い裏面を避け、処理中は進捗を表示します。形状は変更しません。
+- **Topology Colors**: Edit Mode の選択面に 1〜6 の半透明ガイド色を保存し、色付き面と wire を編集中の頂点座標に追従させます。
+- **Exposed Back Face Select**: Edit Mode の T ツールで崩れた面や穴の縁をクリックし、近傍で向きが少数派の面と根元3列を選択します。表側・裏側のどちらから見ても同じ崩れた面を対象にします。穴越しに見える遠い裏面を避け、処理中は進捗を表示します。初期状態では形状を変更しません。Preferences の `Auto Relax with LoopTools` をオンにすると、選択後にオプションの LoopTools Relax を1回実行します。LoopTools が使えない場合は選択だけを残して警告します。
 - **Curved Face Set Tube Shape**: 曲がった Face Set チューブを局所断面に沿って均一化または先細り補正します。
 
 ## インストール
@@ -130,6 +130,11 @@ Smart Fill 自身の確定直後は surface adjacency / cursor cache を再利�
 予測中は実メッシュを変更しません。確定時には、対象成分内の安全な頂点だけへ適用します。端部、Face Set 外、境界共有頂点、hidden、完全 mask は固定し、部分 mask は重みで減衰します。分岐、open edge、non-manifold edge、曖昧な tip や断面は理由を表示して拒否します。`Esc`、右クリック、モード・オブジェクト・トポロジー・可視性の変更、Undo、ファイルロード、アドオン解除では cleanup します。
 
 ## Topology Colors
+
+Nパネルのガイド色ボタンは、赤・オレンジ・黄・緑・青・紫の名前で表示します。
+ガイドはネイティブ Retopology Overlay の offset で手前に表示し、その offset 範囲よりさらに手前にある遮蔽物には隠れます。
+四角面は Edit Mesh と同じ対角で三角化するため、非平面の面でもガイド深度が揃います。
+有効な先頭の Mirror モディファイアが1つだけで、Bisect と前段の有効モディファイアがない場合は、X/Y/Z 軸、Mirror Object、オブジェクト変換、Merge に合わせて生成側にも同じ色を表示します。複数 Mirror、Bisect、Mirror より前の有効なモディファイアは元側ガイドだけを表示し、生成側は誤った位置に出さないよう省略します。
 
 `Shift + Alt + L` は、Edit Modeで可視開口部辺を1本選択するとその開口の縁を一周選び、同じ開口の辺を2本選択すると両端の辺を含む2区間のうち幾何学的に短い区間を選びます。2辺モードで選択を変えず再実行すると反対側の区間へ切り替わり、再実行ごとに交互に選択します。Face Setなどで面を非表示にしてできた開口では、表示面と非表示面の境界を追跡し、面が欠けている実境界にも対応します。画面外の辺も含み、視点や面の色には依存しません。別の開口と1つの頂点で接している場合は閉路を分離します。別開口の辺、境界でない辺、曖昧または途切れた閉路、探索上限超過、再実行tokenと選択・対象・局所形状や可視性が一致しない場合は安全に扱い、失敗時は選択を変更しません。Undo/Redo、ファイル読み込み、アドオン再読み込みも再実行状態を破棄します。面の生成、非表示面の再表示、メッシュ形状の変更は行いません。同じ操作は `MFO > Topology Colors > 開口部を一周選択` からも実行できます。
 
@@ -293,9 +298,14 @@ Prediction does not write the mesh. Confirmation writes only safe vertices in th
 
 ## Topology Colors
 
+The six N-panel guide buttons are labeled Red, Orange, Yellow, Green, Blue, and Purple; `Ctrl + Alt + 1`–`6` keeps its numeric shortcut mapping.
+Guides use the native Retopology Overlay offset; occluders farther toward the view than that offset still hide them.
+
+On the active Edit Mesh, color guides also follow one enabled Mirror modifier and its generated side, including its axis, mirror object, object transforms, and merge behavior. The generated fill and wire use the same depth-tested overlay as the source guide. Additional Mirror modifiers, bisect, or an enabled geometry modifier before Mirror keep the source guide and omit generated-side colors because their raw face mapping is not guaranteed.
+
 `Shift + Alt + L` follows an opening rim in Edit Mode, including borders between visible and hidden faces (such as hidden Face Sets) and true mesh boundaries. One selected visible rim edge selects the complete closed rim. Exactly two edges on the same unique rim select the shorter continuous arc, including both anchor edges; repeating the command without changing selection or local geometry/visibility alternates to the opposite arc. Openings touching at a single vertex are separated, selecting only the cycle containing the seed. Invalid or ambiguous edges, a broken/branched rim, or a search limit leaves selection unchanged. The command only selects edges; it does not create faces, reveal hidden geometry, or modify the mesh shape. It is also available from `MFO > Topology Colors > Select Opening Boundary Loop`.
 
-In Edit Mode, select faces and press `Ctrl + Alt + 1`–`6` to store a color number and show a translucent guide. `Ctrl + Alt + 0` clears it. The value is stored as the FACE integer attribute `mfo_topology_color` (0=clear, 1–6=color) on the active Edit Mesh, not as a material, and is included in .blend and Undo/Redo.
+In Edit Mode, select faces and press `Ctrl + Alt + 1`–`6` to store a color number and show a translucent guide. The colored faces and wire follow vertex coordinates while the mesh is edited. `Ctrl + Alt + 0` clears it. The value is stored as the FACE integer attribute `mfo_topology_color` (0=clear, 1–6=color) on the active Edit Mesh, not as a material, and is included in .blend and Undo/Redo.
 
 Hidden faces, unselected faces, other objects, and existing materials are not changed. Use `MFO > Topology Colors` to toggle visibility, set opacity, assign, or clear colors.
 
@@ -311,6 +321,7 @@ Open `Edit > Preferences > Add-ons > Mesh Focus Orbit`.
 - `Show Mode Indicator`: MFO / FSMFO status text
 - `Debug Display`: display the orbit-center debug point
 - `RetopoFlow Focus-Island Snap/Weld Filter`: FSMFO RetopoFlow candidate restriction; off by default
+- `Auto Relax with LoopTools`: after Select Back Faces, run the optional LoopTools Relax once on the selected patch; off by default
 - `Topology Colors` / `Topology Color Opacity`: Topology Colors visibility and opacity
 - `Guided Ridge Curve Shape` / `Guided Ridge Strength` / `Guided Ridge Radius`: remembered Curve Sculpt shape and dedicated brush settings
 

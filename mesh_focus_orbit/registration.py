@@ -1774,12 +1774,13 @@ class VIEW3D_PT_mesh_focus_topology_colors(bpy.types.Panel):
             layout.prop(prefs, "topology_colors_enabled", text="表示")
             layout.prop(prefs, "topology_color_opacity", text="透明度")
         layout.label(text="選択面へ割り当て")
+        color_names = ("赤", "オレンジ", "黄", "緑", "青", "紫")
         for row_start in (1, 4):
             row = layout.row(align=True)
             for color_index in range(row_start, row_start + 3):
                 operator = row.operator(
                     TOPOLOGY_COLOR_ASSIGN_OPERATOR_ID,
-                    text=str(color_index),
+                    text=color_names[color_index - 1],
                 )
                 operator.color_index = color_index
         clear_operator = layout.operator(
@@ -2405,6 +2406,14 @@ class MESH_FOCUS_ORBIT_AddonPreferences(bpy.types.AddonPreferences):
         ),
         default=False,
     )
+    backface_auto_relax: BoolProperty(
+        name="Auto Relax with LoopTools",
+        description=(
+            "Run LoopTools Relax on the selected faces after Select Back Faces; "
+            "requires the optional LoopTools extension"
+        ),
+        default=False,
+    )
     topology_colors_enabled: BoolProperty(
         name="Topology Colors",
         description="Show the stored six-color topology guide overlay",
@@ -2483,6 +2492,7 @@ class MESH_FOCUS_ORBIT_AddonPreferences(bpy.types.AddonPreferences):
         layout.prop(self, "debug_display")
         layout.prop(self, "show_indicator")
         layout.prop(self, "retopoflow_target_island_filter")
+        layout.prop(self, "backface_auto_relax")
         layout.prop(self, "topology_colors_enabled")
         layout.prop(self, "topology_color_opacity")
         layout.separator()
