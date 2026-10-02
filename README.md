@@ -1,10 +1,10 @@
 # Mesh Focus Orbit
 
-Current source version: 3.4.41.
+Current source version: 3.4.48.
 
 Blender 5.2 用のリトポロジー支援アドオンです。
 
-アドオンバージョン: **3.4.41**
+アドオンバージョン: **3.4.48**
 
 ## 主な機能
 
@@ -18,6 +18,7 @@ Blender 5.2 用のリトポロジー支援アドオンです。
 - **Topology Colors**: Edit Mode の選択面に 1〜6 の半透明ガイド色を保存し、色付き面と wire を編集中の頂点座標に追従させます。
 - **Exposed Back Face Select**: Edit Mode の T ツールで崩れた面や穴の縁をクリックし、近傍で向きが少数派の面と根元3列を選択します。表側・裏側のどちらから見ても同じ崩れた面を対象にします。穴越しに見える遠い裏面を避け、処理中は進捗を表示します。初期状態では形状を変更しません。Preferences の `Auto Relax with LoopTools` をオンにすると、選択後にオプションの LoopTools Relax を1回実行します。LoopTools が使えない場合は選択だけを残して警告します。
 - **Curved Face Set Tube Shape**: 曲がった Face Set チューブを局所断面に沿って均一化または先細り補正します。
+- **Local Remesh**: Edit Modeで選択した修復面だけを三角化・細分し、共有境界を固定して選択外を保持し、新規頂点を軽くRelaxします。新規呼び出しは目標辺長0（周辺辺長中央値から自動推定）で始まり、手動では小さい目標値ほど高密度になります。Shape Key付きMeshは安全に拒否します。全体BMeshコピーが残るため、大きなMeshでは総面数に応じた負荷があります。
 
 ## インストール
 
@@ -45,6 +46,7 @@ Tツールバーは、Astraが作成した6種のBlender VCO `.dat` ジオメト
 | --- | --- | --- | --- |
 | 通常 MFO | Object / Edit / Sculpt | 設定した Activation Key を短時間に 2 回 | 同じ操作で終了 |
 | Face Set MFO | Object / Edit | `Ctrl` + Activation Key を短時間に 2 回 | 同じ操作で終了 |
+| Local Remesh | Edit Mode（Face Select） | 修復面を選択し、F3で `Local Remesh` を実行するか、MFOサイドバーのボタンを押す | 専用ショートカットなし。進捗を表示し、適用前は `Esc` で中止 |
 | MFO Tツール | Object / Edit / Sculpt | Tツールで選択後、面を左クリック（Object/EditはCtrlでFace Set） | 同種入口を3D View region内で再クリックしてトグルOFF。Face Set ON中はFace Set入口を使う |
 | Smart Fill Tツール | Sculpt / Vertex Paint | ツールで選択後、面を左クリック（Ctrlで厳格） | 開始クリックを離した後、次のLMBで確定。以降は既存Smart Fillモーダルの操作 |
 | Guided Ridge / Tube Shape Tツール | Sculpt | ツールで選択後、対象面を左クリック（Guided Ridgeの最初のクリックは起点設定のみ） | Guided Ridgeは準備進捗を表示。準備完了後にLMBで点追加、`Enter`でCurve Previewへ。Preview中の`Enter`はPinch、`Ctrl+Enter`はCreaseを適用 |
@@ -174,7 +176,7 @@ Edit Mode で面を選択し、`Ctrl + Alt + 1`〜`6` を押すと、表示中�
 
 A Blender 5.2 add-on for manual retopology workflows.
 
-Add-on version: **3.4.20**
+Add-on version: **3.4.48**
 
 ## Main features
 
@@ -187,6 +189,7 @@ Add-on version: **3.4.20**
 - **Opening Boundary Loop**: select one opening-rim edge in Edit Mode and press `Shift + Alt + L` to select its complete closed rim. With two edges on the same opening, the first press selects the shorter inclusive arc; pressing again without changing the selection alternates to the opposite arc.
 - **Topology Colors**: stores six translucent topology guide colors on selected Edit Mode faces.
 - **Curved Face Set Tube Shape**: equalizes or tapers a curved Face Set tube while following its local cross-section.
+- **Local Remesh**: in Edit Mode, triangulates and subdivides only selected repair faces, fixes shared boundaries, preserves unselected geometry, and lightly relaxes new vertices. A fresh invocation resets the target to auto (0, the median surrounding edge length); smaller explicit targets produce finer density. Shape Key meshes are safely rejected. A full-mesh BMesh copy remains, so runtime still depends on total mesh size.
 
 ## Install
 
@@ -214,6 +217,7 @@ The `MFO` tab in the right N-sidebar exposes `Reference Object` and compact dail
 | --- | --- | --- | --- |
 | Normal MFO | Object / Edit / Sculpt | Press the configured Activation Key twice quickly | Press it twice again to leave |
 | Face Set MFO | Object / Edit | `Ctrl` + Activation Key twice quickly | Press the same combination again to leave |
+| Local Remesh | Edit Mode (Face Select) | Select repair faces, then press F3 and choose `Local Remesh`, or use the MFO sidebar button | No dedicated shortcut. Progress is shown; `Esc` cancels before apply |
 | MFO T-tool | Object / Edit / Sculpt | Select in T-toolbar, then left-click a surface (Ctrl uses Face Set in Object/Edit) | Re-click the same entry inside the 3D View region to toggle OFF; while Face Set is ON, use the Face Set entry |
 | Select Back Faces T-tool | Edit Mesh | Select in T-toolbar, then click a damaged surface or opening rim | Selects nearby connected back-facing faces and three root rings. Progress is shown; Esc cancels without deforming the mesh |
 | Smart Fill T-tool | Sculpt / Vertex Paint | Select in T-toolbar, then left-click (Ctrl for strict) | Release the start click, then use the next LMB to confirm; existing Smart Fill modal controls apply afterward |

@@ -79,7 +79,10 @@ _FILL_PREVIEW_WHEEL_DRAIN_SECONDS = FILL_PREVIEW_WHEEL_DRAIN_SECONDS
 from .smart_fill.invariants import make_mesh_global_identity_face_ids
 from . import lifecycle as _lifecycle
 from . import runtime as _runtime
-from .local_remesh import MESH_OT_mesh_focus_local_remesh
+from .local_remesh import (
+    MESH_OT_mesh_focus_local_remesh,
+    local_remesh_request_cancel as _local_remesh_request_cancel,
+)
 from .smart_fill.invariants import (
     accepted_graph_rows_from_result,
     normal_cache_hit_allowed,
@@ -1902,7 +1905,16 @@ class VIEW3D_PT_mesh_focus_orbit_tools(bpy.types.Panel):
         layout.separator()
         layout.label(text="Tツール: クリックで対象面を指定")
         if context.mode == "EDIT_MESH":
-            layout.operator("mesh.mesh_focus_local_remesh", text="Local Remesh")
+            previous_operator_context = layout.operator_context
+            try:
+                layout.operator_context = "INVOKE_REGION_WIN"
+                remesh_operator = layout.operator(
+                    "mesh.mesh_focus_local_remesh",
+                    text="Local Remesh",
+                )
+                remesh_operator.target_edge_length = 0.0
+            finally:
+                layout.operator_context = previous_operator_context
         if context.mode in {"OBJECT", "EDIT_MESH"}:
             layout.label(text="Ctrl + クリック: Face Set (厳密)")
         elif context.mode == "SCULPT":
@@ -2539,9 +2551,27 @@ CLASSES = (
 )
 
 
+@persistent
+def _on_local_remesh_load_pre(_dummy):
+    _local_remesh_request_cancel("load")
+
+
+@persistent
+def _on_local_remesh_undo_pre(_dummy):
+    _local_remesh_request_cancel("undo")
+
+
+@persistent
+def _on_local_remesh_redo_pre(_dummy):
+    _local_remesh_request_cancel("redo")
+
+
 def _remove_registered_handlers():
     """Remove only this module's exact callback objects during teardown."""
     specs = (
+        (bpy.app.handlers.load_pre, _on_local_remesh_load_pre),
+        (bpy.app.handlers.undo_pre, _on_local_remesh_undo_pre),
+        (bpy.app.handlers.redo_pre, _on_local_remesh_redo_pre),
         (bpy.app.handlers.load_pre, _on_load_pre),
         (bpy.app.handlers.load_post, _on_load_post),
         (bpy.app.handlers.load_pre, _display_distance_load_pre),
@@ -2603,6 +2633,12 @@ def register():
     _restore_retopoflow_hooks()
     _schedule_orphan_cleanup()
     _start_topology_color_draw()
+    if _on_local_remesh_load_pre not in bpy.app.handlers.load_pre:
+        bpy.app.handlers.load_pre.append(_on_local_remesh_load_pre)
+    if _on_local_remesh_undo_pre not in bpy.app.handlers.undo_pre:
+        bpy.app.handlers.undo_pre.append(_on_local_remesh_undo_pre)
+    if _on_local_remesh_redo_pre not in bpy.app.handlers.redo_pre:
+        bpy.app.handlers.redo_pre.append(_on_local_remesh_redo_pre)
     if _on_load_pre not in bpy.app.handlers.load_pre:
         bpy.app.handlers.load_pre.append(_on_load_pre)
     if _on_load_post not in bpy.app.handlers.load_post:
@@ -2737,6 +2773,7 @@ def _fill_preview_invoke_failure_checkpoint(stage):
 
 def unregister():
     _display_distance_cancel_all()
+    _local_remesh_request_cancel("unregister")
     _open_boundary_loop_clear_repeat_token()
     _runtime.fill_preview_reload_blocked = False
     _runtime.fill_preview_reload_warning = ""

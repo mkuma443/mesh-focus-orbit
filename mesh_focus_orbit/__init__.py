@@ -15,7 +15,7 @@ import types
 bl_info = {
     "name": "Mesh Focus Orbit",
     "author": "OpenAI",
-    "version": (3, 4, 41),
+    "version": (3, 4, 48),
     "blender": (5, 2, 0),
     "location": "3D View",
     "description": "Mesh-centered orbit, Face Set tools, Smart Fill, and Guided Ridge",
@@ -63,6 +63,25 @@ def _load_components():
         elif not isinstance(previous_runtime.display_distance_sessions, dict):
             raise TypeError(
                 "Mesh Focus Orbit reload refused: runtime.display_distance_sessions "
+                "must be a dict"
+            )
+        # Local Remesh stage metrics share the retained runtime singleton.
+        # Initialize only missing fields so reload cannot orphan live state.
+        if not hasattr(previous_runtime, "local_remesh_modal_state"):
+            previous_runtime.local_remesh_modal_state = None
+        elif (
+            previous_runtime.local_remesh_modal_state is not None
+            and not isinstance(previous_runtime.local_remesh_modal_state, dict)
+        ):
+            raise TypeError(
+                "Mesh Focus Orbit reload refused: runtime.local_remesh_modal_state "
+                "must be a dict or None"
+            )
+        if not hasattr(previous_runtime, "local_remesh_last_metrics"):
+            previous_runtime.local_remesh_last_metrics = {}
+        elif not isinstance(previous_runtime.local_remesh_last_metrics, dict):
+            raise TypeError(
+                "Mesh Focus Orbit reload refused: runtime.local_remesh_last_metrics "
                 "must be a dict"
             )
     if previous_registration is not None:
